@@ -1,0 +1,24 @@
+.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+data/**
+!data/.gitkeep
+downloads/*
+!downloads/.gitkeep
+sessions/*
+!sessions/.gitkeep
+*.session
+*.session-journal
+.DS_Store
+.idea/
+.vscode/
+
+tangyoha_ref/
+dineshkarthik_ref/
+
+# Synology / desktop sync conflict copies
+*冲突副本*

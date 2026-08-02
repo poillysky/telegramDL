@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a1210" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>Telegram 群组下载器</title>
+  <script>
+    /* First paint: app shell if previously logged in, else blank until session check */
+    (function () {
+      try {
+        document.documentElement.classList.add(
+          localStorage.getItem("tgdl_web_authed") === "1" ? "boot-app" : "boot-pending"
+        );
+      } catch (e) {
+        document.documentElement.classList.add("boot-pending");
+      }
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/style.css?v=20260802-pickerx4" />
+  <!-- Webfonts: non-blocking + optional (no 3s spinner / no late glyph swap stretch) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@400;500;600;700&display=optional"
+    media="print"
+    onload="this.media='all'"
+  />
+  <noscript>
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@400;500;600;700&display=optional"
+    />
+  </noscript>
+</head>
+<body>
+  <div class="bg" aria-hidden="true">
+    <div class="bg-orb bg-orb-a"></div>
+    <div class="bg-orb bg-orb-b"></div>
+    <div class="bg-grid"></div>
+  </div>
+
+  <div id="app" class="shell">
+    <!-- Web login only -->
+    <section id="stageLogin" class="login-stage" hidden>
+      <div class="login-composition login-web-only">
+        <div class="login-hero">
+          <p class="brand">Media Downloader</p>
+          <h1>
+            <span class="hero-title-en">Telegram</span><br />
+            <span class="hero-accent">群组下载</span>
+          </h1>
+          <p class="login-tagline">按文案建夹 · 断点续传 · 标签监控，本地部署一次配好长期用。</p>
+        </div>
+
+        <div class="login-panel card login-card">
+          <h2>进入控制台</h2>
+          <p class="muted">登录后可在设置里连接 Telegram</p>
+          <form id="formWebAuth" class="stack">
+            <label>
+              账号
+              <input type="text" id="webUsername" placeholder="请输入账号" autocomplete="username" required />
+            </label>
+            <label>
+              密码
+              <input type="password" id="webPassword" placeholder="请输入密码" autocomplete="current-password" required />
+            </label>
+            <button type="submit" class="primary wide">开始使用</button>
+          </form>
+          <p id="webAuthMsg" class="msg" role="status"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- App after Web login -->
+    <div id="stageApp" hidden>
+      <header class="top">
+        <div class="brand-block">
+          <p class="brand">Media Downloader</p>
+          <h1>Telegram群组</h1>
+        </div>
+        <nav class="app-nav" aria-label="主导航">
+          <button type="button" class="app-nav-btn is-active" id="btnNavTasks" data-page="tasks">
+            <span class="ui-ico ui-ico-tasks" aria-hidden="true"></span>
+            <span>任务</span>
+          </button>
+          <button type="button" class="app-nav-btn" id="btnNavHistory" data-page="history">
+            <span class="ui-ico ui-ico-history" aria-hidden="true"></span>
+            <span>历史</span>
+          </button>
+        </nav>
+        <div class="top-actions">
+          <button id="btnOpenAccount" class="account-chip is-offline" type="button" title="设置 / 账号">
+            <span class="account-avatar-wrap" aria-hidden="true">
+              <span class="account-avatar" id="accountAvatar">TG</span>
+              <span class="account-status-dot" id="accountStatusDot"></span>
+            </span>
+            <span class="account-chip-text">
+              <span id="userBadge" class="account-chip-name">未连接</span>
+              <span id="userBadgeSub" class="account-chip-sub">打开设置</span>
+            </span>
+            <span class="account-chip-chevron" aria-hidden="true"></span>
+          </button>
+        </div>
+      </header>
+
+      <div id="tgBanner" class="tg-banner" hidden>
+        <div>
+          <strong>尚未登录 Telegram</strong>
+          <p class="muted">请到设置中完成 API / 手机号登录后再下载</p>
+        </div>
+        <button type="button" class="primary" id="btnBannerOpenSettings">去设置</button>
+      </div>
+
+      <section id="pageTasks" class="page page-tasks">
+        <div class="card page-card">
+          <div class="card-head page-toolbar">
+            <div>
+              <div class="section-kicker">监控</div>
+              <h2>下载任务</h2>
+            </div>
+            <div class="toolbar-actions">
+              <button id="btnRefreshTasks" class="ghost icon-btn" type="button" title="刷新" aria-label="刷新">
+                <span class="ui-ico ui-ico-refresh" aria-hidden="true"></span>
+                <span class="btn-label">刷新</span>
+              </button>
+              <button id="btnOpenCreate" class="primary" type="button">
+                <span class="ui-ico ui-ico-plus" aria-hidden="true"></span>
+                <span class="btn-label">新建下载</span>
+              </button>
+            </div>
+          </div>
+          <div id="taskList" class="tasks"></div>
+        </div>
+      </section>
+
+      <section id="pageHistory" class="page page-history" hidden>
+        <div class="card page-card">
+          <div class="card-head page-toolbar">
+            <div>
+              <div class="section-kicker">归档</div>
+              <h2>下载历史</h2>
+            </div>
+            <button id="btnRefreshHistory" class="ghost icon-btn" type="button" title="刷新" aria-label="刷新">
+              <span class="ui-ico ui-ico-refresh" aria-hidden="true"></span>
+              <span class="btn-label">刷新</span>
+            </button>
+          </div>
+          <div class="history-toolbar">
+            <input id="historySearch" type="search" placeholder="搜索文件名 / 群名 / 消息 ID…" />
+          </div>
+          <div id="historyList" class="history-list history-list-page"></div>
+          <div class="history-pager">
+            <button type="button" class="ghost" id="btnHistoryPrev">上一页</button>
+            <span id="historyPageInfo" class="muted">—</span>
+            <button type="button" class="ghost" id="btnHistoryNext">下一页</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Create task modal -->
+  <div id="createModal" class="modal" hidden>
+    <div class="modal-backdrop" id="createBackdrop"></div>
+    <div class="modal-panel" role="dialog" aria-labelledby="createTitle" aria-modal="true">
+      <div class="modal-head">
+        <div>
+          <div class="section-kicker">新建</div>
+          <h2 id="createTitle">创建下载任务</h2>
+        </div>
+        <button type="button" class="ghost icon-btn" id="btnCloseCreate" aria-label="关闭">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="modal-grid">
+          <div class="modal-col modal-col-chats">
+            <div class="card-head compact">
+              <div>
+                <div class="section-kicker">步骤 1</div>
+                <h3 class="modal-h3">选择群组</h3>
+              </div>
+              <button id="btnRefreshChats" class="ghost icon-btn" type="button" title="刷新群组列表">刷新</button>
+            </div>
+
+            <div class="chat-dropdown">
+              <button type="button" id="btnToggleChats" class="dropdown-toggle" aria-expanded="true">
+                <span class="dropdown-label">
+                  <span class="dropdown-title">全部群组</span>
+                  <span class="dropdown-sub muted">可多选，每个群各建一个任务</span>
+                </span>
+                <span class="chevron" aria-hidden="true"></span>
+              </button>
+              <div id="chatDropdownBody" class="dropdown-body">
+                <input id="chatSearch" type="search" placeholder="搜索群组名称…" enterkeyhint="search" />
+                <div id="chatList" class="list"></div>
+              </div>
+            </div>
+
+            <div class="selected-box" id="selectedBox">
+              <span class="selected-label">当前选择（可多选）</span>
+              <p id="selectedChat" class="selected-value">未选择群组</p>
+            </div>
+            <p class="hint" id="selectedCountHint">点选群组可多选，将为每个群各建一个任务</p>
+          </div>
+
+          <div class="modal-col modal-col-options">
+            <div class="card-head compact">
+              <div>
+                <div class="section-kicker">步骤 2</div>
+                <h3 class="modal-h3">下载选项</h3>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <h3 class="form-section-title">媒体类型</h3>
+              <div class="types">
+                <label class="chip"><input type="checkbox" name="media" value="photo" checked /> 图片</label>
+                <label class="chip"><input type="checkbox" name="media" value="video" checked /> 视频</label>
+                <label class="chip"><input type="checkbox" name="media" value="document" /> 文档</label>
+                <label class="chip"><input type="checkbox" name="media" value="audio" /> 音频</label>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <h3 class="form-section-title">任务模式</h3>
+              <div class="mode-tabs" id="downloadModeTabs" role="tablist">
+                <button type="button" class="mode-tab is-active" data-mode="sequential">按时间顺序</button>
+                <button type="button" class="mode-tab" data-mode="monitor">监控模式</button>
+              </div>
+              <input type="hidden" id="downloadMode" value="sequential" />
+              <p class="field-hint" id="downloadModeHint">按消息时间顺序扫描并下载媒体</p>
+
+              <div id="modeDateFields" class="mode-panel">
+                <div class="grid2">
+                  <label>起始日期
+                    <input id="startDate" type="date" />
+                  </label>
+                  <label>结束日期
+                    <input id="endDate" type="date" />
+                  </label>
+                </div>
+                <small class="field-hint">可选；留空表示不限日期，按时间顺序下完即结束</small>
+              </div>
+
+              <div id="modeTagsFields" class="mode-panel" hidden>
+                <p class="field-hint index-create-hint">文案索引的增量/全量更新请在任务卡片「设置」里操作</p>
+
+                <div class="tag-manager">
+                  <div class="tag-manager-head">
+                    <span class="tag-manager-title">监控标签</span>
+                    <span class="tag-manager-count muted" id="monitorTagCount">已选 0</span>
+                  </div>
+
+                  <div class="tag-add-row tag-add-wrap">
+                    <div class="tag-suggest-box">
+                      <input id="tagAddInput" type="text" placeholder="输入标签名，自动补全…" enterkeyhint="done" autocomplete="off" />
+                      <div id="tagSuggestList" class="tag-suggest-list" hidden></div>
+                    </div>
+                    <button type="button" class="primary" id="btnTagAdd">添加</button>
+                  </div>
+                  <label class="check tag-auto-related">
+                    <input type="checkbox" id="tagAutoRelated" checked />
+                    <span>
+                      <strong>自动关联相关标签</strong>
+                      <small>同文案共现及间接关联的标签一并加入（如 #1+#2、#2+#3 → 选 #1 也带上 #2 #3）</small>
+                    </span>
+                  </label>
+
+                  <div id="monitorTagList" class="monitor-tag-list" aria-live="polite"></div>
+                  <p class="field-hint" id="monitorTagEmpty">尚未添加标签；可输入补全、或点下方索引标签加入</p>
+
+                  <div class="tag-edit-row" id="tagEditRow" hidden>
+                    <input id="tagEditInput" type="text" placeholder="修改标签名" />
+                    <button type="button" class="primary" id="btnTagEditSave">保存</button>
+                    <button type="button" class="ghost" id="btnTagEditCancel">取消</button>
+                  </div>
+
+                  <div class="tag-cloud-toolbar">
+                    <span class="tag-cloud-label">索引标签</span>
+                    <input id="tagSearchInput" type="search" placeholder="搜索索引标签…" />
+                  </div>
+                  <div id="indexTagCloud" class="tag-cloud"></div>
+                </div>
+
+                <input type="hidden" id="includeTags" value="" />
+                <input type="hidden" id="tagMatchMode" value="any" />
+
+                <label>文案关键词
+                  <input id="captionKeywords" type="text" placeholder="可选，如 自录,合集" />
+                  <small class="field-hint">先按索引补下历史匹配，再持续监控新消息</small>
+                </label>
+                <div id="indexPreview" class="index-preview muted"></div>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <h3 class="form-section-title">目录与选项</h3>
+              <label>目录规则
+                <select id="folderMode">
+                  <option value="caption" selected>按文案 #标签 + 日期（推荐）</option>
+                  <option value="media_type">按媒体类型（photo/video…）</option>
+                  <option value="flat">扁平（直接放群目录下）</option>
+                </select>
+              </label>
+              <label class="check" id="useTextFolderWrap">
+                <input type="checkbox" id="useTextFolder" checked />
+                <span>
+                  <strong>按文案自动建夹</strong>
+                  <small>解析 #标签 与日期，边下边合并同类目录</small>
+                </span>
+              </label>
+              <label class="check">
+                <input type="checkbox" id="testMode" />
+                <span>
+                  <strong>测试模式</strong>
+                  <small>不下载完整文件，约 10 秒后自动停止</small>
+                </span>
+              </label>
+              <label hidden>最短标题字数
+                <input id="minTitleLen" type="number" min="1" value="2" />
+              </label>
+              <label>下载方向
+                <select id="downloadOrder">
+                  <option value="added_first" selected>先入库先下载（推荐）</option>
+                  <option value="oldest_first">从旧到新（按消息）</option>
+                  <option value="newest_first">从最近往前</option>
+                </select>
+              </label>
+              <div class="grid2">
+                <label>并发下载
+                  <input id="concurrency" type="number" min="1" max="5" value="2" inputmode="numeric" title="官方大文件队列上限 2，小文件 5" />
+                  <small class="field-hint">多文件并行；每路独立媒体连接，总速度可接近倍数提升</small>
+                </label>
+                <label>最多下载
+                  <input id="maxMessages" type="number" min="1" placeholder="空=不限" inputmode="numeric" />
+                </label>
+              </div>
+              <label>全局扩展名
+                <input id="fileFormats" type="text" placeholder="空=全部，如 mp4,jpg,png" />
+                <small class="field-hint">逗号分隔，不含点；若填写下方分类型则忽略此项</small>
+              </label>
+              <details class="advanced" id="formatByType">
+                <summary>按媒体类型扩展名（可选）</summary>
+                <div class="grid2 advanced-grid">
+                  <label>视频
+                    <input id="fmtVideo" type="text" placeholder="如 mp4,mkv" />
+                  </label>
+                  <label>图片
+                    <input id="fmtPhoto" type="text" placeholder="如 jpg,png" />
+                  </label>
+                  <label>文档
+                    <input id="fmtDocument" type="text" placeholder="如 pdf,zip" />
+                  </label>
+                  <label>音频
+                    <input id="fmtAudio" type="text" placeholder="如 mp3,m4a" />
+                  </label>
+                </div>
+              </details>
+              <div class="grid2">
+                <label>最小大小 (MB)
+                  <input id="minFileMb" type="number" min="0" step="0.1" placeholder="空=不限" inputmode="decimal" />
+                </label>
+                <label>最大大小 (MB)
+                  <input id="maxFileMb" type="number" min="0" step="0.1" placeholder="空=不限" inputmode="decimal" />
+                </label>
+              </div>
+              <small class="field-hint">按 Telegram 报告的文件大小过滤；0 或不填表示不限</small>
+              <div class="grid2">
+                <label>延迟最小(秒)
+                  <input id="delayMin" type="number" min="0" step="0.1" value="0.5" />
+                </label>
+                <label>延迟最大(秒)
+                  <input id="delayMax" type="number" min="0" step="0.1" value="0.5" />
+                </label>
+              </div>
+              <small class="field-hint">最小≠最大时在区间内随机延迟，减轻限流</small>
+            </div>
+
+            <details class="advanced" id="advancedIds">
+              <summary>高级过滤（消息 ID）</summary>
+              <div class="grid2 advanced-grid">
+                <label>最旧消息 ID
+                  <input id="startMsgId" type="number" inputmode="numeric" value="0" />
+                </label>
+                <label>最新消息 ID
+                  <input id="endMsgId" type="number" inputmode="numeric" placeholder="空=到最新" />
+                </label>
+              </div>
+            </details>
+
+            <p id="taskMsg" class="msg" role="status"></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-foot">
+        <button type="button" class="ghost" id="btnCancelCreate">取消</button>
+        <button id="btnCreateTask" class="primary" type="button">开始下载</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings / Account drawer -->
+  <div id="accountDrawer" class="drawer" hidden>
+    <div class="drawer-backdrop" id="accountBackdrop"></div>
+    <aside class="drawer-panel" role="dialog" aria-labelledby="accountTitle" aria-modal="true">
+      <div class="drawer-head">
+        <div>
+          <div class="section-kicker">设置</div>
+          <h2 id="accountTitle">账号与设置</h2>
+        </div>
+        <button type="button" class="ghost icon-btn" id="btnCloseAccount" aria-label="关闭">✕</button>
+      </div>
+
+      <div class="settings-tabs" role="tablist" aria-label="设置分类">
+        <button type="button" class="settings-tab is-active" role="tab" id="tabBtnTelegram" aria-controls="tabTelegram" aria-selected="true" data-tab="telegram" title="Telegram 账号">
+          <span class="ui-ico ui-ico-tg" aria-hidden="true"></span>
+          <span class="settings-tab-label">Telegram</span>
+        </button>
+        <button type="button" class="settings-tab" role="tab" id="tabBtnRuntime" aria-controls="tabRuntime" aria-selected="false" data-tab="runtime" title="运行设置">
+          <span class="ui-ico ui-ico-runtime" aria-hidden="true"></span>
+          <span class="settings-tab-label">运行</span>
+        </button>
+        <button type="button" class="settings-tab" role="tab" id="tabBtnTags" aria-controls="tabTags" aria-selected="false" data-tab="tags" title="标签黑名单">
+          <span class="ui-ico ui-ico-ban" aria-hidden="true"></span>
+          <span class="settings-tab-label">黑名单</span>
+        </button>
+        <button type="button" class="settings-tab" role="tab" id="tabBtnWeb" aria-controls="tabWeb" aria-selected="false" data-tab="web" title="Web 账号">
+          <span class="ui-ico ui-ico-user" aria-hidden="true"></span>
+          <span class="settings-tab-label">Web</span>
+        </button>
+      </div>
+
+      <!-- Tab: Telegram -->
+      <div id="tabTelegram" class="settings-tab-panel" role="tabpanel" aria-labelledby="tabBtnTelegram">
+        <div class="account-profile">
+          <div class="account-avatar lg" id="accountAvatarLg">TG</div>
+          <div class="account-profile-text">
+            <p class="account-name" id="accName">未登录 Telegram</p>
+            <p class="account-meta" id="accMeta">请在下方完成登录</p>
+          </div>
+          <span class="status-pill" id="accStatusPill">未登录</span>
+        </div>
+
+        <dl class="account-dl" id="accDetails">
+          <div><dt>用户 ID</dt><dd id="accId">—</dd></div>
+          <div><dt>用户名</dt><dd id="accUsername">—</dd></div>
+          <div><dt>手机号</dt><dd id="accPhone">—</dd></div>
+          <div><dt>连接</dt><dd id="accConnected">—</dd></div>
+          <div><dt>API</dt><dd id="accApiStatus">—</dd></div>
+          <div><dt>会话文件</dt><dd id="accSessionStatus">—</dd></div>
+          <div><dt>下载目录</dt><dd id="accDownloadDir" class="mono">—</dd></div>
+        </dl>
+
+        <div class="actions-bar settings-inline-actions">
+          <button type="button" class="ghost" id="btnRefreshTgStatus">
+            <span class="ui-ico ui-ico-refresh" aria-hidden="true"></span>
+            <span>刷新状态</span>
+          </button>
+          <button type="button" class="primary" id="btnReconnectTg">重新连接</button>
+        </div>
+        <p id="tgReconnectMsg" class="msg" role="status"></p>
+
+        <div class="form-section" id="tgSettingsLogin">
+          <h3 class="form-section-title">Telegram 登录</h3>
+          <p class="hint" style="margin-bottom:10px">
+            凭证来自
+            <a href="https://my.telegram.org" target="_blank" rel="noreferrer">my.telegram.org</a>
+            ；登录后会保存，服务重启可自动重连。
+          </p>
+
+          <div class="tg-progress" aria-hidden="true">
+            <span id="tgProgApi" class="tg-prog on">API</span>
+            <span id="tgProgPhone" class="tg-prog">手机</span>
+            <span id="tgProgCode" class="tg-prog">验证</span>
+          </div>
+
+          <div id="tgSubApi" class="tg-sub">
+            <div class="grid2">
+              <label>API ID<input id="apiId" type="number" inputmode="numeric" placeholder="123456" /></label>
+              <label>API Hash<input id="apiHash" type="text" placeholder="api_hash" autocomplete="off" /></label>
+            </div>
+            <label>代理 PROXY
+              <input id="proxy" type="text" placeholder="socks5://127.0.0.1:7897" value="socks5://127.0.0.1:7897" />
+            </label>
+            <p class="hint">国内建议 Clash SOCKS5，否则可能连不上。</p>
+            <div class="actions-bar">
+              <button id="btnTestConn" type="button" class="ghost">测试连接</button>
+              <button id="btnTgNextPhone" type="button" class="primary">下一步</button>
+            </div>
+          </div>
+
+          <div id="tgSubPhone" class="tg-sub" hidden>
+            <label>手机号（含国际区号）
+              <input id="phone" type="tel" placeholder="+86138…" autocomplete="tel" />
+            </label>
+            <div class="actions-bar">
+              <button id="btnTgBackApi" type="button" class="ghost">返回</button>
+              <button id="btnSendCode" type="button" class="primary">发送验证码</button>
+            </div>
+          </div>
+
+          <div id="tgSubCode" class="tg-sub" hidden>
+            <label>验证码
+              <input id="code" type="text" inputmode="numeric" placeholder="Telegram 验证码" autocomplete="one-time-code" />
+            </label>
+            <label>两步验证密码（如已开启）
+              <input id="tfa" type="password" placeholder="未开启可留空" />
+            </label>
+            <div class="actions-bar">
+              <button id="btnTgBackPhone" type="button" class="ghost">返回</button>
+              <button id="btnSignIn" type="button" class="primary">登录 Telegram</button>
+            </div>
+          </div>
+
+          <p id="tgAuthMsg" class="msg" role="status"></p>
+        </div>
+
+        <div class="form-section" id="proxySettingsBlock">
+          <h3 class="form-section-title">网络代理</h3>
+          <p class="hint">保存后写入本地配置，重启服务仍会使用。</p>
+          <label>PROXY
+            <input id="accProxy" type="text" placeholder="socks5://127.0.0.1:7897" />
+          </label>
+          <div class="actions-bar">
+            <button type="button" class="ghost" id="btnAccTestProxy">测试连接</button>
+            <button type="button" class="primary" id="btnAccSaveProxy">保存代理</button>
+          </div>
+          <p id="accProxyMsg" class="msg" role="status"></p>
+        </div>
+
+        <div class="account-actions">
+          <button type="button" class="ghost wide" id="btnLogoutTg">退出 Telegram 账号</button>
+        </div>
+      </div>
+
+      <!-- Tab: Runtime -->
+      <div id="tabRuntime" class="settings-tab-panel" role="tabpanel" aria-labelledby="tabBtnRuntime" hidden>
+        <div class="settings-card">
+          <div class="settings-card-head">
+            <span class="ui-ico ui-ico-queue" aria-hidden="true"></span>
+            <div>
+              <h3 class="settings-card-title">多任务并行</h3>
+              <p class="settings-card-desc">同时运行的下载任务（不同群）上限；同任务内并发仍由「并发下载」控制。</p>
+            </div>
+          </div>
+          <label class="settings-field">并行群数
+            <input id="maxParallelChats" type="number" min="1" max="10" value="1" inputmode="numeric" />
+          </label>
+        </div>
+        <div class="settings-card">
+          <div class="settings-card-head">
+            <span class="ui-ico ui-ico-runtime" aria-hidden="true"></span>
+            <div>
+              <h3 class="settings-card-title">完成 / 限流通知</h3>
+              <p class="settings-card-desc">Webhook：任务完成、失败或 FloodWait 时 POST JSON；留空则不发送。</p>
+            </div>
+          </div>
+          <label class="check settings-check">
+            <input type="checkbox" id="notifyEnabled" />
+            <span><strong>启用通知</strong></span>
+          </label>
+          <label class="settings-field">Webhook URL
+            <input id="notifyWebhook" type="url" placeholder="https://example.com/hook" autocomplete="off" />
+          </label>
+          <div class="actions-bar settings-card-actions">
+            <button type="button" class="primary wide" id="btnSaveRuntime">
+              <span class="ui-ico ui-ico-check" aria-hidden="true"></span>
+              <span>保存运行设置</span>
+            </button>
+          </div>
+          <p id="runtimeMsg" class="msg" role="status"></p>
+          <p class="settings-log-hint" id="runtimeLogHint"></p>
+        </div>
+      </div>
+
+      <!-- Tab: Tag blacklist -->
+      <div id="tabTags" class="settings-tab-panel" role="tabpanel" aria-labelledby="tabBtnTags" hidden>
+        <div class="settings-card">
+          <div class="settings-card-head">
+            <span class="ui-ico ui-ico-ban" aria-hidden="true"></span>
+            <div>
+              <h3 class="settings-card-title">关联黑名单</h3>
+              <p class="settings-card-desc">不参与「关联」聚合，也不进多标签文件夹名。适合网红 / 福利等通用词。</p>
+            </div>
+          </div>
+          <div class="bl-add-row">
+            <input id="blTagInput" type="text" placeholder="输入标签，如 网红 / #半糖" autocomplete="off" />
+            <button type="button" class="primary" id="btnBlAdd">添加</button>
+          </div>
+          <div class="bl-toolbar">
+            <span class="muted" id="blTagCount">0 个</span>
+            <div class="bl-toolbar-actions">
+              <button type="button" class="ghost icon-btn" id="btnBlRefresh" title="刷新" aria-label="刷新">
+                <span class="ui-ico ui-ico-refresh" aria-hidden="true"></span>
+              </button>
+              <button type="button" class="ghost" id="btnBlReset">恢复默认</button>
+            </div>
+          </div>
+          <div class="bl-tag-list" id="blTagList"></div>
+          <p id="blTagMsg" class="msg" role="status"></p>
+        </div>
+      </div>
+
+      <!-- Tab: Web -->
+      <div id="tabWeb" class="settings-tab-panel" role="tabpanel" aria-labelledby="tabBtnWeb" hidden>
+        <div class="account-profile web-profile">
+          <div class="account-avatar lg" id="webAvatarLg">Web</div>
+          <div class="account-profile-text">
+            <p class="account-name" id="webProfileName">—</p>
+            <p class="account-meta">控制台登录账号（与 Telegram 无关）</p>
+          </div>
+          <span class="status-pill status-completed" id="webProfilePill">已登录</span>
+        </div>
+
+        <div class="form-section" id="webUsersBlock">
+          <h3 class="form-section-title">账号列表</h3>
+          <p class="hint">当前登录：<strong id="webCurrentUser">—</strong></p>
+          <div class="web-users-list" id="webUsersList"></div>
+
+          <h4 class="form-subsection-title">修改密码</h4>
+          <label>目标账号
+            <select id="webPwdUsername"></select>
+          </label>
+          <label>确认密码（当前登录账号的密码）
+            <input id="webPwdOld" type="password" autocomplete="current-password" placeholder="当前登录密码" />
+          </label>
+          <label>新密码
+            <input id="webPwdNew" type="password" autocomplete="new-password" placeholder="至少 4 位" />
+          </label>
+          <label>确认新密码
+            <input id="webPwdConfirm" type="password" autocomplete="new-password" placeholder="再输入一次" />
+          </label>
+          <button type="button" class="primary wide" id="btnWebChangePwd">保存密码</button>
+          <p id="webPwdMsg" class="msg" role="status"></p>
+
+          <h4 class="form-subsection-title">新增账号</h4>
+          <label>用户名
+            <input id="webNewUsername" type="text" autocomplete="off" placeholder="新用户名" />
+          </label>
+          <label>密码
+            <input id="webNewPassword" type="password" autocomplete="new-password" placeholder="至少 4 位" />
+          </label>
+          <button type="button" class="primary wide" id="btnWebAddUser">创建账号</button>
+          <p id="webAddMsg" class="msg" role="status"></p>
+        </div>
+
+        <div class="account-actions">
+          <button type="button" class="danger wide" id="btnLogoutWeb">退出 Web 控制台</button>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <button id="btnLogout" type="button" hidden></button>
+
+  <div id="toastHost" class="toast-host" aria-live="polite" aria-relevant="additions"></div>
+
+  <!-- App confirm / alert (replaces native browser dialogs) -->
+  <div id="confirmModal" class="confirm-modal" hidden>
+    <div class="confirm-backdrop" id="confirmBackdrop"></div>
+    <div class="confirm-panel" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmMessage">
+      <div class="confirm-kicker" id="confirmKicker">确认</div>
+      <h3 id="confirmTitle" class="confirm-title">请确认</h3>
+      <p id="confirmMessage" class="confirm-message"></p>
+      <div class="confirm-actions">
+        <button type="button" class="ghost" id="btnConfirmCancel">取消</button>
+        <button type="button" class="primary" id="btnConfirmOk">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Task settings modal (tags / concurrency / …) -->
+  <div id="tagsModal" class="confirm-modal tags-modal" hidden>
+    <div class="confirm-backdrop" id="tagsBackdrop"></div>
+    <div class="confirm-panel tags-panel" role="dialog" aria-modal="true" aria-labelledby="tagsModalTitle">
+      <div class="tags-modal-head">
+        <div class="tags-modal-head-text">
+          <div class="confirm-kicker">任务配置</div>
+          <div class="tags-modal-title-row">
+            <h3 id="tagsModalTitle" class="confirm-title">任务设置</h3>
+            <button type="button" class="ghost icon-btn modal-close-btn" id="btnTagsClose" aria-label="关闭">✕</button>
+          </div>
+          <p id="tagsModalSub" class="tags-modal-sub muted"></p>
+        </div>
+      </div>
+
+      <label id="tagsModalTaskWrap" class="tags-modal-task-pick" hidden>
+        选择任务
+        <select id="tagsModalTaskSelect"></select>
+      </label>
+
+      <div class="tags-modal-section" id="tagsModalIndexSection">
+        <div class="tags-modal-section-title">文案索引</div>
+        <div class="index-panel index-panel-row">
+          <div class="index-meta-block">
+            <span class="index-meta-kicker">索引状态</span>
+            <div class="index-meta" id="indexMetaText">加载索引状态…</div>
+          </div>
+          <div class="index-toolbar" role="group" aria-label="索引操作">
+            <button type="button" class="index-btn index-btn-inc" id="btnIndexScan" title="只扫新增消息">增量</button>
+            <button type="button" class="index-btn index-btn-full" id="btnIndexFull" title="清空后重新全量扫描">全量</button>
+            <button type="button" class="index-btn index-btn-stop" id="btnIndexStop" hidden>停止</button>
+            <div class="index-auto-seg">
+              <label class="index-auto-toggle" title="按间隔定时补扫新消息">
+                <input type="checkbox" id="tagsModalAutoIndex" />
+                <span class="index-auto-mark" aria-hidden="true"></span>
+                <span class="index-auto-label">自动</span>
+              </label>
+              <div class="auto-index-dd" id="tagsModalAutoIndexDd">
+                <select id="tagsModalAutoIndexInterval" hidden>
+                  <option value="15">15 分</option>
+                  <option value="30">30 分</option>
+                  <option value="60" selected>1 小时</option>
+                  <option value="180">3 小时</option>
+                  <option value="360">6 小时</option>
+                  <option value="720">12 小时</option>
+                  <option value="1440">24 小时</option>
+                </select>
+                <button type="button" class="auto-index-dd-btn" id="tagsModalAutoIndexIntervalBtn" title="自动增量间隔" aria-haspopup="listbox" aria-expanded="false">
+                  <span id="tagsModalAutoIndexIntervalLabel">1 小时</span>
+                  <span class="auto-index-dd-chevron" aria-hidden="true">▾</span>
+                </button>
+                <div class="auto-index-dd-menu" id="tagsModalAutoIndexIntervalMenu" role="listbox" hidden>
+                  <button type="button" role="option" data-value="15">15 分</button>
+                  <button type="button" role="option" data-value="30">30 分</button>
+                  <button type="button" role="option" data-value="60" aria-selected="true">1 小时</button>
+                  <button type="button" role="option" data-value="180">3 小时</button>
+                  <button type="button" role="option" data-value="360">6 小时</button>
+                  <button type="button" role="option" data-value="720">12 小时</button>
+                  <button type="button" role="option" data-value="1440">24 小时</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tags-modal-section">
+        <div class="tags-modal-section-title">监控标签</div>
+        <button type="button" class="tag-summary-btn" id="btnOpenTagPicker">
+          <span class="tag-summary-main">
+            <span class="tag-summary-label">已选标签</span>
+            <span id="tagsModalSummary" class="tag-summary-text muted">点击选择标签</span>
+          </span>
+          <span class="tag-summary-action">选择</span>
+        </button>
+        <!-- 自动关联相关标签：默认开启，界面隐藏 -->
+        <input type="checkbox" id="tagsModalRelated" checked hidden />
+      </div>
+
+      <div class="tags-modal-section">
+        <div class="tags-modal-section-title">下载参数</div>
+        <div class="grid2 tags-modal-grid">
+          <label>并发下载
+            <span class="num-stepper">
+              <input id="tagsModalConcurrency" type="number" min="1" max="5" value="2" inputmode="numeric" title="官方大文件队列上限 2，小文件 5" />
+              <span class="num-stepper-btns">
+                <button type="button" class="num-step" data-dir="up" tabindex="-1" aria-label="增加">▴</button>
+                <button type="button" class="num-step" data-dir="down" tabindex="-1" aria-label="减少">▾</button>
+              </span>
+            </span>
+          </label>
+          <label>延迟(秒)
+            <span class="tags-modal-delay-row">
+              <span class="num-stepper">
+                <input id="tagsModalDelayMin" type="number" min="0" step="0.1" value="0.5" />
+                <span class="num-stepper-btns">
+                  <button type="button" class="num-step" data-dir="up" tabindex="-1" aria-label="增加">▴</button>
+                  <button type="button" class="num-step" data-dir="down" tabindex="-1" aria-label="减少">▾</button>
+                </span>
+              </span>
+              <span class="muted">–</span>
+              <span class="num-stepper">
+                <input id="tagsModalDelayMax" type="number" min="0" step="0.1" value="0.5" />
+                <span class="num-stepper-btns">
+                  <button type="button" class="num-step" data-dir="up" tabindex="-1" aria-label="增加">▴</button>
+                  <button type="button" class="num-step" data-dir="down" tabindex="-1" aria-label="减少">▾</button>
+                </span>
+              </span>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <div class="confirm-actions tags-modal-actions">
+        <button type="button" class="ghost" id="btnTagsModalCancel">取消</button>
+        <button type="button" class="primary" id="btnTagsModalSave">保存设置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tag picker: applied | index (mobile = two pages) -->
+  <div id="tagPickerModal" class="confirm-modal tag-picker-modal" hidden>
+    <div class="confirm-backdrop" id="tagPickerBackdrop"></div>
+    <div class="confirm-panel tag-picker-panel" role="dialog" aria-modal="true" aria-labelledby="tagPickerTitle">
+      <div class="tags-modal-head">
+        <div class="tags-modal-head-text">
+          <div class="section-kicker">标签</div>
+          <div class="tags-modal-title-row">
+            <h3 id="tagPickerTitle" class="confirm-title">选择监控标签</h3>
+            <button type="button" class="ghost icon-btn modal-close-btn" id="btnTagPickerClose" aria-label="关闭">✕</button>
+          </div>
+          <p class="tags-modal-sub muted">桌面左右分栏 · 手机分页切换</p>
+        </div>
+      </div>
+
+      <div class="tag-picker-tabs" role="tablist" aria-label="标签分页">
+        <button type="button" class="tag-picker-tab is-active" role="tab" id="tabPickerApplied" data-picker-page="applied" aria-selected="true">
+          已应用 <span class="tag-picker-tab-count" id="tagPickerTabAppliedCount">0</span>
+        </button>
+        <button type="button" class="tag-picker-tab" role="tab" id="tabPickerIndex" data-picker-page="index" aria-selected="false">
+          库内索引 <span class="tag-picker-tab-count" id="tagPickerTabIndexCount">0</span>
+        </button>
+      </div>
+
+      <div class="tag-picker-grid">
+        <section class="tag-picker-col tag-picker-page" data-picker-page="applied" id="tagPickerPageApplied">
+          <div class="tag-picker-col-head tag-picker-col-head-desk">
+            <strong>已应用</strong>
+            <span id="tagPickerAppliedCount" class="muted">0</span>
+          </div>
+          <div id="tagPickerApplied" class="tag-picker-list"></div>
+          <div class="task-tag-add-row tag-picker-add">
+            <div class="tag-picker-suggest" id="tagPickerSuggest">
+              <input id="tagPickerInput" type="text" placeholder="输入 #标签 联想库内标签…" autocomplete="off" />
+              <div class="tag-picker-suggest-menu" id="tagPickerSuggestMenu" role="listbox" hidden></div>
+            </div>
+            <button type="button" class="ghost" id="btnTagPickerAdd">添加</button>
+          </div>
+        </section>
+        <section class="tag-picker-col tag-picker-page" data-picker-page="index" id="tagPickerPageIndex">
+          <div class="tag-picker-col-head">
+            <strong class="tag-picker-col-head-desk">索引标签</strong>
+            <input id="tagPickerSearch" type="search" placeholder="搜索库内索引标签…" autocomplete="off" />
+          </div>
+          <div id="tagPickerIndex" class="tag-picker-list tag-picker-index"></div>
+        </section>
+      </div>
+      <div class="confirm-actions tags-modal-actions">
+        <button type="button" class="primary" id="btnTagPickerDone">完成</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Task download queue -->
+  <div id="queueModal" class="confirm-modal queue-modal" hidden>
+    <div class="confirm-backdrop" id="queueBackdrop"></div>
+    <div class="confirm-panel queue-panel" role="dialog" aria-modal="true" aria-labelledby="queueModalTitle">
+      <div class="tags-modal-head">
+        <div>
+          <div class="section-kicker">详情</div>
+          <h3 id="queueModalTitle" class="confirm-title">文件列表</h3>
+          <p class="tags-modal-sub muted" id="queueModalSub"></p>
+        </div>
+        <button type="button" class="ghost icon-btn" id="btnQueueClose" aria-label="关闭">✕</button>
+      </div>
+      <div class="queue-modal-body" id="queueModalBody"></div>
+      <div class="confirm-actions tags-modal-actions">
+        <button type="button" class="ghost" id="btnQueueRefresh">刷新</button>
+        <button type="button" class="primary" id="btnQueueDone">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- History media preview -->
+  <div id="historyPreviewModal" class="confirm-modal history-preview-modal" hidden>
+    <div class="confirm-backdrop" id="historyPreviewBackdrop"></div>
+    <div class="confirm-panel history-preview-panel" role="dialog" aria-modal="true" aria-labelledby="historyPreviewTitle">
+      <div class="tags-modal-head">
+        <div>
+          <div class="section-kicker">预览</div>
+          <h3 id="historyPreviewTitle" class="confirm-title">媒体预览</h3>
+          <p class="tags-modal-sub muted" id="historyPreviewMeta"></p>
+        </div>
+        <button type="button" class="ghost icon-btn" id="btnHistoryPreviewClose" aria-label="关闭">✕</button>
+      </div>
+      <div class="history-preview-body" id="historyPreviewBody"></div>
+      <div class="confirm-actions tags-modal-actions">
+        <a class="ghost" id="historyPreviewOpen" href="#" target="_blank" rel="noopener">新窗口打开</a>
+        <button type="button" class="primary" id="btnHistoryPreviewDone">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=20260802-tagmerge"></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+services:
+  web:
+    image: ghcr.io/poillysky/telegramdl:1.0.0
+    build: .
+    container_name: telegram-group-downloader
+    restart: unless-stopped
+    ports:
+      - "9345:9345"
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads
+      - ./data:/app/data
+      - ./sessions:/app/sessions
+    environment:
+      - HOST=0.0.0.0
+      - PORT=9345
+      - DOWNLOAD_DIR=/app/downloads
+      - DATA_DIR=/app/data
+      - SESSION_DIR=/app/sessions

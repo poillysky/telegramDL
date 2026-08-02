@@ -1,0 +1,1000 @@
+"""Rules for mapping group captions into nested / merged download folders."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Iterable, Optional
+
+from telethon.tl.custom.message import Message
+from telethon.tl.types import (
+    DocumentAttributeAudio,
+    DocumentAttributeFilename,
+    DocumentAttributeVideo,
+    MessageMediaDocument,
+    MessageMediaPhoto,
+)
+
+INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+WHITESPACE = re.compile(r"\s+")
+
+# #风流狗尾巴 或 #1#2（逐个匹配，# 始终在前）
+HASHTAG_RE = re.compile(r"#([^\s#@/\\<>:|?*]+)")
+# 7.18 / 07.18
+DATE_DOT_RE = re.compile(r"(?<!\d)(\d{1,2}\.\d{1,2})(?!\d)")
+# 7月18日
+DATE_CN_RE = re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]?")
+
+
+def sanitize_name(name: str, max_len: int = 120) -> str:
+    name = name.strip().replace("\n", " ").replace("\r", " ")
+    name = WHITESPACE.sub(" ", name)
+    name = INVALID_PATH_CHARS.sub("_", name)
+    name = name.strip(" .")
+    if not name:
+        return "_未命名"
+    if len(name) > max_len:
+        name = name[:max_len].rstrip(" .")
+    return name
+
+
+def message_text(message: Message) -> str:
+    return (message.message or message.text or "").strip()
+
+
+def has_media(message: Message) -> bool:
+    if not message.media:
+        return False
+    return isinstance(message.media, (MessageMediaPhoto, MessageMediaDocument)) or bool(
+        message.photo
+        or message.document
+        or message.video
+        or message.audio
+        or message.voice
+        or message.video_note
+        or message.gif
+        or message.sticker
+    )
+
+
+def detect_media_type(message: Message) -> Optional[str]:
+    if message.photo:
+        return "photo"
+    if message.voice:
+        return "voice"
+    if message.video_note:
+        return "video_note"
+    if message.video or message.gif:
+        return "video"
+    if message.audio:
+        return "audio"
+    if message.sticker:
+        return "sticker"
+    if message.document:
+        doc = message.document
+        for attr in doc.attributes or []:
+            if isinstance(attr, DocumentAttributeAudio):
+                if getattr(attr, "voice", False):
+                    return "voice"
+                return "audio"
+            if isinstance(attr, DocumentAttributeVideo):
+                if getattr(attr, "round_message", False):
+                    return "video_note"
+                return "video"
+        return "document"
+    return None
+
+
+def _extension_for_message(message: Message, media_type: Optional[str]) -> str:
+    if message.file and message.file.ext:
+        return message.file.ext
+    defaults = {
+        "photo": ".jpg",
+        "video": ".mp4",
+        "video_note": ".mp4",
+        "voice": ".ogg",
+        "audio": ".mp3",
+        "document": "",
+        "sticker": ".webp",
+    }
+    return defaults.get(media_type or "", "")
+
+
+def _original_filename(message: Message) -> Optional[str]:
+    if message.file and message.file.name:
+        return message.file.name
+    if message.document:
+        for attr in message.document.attributes or []:
+            if isinstance(attr, DocumentAttributeFilename):
+                return attr.file_name
+    return None
+
+
+def message_file_extension(message: Message, media_type: Optional[str] = None) -> str:
+    """Return extension without leading dot, lowercased."""
+    ext = _extension_for_message(message, media_type or detect_media_type(message))
+    name = _original_filename(message) or ""
+    if not ext and "." in name:
+        ext = "." + name.rsplit(".", 1)[-1]
+    return (ext or "").lstrip(".").lower()
+
+
+def _normalize_format_set(raw: Optional[Iterable[str] | str]) -> set[str]:
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        parts = re.split(r"[,，\s]+", raw.strip())
+    else:
+        parts = list(raw)
+    return {str(x).strip().lstrip(".").lower() for x in parts if str(x).strip()}
+
+
+def matches_file_formats(
+    message: Message,
+    formats: Optional[list[str] | dict[str, list[str]] | str],
+    media_type: Optional[str] = None,
+) -> bool:
+    """
+    Empty formats → accept all.
+    list/str → global extension allow-list.
+    dict → per media_type allow-list (missing/empty type key → accept that type).
+    """
+    if not formats:
+        return True
+    mt = media_type or detect_media_type(message) or ""
+    if isinstance(formats, dict):
+        # Missing type key → allow that media type
+        if mt not in formats:
+            return True
+        allowed = _normalize_format_set(formats.get(mt))
+        if not allowed:
+            return True
+    else:
+        allowed = _normalize_format_set(formats)
+        if not allowed:
+            return True
+
+    ext = message_file_extension(message, mt or None)
+    if not ext:
+        if mt == "photo":
+            ext = "jpg"
+    return ext in allowed
+
+
+def matches_file_size(
+    expected_size: int,
+    *,
+    min_bytes: int = 0,
+    max_bytes: int = 0,
+) -> bool:
+    """min/max 0 = no bound. Unknown size (0) always passes."""
+    size = int(expected_size or 0)
+    if size <= 0:
+        return True
+    lo = max(0, int(min_bytes or 0))
+    hi = max(0, int(max_bytes or 0))
+    if lo and size < lo:
+        return False
+    if hi and size > hi:
+        return False
+    return True
+
+
+def extract_date_token(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = DATE_DOT_RE.search(text)
+    if m:
+        return m.group(1)
+    m = DATE_CN_RE.search(text)
+    if m:
+        return f"{int(m.group(1))}.{int(m.group(2))}"
+    return None
+
+
+def extract_tags(text: str) -> list[str]:
+    """
+    Extract tags from caption. # always prefix: #1  #1#2  #风流狗尾巴
+    Returns normalized tag names without #.
+    """
+    if not text:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+
+    for m in HASHTAG_RE.finditer(text):
+        tag = m.group(1).strip()
+        if tag and tag not in seen:
+            seen.add(tag)
+            found.append(tag)
+
+    return found
+
+
+def normalize_tag_list(raw: Optional[Iterable[str] | str]) -> list[str]:
+    """Accept '#a,#b' / ['#a','b'] → ['a','b'] (order preserved, de-duped)."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        parts = re.split(r"[,，\s]+", raw.strip())
+    else:
+        parts = []
+        for item in raw:
+            s = str(item or "").strip()
+            if not s:
+                continue
+            if "," in s or "，" in s or " " in s:
+                parts.extend(re.split(r"[,，\s]+", s))
+            else:
+                parts.append(s)
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        tag = p.strip().lstrip("#").strip()
+        if not tag:
+            continue
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tag)
+    return out
+
+
+def normalize_keyword_list(raw: Optional[Iterable[str] | str]) -> list[str]:
+    """Comma/空白分隔的文案关键词列表。"""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        parts = re.split(r"[,，]+", raw.strip())
+    else:
+        parts = [str(x) for x in raw]
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        kw = p.strip()
+        if not kw:
+            continue
+        key = kw.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(kw)
+    return out
+
+
+def matches_include_tags(
+    message_tags: Optional[Iterable[str]],
+    include_tags: Optional[Iterable[str]],
+    *,
+    mode: str = "any",
+) -> bool:
+    """Empty include_tags → accept all. mode: any | all."""
+    wanted = normalize_tag_list(include_tags)
+    if not wanted:
+        return True
+    have = {t.strip().lstrip("#").lower() for t in (message_tags or []) if str(t).strip()}
+    need = {t.lower() for t in wanted}
+    if mode == "all":
+        return need.issubset(have)
+    return bool(have & need)
+
+
+def matches_caption_keywords(
+    caption: Optional[str],
+    keywords: Optional[Iterable[str]],
+) -> bool:
+    """Empty keywords → accept all. Match if caption contains any keyword (case-insensitive)."""
+    kws = normalize_keyword_list(keywords)
+    if not kws:
+        return True
+    text = (caption or "").lower()
+    if not text:
+        return False
+    return any(k.lower() in text for k in kws)
+
+
+def extract_hashtag(text: str) -> Optional[str]:
+    tags = extract_tags(text)
+    return tags[0] if tags else None
+
+
+def _tag_sort_key(tag: str):
+    if tag.isdigit():
+        return (0, int(tag), "")
+    return (1, 0, tag.lower())
+
+
+def format_merged_folder_name(tags: Iterable[str]) -> str:
+    """
+    ['1','2','3'] → '#1 #2 #3'
+    ['风流狗尾巴'] → '#风流狗尾巴'
+    """
+    uniq = sorted(
+        {t.strip().lstrip("#") for t in tags if t and str(t).strip()},
+        key=_tag_sort_key,
+    )
+    if not uniq:
+        return "_未分类"
+    name = " ".join(f"#{t}" for t in uniq)
+    return sanitize_name(name, max_len=180)
+
+
+def relation_blacklist_set(blacklist: Optional[Iterable[str]] = None) -> set[str]:
+    return {
+        str(b).strip().lstrip("#").lower()
+        for b in (blacklist or [])
+        if str(b).strip()
+    }
+
+
+def strip_relation_blacklist(
+    tags: Optional[Iterable[str]],
+    blacklist: Optional[Iterable[str]] = None,
+) -> list[str]:
+    """Normalize tags and drop relation-hub blacklist entries (order preserved)."""
+    bl = relation_blacklist_set(blacklist)
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in normalize_tag_list(tags or []):
+        key = t.lower()
+        if key in bl or key in seen:
+            continue
+        seen.add(key)
+        out.append(t)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tag relation / folder merge (single source of truth)
+#
+# Pipeline:
+#   1) Index: caption tags stored per media (chat_media_index)
+#   2) Graph: Union-Find on co-occurrence groups (same caption share = edge)
+#      - Blacklist hubs never bridge components and never enter folder names
+#      - Disk folders named #a #b also contribute edges (after blacklist strip)
+#   3) Name: tag → '#1 #2 #3' via build_tag_folder_map_from_groups /
+#      resolve_related_folder_name / canonical_tag_folder
+#   4) Expand (download filter): same UF components (expand_tags_via_cooccurrence)
+#   5) Physical merge: merge_related_tag_folders moves dirs into canonical names
+#
+# UI picker may add extra hubDegree heuristics; download/folder always use this UF.
+# ---------------------------------------------------------------------------
+
+
+class TagUnionFind:
+    """
+    Case-insensitive union-find for co-occurring tags.
+    Keys are lowercase; display casing is first-seen.
+    """
+
+    def __init__(self) -> None:
+        self.parent: dict[str, str] = {}
+        self.display: dict[str, str] = {}
+
+    def _key(self, tag: str) -> str:
+        return str(tag or "").strip().lstrip("#").lower()
+
+    def add(self, tag: str) -> str:
+        key = self._key(tag)
+        if not key:
+            return ""
+        if key not in self.parent:
+            self.parent[key] = key
+            self.display[key] = str(tag).strip().lstrip("#")
+        return key
+
+    def find(self, tag: str) -> str:
+        key = self.add(tag)
+        if not key:
+            return ""
+        while self.parent[key] != key:
+            self.parent[key] = self.parent[self.parent[key]]
+            key = self.parent[key]
+        return key
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if not ra or not rb or ra == rb:
+            return
+        self.parent[rb] = ra
+
+    def union_group(self, tags: list[str]) -> None:
+        cleaned = [t for t in tags if self._key(t)]
+        if not cleaned:
+            return
+        self.add(cleaned[0])
+        for t in cleaned[1:]:
+            self.union(cleaned[0], t)
+
+    def build_tag_to_folder(self) -> dict[str, str]:
+        groups: dict[str, set[str]] = {}
+        for key in self.parent:
+            root = self.find(key)
+            groups.setdefault(root, set()).add(self.display.get(key, key))
+        folder_by_root = {
+            root: format_merged_folder_name(members) for root, members in groups.items()
+        }
+        out: dict[str, str] = {}
+        for key in self.parent:
+            folder = folder_by_root[self.find(key)]
+            out[self.display.get(key, key)] = folder
+            out[key] = folder
+        return out
+
+    def components(self) -> dict[str, list[str]]:
+        """root_key → sorted display tags."""
+        groups: dict[str, set[str]] = {}
+        for key in self.parent:
+            root = self.find(key)
+            groups.setdefault(root, set()).add(self.display.get(key, key))
+        return {
+            root: sorted(members, key=_tag_sort_key)
+            for root, members in groups.items()
+        }
+
+    def related_map(self) -> dict[str, list[str]]:
+        """display tag → other display tags in the same component."""
+        out: dict[str, list[str]] = {}
+        for members in self.components().values():
+            for tag in members:
+                out[tag] = [t for t in members if t.lower() != tag.lower()]
+        return out
+
+    def expand_seeds(self, seeds: Iterable[str]) -> list[str]:
+        """Seeds first, then other members of the same components."""
+        seed_list = normalize_tag_list(seeds)
+        if not seed_list:
+            return []
+        seen = {t.lower(): t for t in seed_list}
+        out = list(seed_list)
+        for seed in seed_list:
+            key = self._key(seed)
+            if key not in self.parent:
+                continue
+            root = self.find(key)
+            for member_key in list(self.parent.keys()):
+                if self.find(member_key) != root:
+                    continue
+                name = self.display.get(member_key, member_key)
+                lk = name.lower()
+                if lk in seen:
+                    continue
+                seen[lk] = name
+                out.append(name)
+        return out
+
+
+def build_tag_uf_from_tag_groups(
+    groups: Iterable[Iterable[str]],
+    *,
+    blacklist: Optional[Iterable[str]] = None,
+) -> TagUnionFind:
+    """Union tags that co-occur in the same group (caption), transitively."""
+    uf = TagUnionFind()
+    for group in groups:
+        tags = strip_relation_blacklist(group, blacklist)
+        if tags:
+            uf.union_group(tags)
+    return uf
+
+
+def build_tag_folder_map_from_texts(
+    texts: Iterable[str],
+    *,
+    blacklist: Optional[Iterable[str]] = None,
+) -> dict[str, str]:
+    uf = TagUnionFind()
+    for text in texts:
+        tags = strip_relation_blacklist(extract_tags(text or ""), blacklist)
+        if tags:
+            uf.union_group(tags)
+    return uf.build_tag_to_folder()
+
+
+def build_tag_uf_from_group_dir(
+    group_dir: Optional[Path],
+    extra_groups: Optional[Iterable[list[str]]] = None,
+    *,
+    blacklist: Optional[Iterable[str]] = None,
+) -> TagUnionFind:
+    """Union tags from existing #… folders on disk + optional caption groups."""
+    uf = TagUnionFind()
+    if group_dir and group_dir.is_dir():
+        for p in group_dir.iterdir():
+            if not p.is_dir():
+                continue
+            tags = strip_relation_blacklist(extract_tags(p.name), blacklist)
+            if tags:
+                uf.union_group(tags)
+    if extra_groups:
+        for group in extra_groups:
+            tags = strip_relation_blacklist(group, blacklist)
+            if tags:
+                uf.union_group(tags)
+    return uf
+
+
+def build_tag_folder_map_from_groups(
+    groups: Iterable[Iterable[str]],
+    *,
+    group_dir: Optional[Path] = None,
+    blacklist: Optional[Iterable[str]] = None,
+) -> dict[str, str]:
+    """
+    tag → full related-folder name.
+    Edges: caption co-occurrence + disk folder names; blacklist hubs never bridge.
+    """
+    uf = (
+        build_tag_uf_from_group_dir(group_dir, None, blacklist=blacklist)
+        if group_dir
+        else TagUnionFind()
+    )
+    for group in groups:
+        tags = strip_relation_blacklist(group, blacklist)
+        if tags:
+            uf.union_group(tags)
+    return uf.build_tag_to_folder()
+
+
+def expand_tags_via_cooccurrence(
+    seeds: Iterable[str],
+    groups: Iterable[Iterable[str]],
+    *,
+    blacklist: Optional[Iterable[str]] = None,
+) -> list[str]:
+    """
+    Expand seeds with all tags in the same UF components (same rules as folders).
+    Seeds keep original order first; related tags append afterward.
+    """
+    seed_list = normalize_tag_list(seeds)
+    if not seed_list:
+        return []
+    uf = build_tag_uf_from_tag_groups(groups, blacklist=blacklist)
+    return uf.expand_seeds(seed_list)
+
+
+def _folder_map_lookup(tag_folder_map: dict[str, str], tag: str) -> Optional[str]:
+    if not tag_folder_map or not tag:
+        return None
+    if tag in tag_folder_map:
+        return tag_folder_map[tag]
+    key = str(tag).strip().lstrip("#").lower()
+    if key in tag_folder_map:
+        return tag_folder_map[key]
+    for k, v in tag_folder_map.items():
+        if str(k).lower() == key:
+            return v
+    return None
+
+
+def resolve_related_folder_name(
+    tags: Iterable[str],
+    *,
+    tag_folder_map: Optional[dict[str, str]] = None,
+    blacklist: Optional[Iterable[str]] = None,
+) -> str:
+    """
+    Folder name = full related component when known, else this caption's tags.
+    Hub/blacklist tags are omitted from the folder name.
+    """
+    ordered = strip_relation_blacklist(tags, blacklist)
+    if not ordered:
+        return "_未分类"
+
+    best: Optional[str] = None
+    best_n = -1
+    if tag_folder_map:
+        for t in ordered:
+            mapped = _folder_map_lookup(tag_folder_map, t)
+            if not mapped:
+                continue
+            n = len(extract_tags(mapped))
+            if n > best_n:
+                best_n = n
+                best = mapped
+    if best:
+        members = strip_relation_blacklist(extract_tags(best), blacklist)
+        have = {m.lower() for m in members}
+        extra = [t for t in ordered if t.lower() not in have]
+        if extra:
+            return format_merged_folder_name(list(members) + extra)
+        if not members:
+            return "_未分类"
+        return format_merged_folder_name(members)
+    return format_merged_folder_name(ordered)
+
+
+def _move_path_unique(src: Path, dst_dir: Path) -> Path:
+    """Move file into dst_dir; on name conflict append _1, _2, …"""
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    target = dst_dir / src.name
+    if not target.exists():
+        src.rename(target)
+        return target
+    stem, suffix = src.stem, src.suffix
+    i = 1
+    while True:
+        alt = dst_dir / f"{stem}_{i}{suffix}"
+        if not alt.exists():
+            src.rename(alt)
+            return alt
+        i += 1
+
+
+def _merge_tree_into(src: Path, dst: Path) -> None:
+    """Move all contents of src into dst (recursive), then remove empty src."""
+    if not src.is_dir():
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in list(src.iterdir()):
+        if item.is_dir():
+            _merge_tree_into(item, dst / item.name)
+        else:
+            _move_path_unique(item, dst)
+    try:
+        if src.exists() and not any(src.iterdir()):
+            src.rmdir()
+    except OSError:
+        pass
+
+
+def canonical_tag_folder(
+    group_dir: Optional[Path],
+    tags: list[str],
+    *,
+    tag_folder_map: Optional[dict[str, str]] = None,
+    blacklist: Optional[Iterable[str]] = None,
+) -> str:
+    """
+    Folder name for this message's tags, considering related map + disk folders.
+
+    Example: caption #1#2 with related #3 → '#1 #2 #3'
+    Later caption #1 alone → still '#1 #2 #3'
+    """
+    if not tags:
+        return "_未分类"
+    mapping = dict(tag_folder_map or {})
+    if group_dir:
+        disk_map = build_tag_uf_from_group_dir(
+            group_dir, [list(tags)], blacklist=blacklist
+        ).build_tag_to_folder()
+        for tag, folder in disk_map.items():
+            prev = _folder_map_lookup(mapping, tag)
+            if not prev or len(extract_tags(folder)) >= len(extract_tags(prev)):
+                mapping[tag] = folder
+    return resolve_related_folder_name(
+        tags, tag_folder_map=mapping or None, blacklist=blacklist
+    )
+
+
+def merge_related_tag_folders(
+    group_dir: Path,
+    *,
+    extra_tag_groups: Optional[Iterable[list[str]]] = None,
+    blacklist: Optional[Iterable[str]] = None,
+) -> list[str]:
+    """
+    Merge top-level #tag dirs that share tags transitively.
+    #1 + #2 + related #3 → single folder #1 #2 #3
+    Date subfolders (e.g. 7.18) are preserved under the merged name.
+    """
+    if not group_dir.is_dir():
+        return []
+
+    tag_dirs = [
+        p for p in group_dir.iterdir() if p.is_dir() and extract_tags(p.name)
+    ]
+    if len(tag_dirs) < 2 and not extra_tag_groups:
+        return []
+
+    tag_to_folder = build_tag_folder_map_from_groups(
+        extra_tag_groups or [],
+        group_dir=group_dir,
+        blacklist=blacklist,
+    )
+    if not tag_to_folder:
+        return []
+
+    plan: list[tuple[Path, str]] = []
+    for d in tag_dirs:
+        tags = extract_tags(d.name)
+        target = resolve_related_folder_name(
+            tags, tag_folder_map=tag_to_folder, blacklist=blacklist
+        )
+        if target and target != d.name and target != "_未分类":
+            plan.append((d, target))
+
+    if not plan:
+        return []
+
+    logs: list[str] = []
+    for src, target_name in plan:
+        if not src.exists():
+            continue
+        dst = group_dir / target_name
+        _merge_tree_into(src, dst)
+        logs.append(f"合并目录: {src.name} → {target_name}")
+    return logs
+
+
+MENTION_RE = re.compile(r"@\S+")
+
+
+def resolve_caption_text(
+    message: Message,
+    *,
+    album_captions: Optional[dict] = None,
+    caption_override: Optional[str] = None,
+) -> str:
+    """
+    Read ONLY the message caption / album caption.
+    Never uses Telegram original filename.
+    Example: 「#风流狗尾巴 7.18自录 @csdkl333」
+    """
+    if caption_override is not None and str(caption_override).strip():
+        text = str(caption_override).strip()
+        grouped_id = getattr(message, "grouped_id", None)
+        if album_captions is not None and grouped_id:
+            album_captions[grouped_id] = text
+        return text
+
+    text = message_text(message)
+    grouped_id = getattr(message, "grouped_id", None)
+
+    if album_captions is not None and grouped_id:
+        if text:
+            album_captions[grouped_id] = text
+        else:
+            text = album_captions.get(grouped_id, "") or ""
+
+    return text.strip()
+
+
+def caption_filename_stem(caption: str) -> str:
+    """
+    File stem from caption body.
+    「#风流狗尾巴 7.18自录 @csdkl333」→「自录」
+    (tags / date / @mention already used for folders)
+    """
+    if not caption:
+        return ""
+    text = caption
+    text = HASHTAG_RE.sub(" ", text)
+    text = DATE_CN_RE.sub(" ", text)
+    text = DATE_DOT_RE.sub(" ", text)
+    text = MENTION_RE.sub(" ", text)
+    return sanitize_name(WHITESPACE.sub(" ", text).strip(), max_len=80)
+
+
+def resolve_media_subdir(
+    message: Message,
+    *,
+    album_captions: Optional[dict] = None,
+    use_caption_folders: bool = True,
+    tag_folder_map: Optional[dict[str, str]] = None,
+    group_dir: Optional[Path] = None,
+    folder_mode: str = "caption",
+    caption_override: Optional[str] = None,
+    tag_blacklist: Optional[Iterable[str]] = None,
+) -> str:
+    """
+    Resolve relative folder under group dir.
+
+    folder_mode:
+      - caption: full related #tags + date from 文案
+      - media_type: photo/video/...
+      - flat: no subfolder (files directly under group dir)
+    """
+    mode = (folder_mode or "caption").strip()
+    if mode not in ("caption", "media_type", "flat"):
+        mode = "caption" if use_caption_folders else "flat"
+
+    if mode == "flat":
+        return ""
+    if mode == "media_type":
+        mt = detect_media_type(message) or "file"
+        if mt == "sticker":
+            mt = "document"
+        return mt
+    if not use_caption_folders:
+        return "_未分类"
+
+    combined = resolve_caption_text(
+        message,
+        album_captions=album_captions,
+        caption_override=caption_override,
+    )
+    tags = extract_tags(combined)
+    date_token = extract_date_token(combined)
+    if date_token:
+        date_token = sanitize_name(date_token, max_len=32)
+
+    # Use full related multi-tag folder name (index co-occurrence + disk),
+    # not only the tags present on this single caption.
+    category: Optional[str] = None
+    if tags:
+        category = canonical_tag_folder(
+            group_dir,
+            tags,
+            tag_folder_map=tag_folder_map,
+            blacklist=tag_blacklist,
+        )
+
+    if category and date_token:
+        return f"{category}/{date_token}"
+    if category:
+        return category
+    if date_token:
+        return f"_未分类/{date_token}"
+    return "_未分类"
+
+
+def build_filename(
+    message: Message,
+    media_type: Optional[str],
+    *,
+    album_captions: Optional[dict] = None,
+    caption: Optional[str] = None,
+) -> str:
+    """
+    Use Telegram original filename when present.
+    Folder layout still comes from caption elsewhere; caption args kept for call-site compat.
+    """
+    _ = album_captions, caption  # unused — folders use caption, files use original name
+    original = _original_filename(message)
+    if original:
+        return sanitize_name(original, max_len=180)
+
+    ext = _extension_for_message(message, media_type)
+    return f"{media_type or 'file'}_{message.id}{ext}"
+
+
+def next_folder_state(
+    current_folder: Optional[str],
+    message: Message,
+    *,
+    use_text_as_folder: bool,
+    min_len: int,
+    album_captions: Optional[dict] = None,
+    tag_folder_map: Optional[dict[str, str]] = None,
+    group_dir: Optional[Path] = None,
+    folder_mode: str = "caption",
+    tag_blacklist: Optional[Iterable[str]] = None,
+) -> tuple[Optional[str], Optional[str], bool]:
+    if not has_media(message):
+        return current_folder, None, True
+
+    subdir = resolve_media_subdir(
+        message,
+        album_captions=album_captions,
+        use_caption_folders=use_text_as_folder,
+        tag_folder_map=tag_folder_map,
+        group_dir=group_dir,
+        folder_mode=folder_mode,
+        tag_blacklist=tag_blacklist,
+    )
+    return subdir, subdir, False
+
+
+def file_looks_complete(path: Path, expected_size: int = 0) -> bool:
+    """True if path exists and size looks like a finished download (not .part)."""
+    try:
+        if not path or not path.exists() or not path.is_file():
+            return False
+        if str(path).endswith(".part"):
+            return False
+        size = path.stat().st_size
+        if size <= 0:
+            return False
+        if expected_size and expected_size > 0 and size != int(expected_size):
+            return False
+        return True
+    except OSError:
+        return False
+
+
+def build_identical_file_index(group_dir: Path) -> dict[tuple[str, int], Path]:
+    """
+    Index finished files under group_dir by (filename_lower, size).
+    Used to skip re-downloading identical media already saved in any subfolder.
+    """
+    index: dict[tuple[str, int], Path] = {}
+    if not group_dir or not group_dir.exists():
+        return index
+    try:
+        for p in group_dir.rglob("*"):
+            try:
+                if not p.is_file():
+                    continue
+                name = p.name
+                if name.endswith(".part"):
+                    continue
+                size = p.stat().st_size
+                if size <= 0:
+                    continue
+                key = (name.lower(), int(size))
+                if key not in index:
+                    index[key] = p
+            except OSError:
+                continue
+    except OSError:
+        return index
+    return index
+
+
+def find_identical_file(
+    filename: str,
+    expected_size: int,
+    *,
+    dup_index: Optional[dict[tuple[str, int], Path]] = None,
+    group_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """
+    Find an already-saved file with the same name and size (一模一样).
+    Prefers dup_index; falls back to scanning group_dir when size is known.
+    """
+    name = (filename or "").strip()
+    if not name or name.endswith(".part"):
+        return None
+    size = int(expected_size or 0)
+    if size <= 0:
+        return None
+    key = (name.lower(), size)
+    if dup_index is not None:
+        hit = dup_index.get(key)
+        if hit is not None and file_looks_complete(hit, size):
+            return hit
+        return None
+    if not group_dir or not group_dir.exists():
+        return None
+    try:
+        for p in group_dir.rglob(name):
+            if p.is_file() and file_looks_complete(p, size):
+                return p
+    except OSError:
+        return None
+    return None
+
+
+def resolve_download_path(
+    directory: Path,
+    filename: str,
+    message_id: int,
+    expected_size: int = 0,
+) -> tuple[Path, bool]:
+    """
+    Pick a target path. Returns (path, already_complete).
+    Reuses existing complete files (original name or name_msgid) instead of re-downloading.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    primary = directory / filename
+    stem = primary.stem
+    suffix = primary.suffix
+    with_id = directory / f"{stem}_{message_id}{suffix}"
+
+    for candidate in (primary, with_id):
+        if file_looks_complete(candidate, expected_size):
+            return candidate, True
+
+    # Incomplete primary → overwrite it on next download
+    if primary.exists() and not file_looks_complete(primary, expected_size):
+        return primary, False
+    if not primary.exists():
+        return primary, False
+    # Primary exists but size unknown / treated incomplete above; prefer msgid name
+    if not with_id.exists():
+        return with_id, False
+    i = 1
+    while True:
+        alt = directory / f"{stem}_{message_id}_{i}{suffix}"
+        if file_looks_complete(alt, expected_size):
+            return alt, True
+        if not alt.exists():
+            return alt, False
+        i += 1
+
+
+def unique_path(directory: Path, filename: str, message_id: int) -> Path:
+    path, _done = resolve_download_path(directory, filename, message_id, expected_size=0)
+    return path
