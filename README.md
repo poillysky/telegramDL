@@ -75,16 +75,16 @@ WEB_PASSWORD=自定义管理密码
 docker compose up -d --build
 ```
 
-或直接使用已发布镜像（[GitHub Packages](https://github.com/poillysky/telegramDL/pkgs/container/telegramdl)）：
+或直接使用已发布镜像（[Docker Hub](https://hub.docker.com/r/poillysky/telegramdl)）：
 
 ```bash
-docker pull ghcr.io/poillysky/telegramdl:1.0.0
+docker pull poillysky/telegramdl:1.0.0
 docker run -d --name telegramdl -p 9345:9345 \
   --env-file .env \
   -v "$(pwd)/downloads:/app/downloads" \
   -v "$(pwd)/data:/app/data" \
   -v "$(pwd)/sessions:/app/sessions" \
-  ghcr.io/poillysky/telegramdl:1.0.0
+  poillysky/telegramdl:1.0.0
 ```
 
 浏览器打开 [http://localhost:9345](http://localhost:9345)：

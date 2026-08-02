@@ -1,0 +1,36 @@
+# 飞牛 NAS (fnOS) 部署
+#
+# 1. 文件管理创建目录：/vol1/1000/Docker/telegramdl
+# 2. 在该目录下放好本文件，并改名为 docker-compose.yml（或 Compose 里直接粘贴）
+# 3. 同目录新建 .env（可参考仓库 .env.example），至少改 WEB_PASSWORD
+# 4. 飞牛 Docker → Compose → 新增项目 → 路径选 telegramdl → 启动
+#
+# 镜像：Docker Hub  poillysky/telegramdl:1.0.0
+# 相对路径 ./ 落在项目目录下，飞牛会自动创建子目录：
+#   ./downloads  下载文件
+#   ./data       数据库 / 日志
+#   ./sessions   Telegram 会话（勿泄露）
+
+services:
+  telegramdl:
+    image: poillysky/telegramdl:1.0.0
+    container_name: telegramdl
+    restart: unless-stopped
+    ports:
+      - "9345:9345"
+    env_file:
+      - ./.env
+    environment:
+      - TZ=Asia/Shanghai
+      - HOST=0.0.0.0
+      - PORT=9345
+      - DOWNLOAD_DIR=/app/downloads
+      - DATA_DIR=/app/data
+      - SESSION_DIR=/app/sessions
+    volumes:
+      - ./downloads:/app/downloads
+      - ./data:/app/data
+      - ./sessions:/app/sessions
+    # 要用飞牛本机 Clash 代理时，.env 里写：
+    #   PROXY=socks5://宿主机局域网IP:7897
+    # 不要写 127.0.0.1（那是容器自己）
