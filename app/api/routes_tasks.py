@@ -311,7 +311,7 @@ async def update_task_tags(
     body: UpdateTaskTagsBody,
     _: None = Depends(require_web_auth),
 ):
-    """Update monitor tags on an existing task (applies on next poll / continue)."""
+    """Update monitor tags; new tags auto-start index backlog download."""
     return await update_task_settings(
         task_id,
         UpdateTaskSettingsBody(
@@ -329,10 +329,13 @@ async def update_task_settings(
     body: UpdateTaskSettingsBody,
     _: None = Depends(require_web_auth),
 ):
-    """Update tags / concurrency / delay etc. (tags apply next poll; concurrency after 继续)."""
+    """Update tags / concurrency / delay. Monitor: new tags auto-start index backlog."""
     task = await db.get_task(task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
+
+    old_tags = normalize_tag_list(task.get("include_tags") or [])
+    old_kws = normalize_keyword_list(task.get("caption_keywords") or [])
 
     fields: dict = {}
     log_bits: list[str] = []
@@ -387,6 +390,23 @@ async def update_task_settings(
     await db.append_log(task_id, "已更新任务设置: " + " · ".join(log_bits))
     _tag_match_cache.pop(int(task_id), None)
     task = await db.get_task(task_id)
+
+    # Monitor: newly added tags/keywords → auto-start backlog download
+    mode = normalize_download_mode(task.get("download_mode") or "")
+    if mode == "monitor" and (
+        body.include_tags is not None or body.caption_keywords is not None
+    ):
+        new_tags = normalize_tag_list(task.get("include_tags") or [])
+        new_kws = normalize_keyword_list(task.get("caption_keywords") or [])
+        gained = (set(new_tags) - set(old_tags)) or (set(new_kws) - set(old_kws))
+        if gained and (new_tags or new_kws):
+            await db.append_log(
+                task_id, "标签/关键词已更新，自动开始按索引下载…"
+            )
+            await db.update_task(task_id, status="pending", last_error=None)
+            await scheduler.start_task(task_id)
+            task = await db.get_task(task_id)
+
     return {"ok": True, "task": await _with_tag_progress(task)}
 
 

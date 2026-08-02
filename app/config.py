@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     small_file_concurrency: int = 5
     # Media TCP sessions on media DCs (parallel file sessions are allowed there).
     # Higher hides SOCKS/代理 RTT; keep ≤8 to avoid FloodWait.
-    # Safer defaults (near official large_queue=2); raise only if needed.
+    # Defaults; raise via .env for proxy RTT (hard cap 8).
     media_connections: int = 3
     download_pipeline: int = 4
     # upload.getFile part size (bytes). Official max 1MiB.

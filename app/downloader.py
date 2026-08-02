@@ -710,7 +710,8 @@ class DownloadScheduler:
         tag_blacklist = await self.db.get_tag_relation_blacklist()
         # Tag filter is always OR: hit any selected tag → download
         tag_match_mode = "any"
-        media_conn = max(1, min(4, int(getattr(settings, "media_connections", 2) or 2)))
+        # Cap ≤8; safe operating range is 2–3 (see .env MEDIA_CONNECTIONS)
+        media_conn = max(1, min(8, int(getattr(settings, "media_connections", 3) or 3)))
         try:
             from app.telegram_client import install_media_connection_pool
 
@@ -948,16 +949,8 @@ class DownloadScheduler:
                 task_id, f"已扫描群目录，可按同名同大小跳过 {len(dup_index)} 个文件"
             )
 
-        if not include_tags and not caption_keywords:
-            await self.db.update_task(
-                task_id,
-                status="failed",
-                last_error="监控模式需要选择标签或填写文案关键词",
-            )
-            await self.db.append_log(
-                task_id, "失败：请选择至少一个标签，或填写文案关键词"
-            )
-            return
+        # Empty tags/keywords allowed: build index then index-only monitor;
+        # downloads start when tags are added in task settings.
 
         coverage = await indexer.assess_index_coverage(chat_id)
         meta0 = await self.db.get_index_meta(chat_id) or {}
@@ -1047,7 +1040,7 @@ class DownloadScheduler:
                 int(meta.get("last_message_id") or 0),
                 int(counters.get("last_id") or 0),
             )
-            await self._monitor_tagged_messages(
+            reason = await self._monitor_tagged_messages(
                 task_id=task_id,
                 stop_event=stop_event,
                 settings=settings,
@@ -1071,7 +1064,19 @@ class DownloadScheduler:
                 test_mode=test_mode,
                 test_deadline=test_deadline,
             )
-            return
+            if reason != "filters_ready" or stop_event.is_set():
+                return
+            fresh = await self.db.get_task(task_id) or {}
+            include_tags = normalize_tag_list(fresh.get("include_tags") or [])
+            caption_keywords = normalize_keyword_list(
+                fresh.get("caption_keywords") or []
+            )
+            if not include_tags and not caption_keywords:
+                return
+            await self.db.append_log(
+                task_id, "已配置标签/关键词，开始按索引补下历史匹配…"
+            )
+            # Fall through to tagged backlog + monitor
         # Expand with direct + indirect related tags from caption co-occurrence
         expanded_tags = await self.db.expand_related_tags(chat_id, include_tags)
         if len(expanded_tags) > len(include_tags):
@@ -1480,7 +1485,7 @@ class DownloadScheduler:
             int(counters.get("last_id") or 0),
             max(message_ids) if message_ids else 0,
         )
-        await self._monitor_tagged_messages(
+        reason = await self._monitor_tagged_messages(
             task_id=task_id,
             stop_event=stop_event,
             settings=settings,
@@ -1504,6 +1509,41 @@ class DownloadScheduler:
             test_mode=test_mode,
             test_deadline=test_deadline,
         )
+        if reason == "filters_ready" and not stop_event.is_set():
+            await self.db.append_log(
+                task_id, "标签/关键词已更新，重新按索引补下历史匹配…"
+            )
+            await self._download_by_index_body(
+                task_id=task_id,
+                stop_event=stop_event,
+                settings=settings,
+                client=client,
+                chat_id=chat_id,
+                chat_title=chat_title,
+                group_dir=group_dir,
+                media_types=media_types,
+                use_text_as_folder=use_text_as_folder,
+                current_folder=counters.get("current_folder") or current_folder,
+                album_captions=album_captions,
+                processed=int(counters["processed"]),
+                downloaded=int(counters["downloaded"]),
+                failed=await self.db.count_failed(task_id),
+                skipped=int(counters["skipped"]),
+                newest_first=newest_first,
+                index_order_by=index_order_by,
+                test_mode=test_mode,
+                test_deadline=test_deadline,
+                concurrency=concurrency,
+                file_formats=file_formats,
+                max_messages=max_messages,
+                delay_min=delay_min,
+                delay_max=delay_max,
+                folder_mode=folder_mode,
+                include_tags=None,  # reload from DB inside
+                caption_keywords=None,
+                tag_match_mode=tag_match_mode,
+                tag_blacklist=tag_blacklist,
+            )
 
     async def _monitor_tagged_messages(
         self,
@@ -1531,8 +1571,12 @@ class DownloadScheduler:
         test_mode: bool = False,
         test_deadline: float | None = None,
         poll_sec: float = 30.0,
-    ) -> None:
-        """Keep watching the chat for new media matching tags/keywords until paused."""
+    ) -> str | None:
+        """Keep watching the chat for new media matching tags/keywords until paused.
+
+        Returns ``filters_ready`` when tags/keywords appear or grow so the caller
+        can run the index backlog; otherwise ``None``.
+        """
         file_formats = file_formats or []
         include_tags = include_tags or []
         caption_keywords = caption_keywords or []
@@ -1576,13 +1620,38 @@ class DownloadScheduler:
                     skipped_count=int(counters["skipped"]),
                 )
                 await self.db.append_log(task_id, reason)
-                return
+                return None
 
             # Pick up tag edits from the tasks page without restart
             fresh = await self.db.get_task(task_id) or {}
+            prev_tags = set(include_tags)
+            prev_kws = set(caption_keywords)
             include_tags = normalize_tag_list(fresh.get("include_tags") or [])
             caption_keywords = normalize_keyword_list(fresh.get("caption_keywords") or [])
             tag_match_mode = "any"
+            gained = (set(include_tags) - prev_tags) or (
+                set(caption_keywords) - prev_kws
+            )
+            became_filtered = (not prev_tags and not prev_kws) and (
+                include_tags or caption_keywords
+            )
+            if became_filtered or gained:
+                await self.db.append_log(
+                    task_id,
+                    "检测到标签/关键词更新，退出监控以按索引补下历史匹配…",
+                )
+                await self.db.update_task(
+                    task_id,
+                    status="running",
+                    last_message_id=last_seen,
+                    current_folder=counters.get("current_folder"),
+                    processed_count=int(counters["processed"]),
+                    downloaded_count=int(counters["downloaded"]),
+                    failed_count=await self.db.count_failed(task_id),
+                    skipped_count=int(counters["skipped"]),
+                    last_error=None,
+                )
+                return "filters_ready"
 
             if max_messages and int(counters["downloaded"]) >= max_messages:
                 await self.db.update_task(

@@ -3910,10 +3910,11 @@ async function saveTaskTagsModal() {
         chat_title: draft.title || "",
       }),
     });
+    const tagN = (draft.tags || []).length;
     toast(
       autoEnabled
-        ? `任务设置已保存 · 自动增量每 ${autoInterval} 分钟`
-        : "任务设置已保存",
+        ? `任务设置已保存${tagN ? " · 开始按标签下载" : ""} · 自动增量每 ${autoInterval} 分钟`
+        : `任务设置已保存${tagN ? " · 开始按标签下载" : ""}`,
       "ok"
     );
     closeTaskTagsModal();

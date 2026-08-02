@@ -47,7 +47,7 @@ _TG_VALID_LIMITS = (
 # Prefer 1MiB parts over many connections; keep caps modest for account safety.
 _TG_SAFE_POOL_SIZE = 3
 _TG_SAFE_PIPELINE = 4
-_TG_MAX_POOL_SIZE = 6
+_TG_MAX_POOL_SIZE = 8
 _TG_MAX_PIPELINE = 8
 
 # GetConfig often omits media_only for DC5; these are known media endpoints
