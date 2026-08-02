@@ -54,10 +54,17 @@ async def lifespan(app: FastAPI):
     indexer.start_auto_scheduler()
     logger.info("Telegram Group Downloader started")
     yield
-    await indexer.stop_auto_scheduler()
-    await scheduler.stop_all()
-    await tg_manager.disconnect()
-    await db.close()
+    # Bounded shutdown — never wedge uvicorn reload on a stuck download/Telethon
+    async def _shutdown_step(name: str, coro, timeout: float = 2.5) -> None:
+        try:
+            await asyncio.wait_for(coro, timeout=timeout)
+        except (asyncio.TimeoutError, Exception):
+            logger.warning("shutdown %s did not finish within %.1fs", name, timeout)
+
+    await _shutdown_step("indexer", indexer.stop_auto_scheduler(), 2.0)
+    await _shutdown_step("scheduler", scheduler.stop_all(), 3.0)
+    await _shutdown_step("telegram", tg_manager.disconnect(), 2.0)
+    await _shutdown_step("db", db.close(), 2.0)
     logger.info("Shutdown complete")
 
 

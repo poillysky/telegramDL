@@ -138,10 +138,16 @@ async def _with_tag_progress(task: dict) -> dict:
         except RuntimeError:
             pass
 
-    # Truncate log for list payload — full log is huge and slows first paint
+    # Truncate log for list payload — full log is huge and slows first paint.
+    # last_log is newest-first, so keep the HEAD (not the tail). Tail-trim used
+    # to chop "[HH:MM:SS]" off the newest line → UI showed「无时间」+ half a filename.
     last_log = task.get("last_log") or ""
     if isinstance(last_log, str) and len(last_log) > 2500:
-        last_log = last_log[-2500:]
+        chunk = last_log[:2500]
+        nl = chunk.rfind("\n")
+        if nl >= 800:
+            chunk = chunk[:nl]
+        last_log = chunk
 
     out = {
         **task,
@@ -419,7 +425,6 @@ async def start_task(task_id: int, _: None = Depends(require_web_auth)):
         raise HTTPException(404, "任务不存在")
     await scheduler.heal_stale_running(task_id)
     await db.update_task(task_id, status="pending", last_error=None)
-    await db.append_log(task_id, "收到继续指令，正在启动…")
     await scheduler.start_task(task_id)
     # Brief wait for worker to flip status — keep short so UI stays responsive
     for _ in range(15):

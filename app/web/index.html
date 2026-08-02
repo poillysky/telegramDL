@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0a1210" />
+  <meta name="theme-color" content="#2f7ff0" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <title>Telegram 群组下载器</title>
   <script>
@@ -18,7 +18,7 @@
       }
     })();
   </script>
-  <link rel="stylesheet" href="/static/style.css?v=20260802-indexcreate" />
+  <link rel="stylesheet" href="/static/style.css?v=20260802-logcol" />
   <!-- Webfonts: non-blocking + optional (no 3s spinner / no late glyph swap stretch) -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -115,10 +115,10 @@
       </div>
 
       <section id="pageTasks" class="page page-tasks">
-        <div class="card page-card">
-          <div class="card-head page-toolbar">
+        <div class="tasks-page-shell">
+          <div class="page-toolbar tasks-toolbar">
             <div>
-              <div class="section-kicker">监控</div>
+              <div class="section-kicker">任务</div>
               <h2>下载任务</h2>
             </div>
             <div class="toolbar-actions">
@@ -163,33 +163,33 @@
   </div>
 
   <!-- Create task modal -->
-  <div id="createModal" class="modal" hidden>
+  <div id="createModal" class="modal create-modal" hidden>
     <div class="modal-backdrop" id="createBackdrop"></div>
-    <div class="modal-panel" role="dialog" aria-labelledby="createTitle" aria-modal="true">
-      <div class="modal-head">
+    <div class="modal-panel create-modal-panel" role="dialog" aria-labelledby="createTitle" aria-modal="true">
+      <div class="modal-head create-modal-head">
         <div>
-          <div class="section-kicker">新建</div>
-          <h2 id="createTitle">创建下载任务</h2>
+          <h2 id="createTitle">新建任务</h2>
+          <p class="create-modal-sub">选群 → 选模式 → 开始</p>
         </div>
         <button type="button" class="ghost icon-btn" id="btnCloseCreate" aria-label="关闭">✕</button>
       </div>
 
-      <div class="modal-body">
-        <div class="modal-grid">
-          <div class="modal-col modal-col-chats">
-            <div class="card-head compact">
+      <div class="modal-body create-modal-body">
+        <div class="modal-grid create-modal-grid">
+          <div class="modal-col modal-col-chats create-pane">
+            <div class="card-head compact create-pane-head">
               <div>
-                <div class="section-kicker">步骤 1</div>
                 <h3 class="modal-h3">选择群组</h3>
+                <p class="field-hint create-chat-hint">可多选，每群各建一个任务</p>
               </div>
-              <button id="btnRefreshChats" class="ghost icon-btn" type="button" title="刷新群组列表">刷新</button>
+              <button id="btnRefreshChats" class="ghost icon-btn create-refresh-btn" type="button" title="刷新群组列表">刷新</button>
             </div>
 
-            <div class="chat-dropdown">
+            <div class="chat-dropdown create-chat-dd">
               <button type="button" id="btnToggleChats" class="dropdown-toggle" aria-expanded="true">
                 <span class="dropdown-label">
                   <span class="dropdown-title">全部群组</span>
-                  <span class="dropdown-sub muted">可多选，每个群各建一个任务</span>
+                  <span class="dropdown-sub muted" id="selectedCountHint">未选择</span>
                 </span>
                 <span class="chevron" aria-hidden="true"></span>
               </button>
@@ -199,66 +199,34 @@
               </div>
             </div>
 
-            <div class="selected-box" id="selectedBox">
-              <span class="selected-label">当前选择（可多选）</span>
+            <div class="selected-box create-selected" id="selectedBox">
+              <span class="selected-label">已选</span>
               <p id="selectedChat" class="selected-value">未选择群组</p>
             </div>
-            <p class="hint" id="selectedCountHint">点选群组可多选，将为每个群各建一个任务</p>
           </div>
 
-          <div class="modal-col modal-col-options">
-            <div class="card-head compact">
-              <div>
-                <div class="section-kicker">步骤 2</div>
-                <h3 class="modal-h3">下载选项</h3>
-              </div>
-            </div>
-
-            <div class="form-section" id="createMediaSection">
-              <h3 class="form-section-title">媒体类型</h3>
-              <div class="types">
-                <label class="chip"><input type="checkbox" name="media" value="photo" checked /> 图片</label>
-                <label class="chip"><input type="checkbox" name="media" value="video" checked /> 视频</label>
-                <label class="chip"><input type="checkbox" name="media" value="document" /> 文档</label>
-                <label class="chip"><input type="checkbox" name="media" value="audio" /> 音频</label>
-              </div>
-            </div>
-
-            <div class="form-section">
+          <div class="modal-col modal-col-options create-pane">
+            <div class="form-section create-options-first create-block">
               <h3 class="form-section-title">任务模式</h3>
               <div class="mode-tabs" id="downloadModeTabs" role="tablist">
+                <span class="mode-tab-slider" id="modeTabSlider" aria-hidden="true"></span>
                 <button type="button" class="mode-tab is-active" data-mode="sequential">按时间顺序</button>
                 <button type="button" class="mode-tab" data-mode="monitor">监控模式</button>
               </div>
               <input type="hidden" id="downloadMode" value="sequential" />
               <p class="field-hint" id="downloadModeHint">按消息时间顺序扫描并下载媒体</p>
 
-              <div id="modeDateFields" class="mode-panel">
-                <div class="grid2">
-                  <label>起始日期
-                    <input id="startDate" type="date" />
-                  </label>
-                  <label>结束日期
-                    <input id="endDate" type="date" />
-                  </label>
-                </div>
-                <small class="field-hint">可选；留空表示不限日期，按时间顺序下完即结束</small>
-              </div>
-
               <div id="modeTagsFields" class="mode-panel" hidden>
                 <div class="index-create-card">
-                  <p class="index-create-title">建立文案索引任务</p>
+                  <p class="index-create-title">建立文案索引</p>
                   <p class="field-hint index-create-hint">
-                    选好群组即可创建：先扫描建索引，再持续跟踪新消息。
-                    标签与下载筛选请在任务卡片「设置」里配置，创建时不必填写。
+                    选群后即可创建。标签筛选在任务「设置」里再配。
                   </p>
                 </div>
-                <!-- 兼容旧逻辑：创建监控任务时标签为空，稍后在设置里添加 -->
                 <input type="hidden" id="includeTags" value="" />
                 <input type="hidden" id="tagMatchMode" value="any" />
                 <input type="hidden" id="captionKeywords" value="" />
                 <div id="indexPreview" class="index-preview muted"></div>
-                <!-- 保留节点供设置页/脚本复用（创建弹窗内隐藏） -->
                 <div id="monitorTagList" class="monitor-tag-list" hidden aria-hidden="true"></div>
                 <span id="monitorTagCount" hidden>已选 0</span>
                 <span id="monitorTagEmpty" hidden></span>
@@ -269,98 +237,108 @@
               </div>
             </div>
 
-            <div class="form-section" id="createFolderSection">
-              <h3 class="form-section-title">目录与选项</h3>
-              <label>目录规则
+            <div class="form-section create-block" id="createMediaSection">
+              <h3 class="form-section-title">媒体类型</h3>
+              <div class="types create-types">
+                <label class="chip"><input type="checkbox" name="media" value="photo" checked /> 图片</label>
+                <label class="chip"><input type="checkbox" name="media" value="video" checked /> 视频</label>
+                <label class="chip"><input type="checkbox" name="media" value="document" /> 文档</label>
+                <label class="chip"><input type="checkbox" name="media" value="audio" /> 音频</label>
+              </div>
+            </div>
+
+            <div class="form-section create-block" id="createFolderSection">
+              <h3 class="form-section-title">保存目录</h3>
+              <label class="create-field">
                 <select id="folderMode">
                   <option value="caption" selected>按文案 #标签 + 日期（推荐）</option>
-                  <option value="media_type">按媒体类型（photo/video…）</option>
-                  <option value="flat">扁平（直接放群目录下）</option>
+                  <option value="media_type">按媒体类型</option>
+                  <option value="flat">扁平（群目录下）</option>
                 </select>
               </label>
-              <label class="check" id="useTextFolderWrap">
+              <!-- caption 模式默认自动建夹；节点保留供脚本读写 -->
+              <label class="check" id="useTextFolderWrap" hidden>
                 <input type="checkbox" id="useTextFolder" checked />
-                <span>
-                  <strong>按文案自动建夹</strong>
-                  <small>解析 #标签 与日期，边下边合并同类目录</small>
-                </span>
-              </label>
-              <label class="check">
-                <input type="checkbox" id="testMode" />
-                <span>
-                  <strong>测试模式</strong>
-                  <small>不下载完整文件，约 10 秒后自动停止</small>
-                </span>
+                <span><strong>按文案自动建夹</strong></span>
               </label>
               <label hidden>最短标题字数
                 <input id="minTitleLen" type="number" min="1" value="2" />
               </label>
-              <label>下载方向
-                <select id="downloadOrder">
-                  <option value="added_first" selected>先入库先下载（推荐）</option>
-                  <option value="oldest_first">从旧到新（按消息）</option>
-                  <option value="newest_first">从最近往前</option>
-                </select>
-              </label>
-              <div class="grid2">
-                <label>并发下载
-                  <input id="concurrency" type="number" min="1" max="5" value="2" inputmode="numeric" title="官方大文件队列上限 2，小文件 5" />
-                  <small class="field-hint">多文件并行；每路独立媒体连接，总速度可接近倍数提升</small>
-                </label>
-                <label>最多下载
-                  <input id="maxMessages" type="number" min="1" placeholder="空=不限" inputmode="numeric" />
-                </label>
-              </div>
-              <label>全局扩展名
-                <input id="fileFormats" type="text" placeholder="空=全部，如 mp4,jpg,png" />
-                <small class="field-hint">逗号分隔，不含点；若填写下方分类型则忽略此项</small>
-              </label>
-              <details class="advanced" id="formatByType">
-                <summary>按媒体类型扩展名（可选）</summary>
-                <div class="grid2 advanced-grid">
-                  <label>视频
-                    <input id="fmtVideo" type="text" placeholder="如 mp4,mkv" />
-                  </label>
-                  <label>图片
-                    <input id="fmtPhoto" type="text" placeholder="如 jpg,png" />
-                  </label>
-                  <label>文档
-                    <input id="fmtDocument" type="text" placeholder="如 pdf,zip" />
-                  </label>
-                  <label>音频
-                    <input id="fmtAudio" type="text" placeholder="如 mp3,m4a" />
-                  </label>
-                </div>
-              </details>
-              <div class="grid2">
-                <label>最小大小 (MB)
-                  <input id="minFileMb" type="number" min="0" step="0.1" placeholder="空=不限" inputmode="decimal" />
-                </label>
-                <label>最大大小 (MB)
-                  <input id="maxFileMb" type="number" min="0" step="0.1" placeholder="空=不限" inputmode="decimal" />
-                </label>
-              </div>
-              <small class="field-hint">按 Telegram 报告的文件大小过滤；0 或不填表示不限</small>
-              <div class="grid2">
-                <label>延迟最小(秒)
-                  <input id="delayMin" type="number" min="0" step="0.1" value="0.5" />
-                </label>
-                <label>延迟最大(秒)
-                  <input id="delayMax" type="number" min="0" step="0.1" value="0.5" />
-                </label>
-              </div>
-              <small class="field-hint">最小≠最大时在区间内随机延迟，减轻限流</small>
             </div>
 
-            <details class="advanced" id="advancedIds">
-              <summary>高级过滤（消息 ID）</summary>
-              <div class="grid2 advanced-grid">
-                <label>最旧消息 ID
-                  <input id="startMsgId" type="number" inputmode="numeric" value="0" />
+            <details class="advanced create-more" id="createMoreOptions">
+              <summary>更多选项 <span class="create-more-hint">日期 · 并发 · 过滤</span></summary>
+              <div class="create-more-body">
+                <div id="modeDateFields" class="mode-panel">
+                  <div class="grid2">
+                    <label>起始日期
+                      <input id="startDate" type="date" />
+                    </label>
+                    <label>结束日期
+                      <input id="endDate" type="date" />
+                    </label>
+                  </div>
+                </div>
+                <div class="grid2">
+                  <label>并发
+                    <input id="concurrency" type="number" min="1" max="5" value="2" inputmode="numeric" title="官方大文件队列上限 2，小文件 5" />
+                  </label>
+                  <label>最多下载
+                    <input id="maxMessages" type="number" min="1" placeholder="空=不限" inputmode="numeric" />
+                  </label>
+                </div>
+                <label>下载方向
+                  <select id="downloadOrder">
+                    <option value="added_first" selected>先入库先下载</option>
+                    <option value="oldest_first">从旧到新</option>
+                    <option value="newest_first">从最近往前</option>
+                  </select>
                 </label>
-                <label>最新消息 ID
-                  <input id="endMsgId" type="number" inputmode="numeric" placeholder="空=到最新" />
+                <label>扩展名过滤
+                  <input id="fileFormats" type="text" placeholder="空=全部，如 mp4,jpg" />
                 </label>
+                <details class="advanced" id="formatByType">
+                  <summary>按类型扩展名</summary>
+                  <div class="grid2 advanced-grid">
+                    <label>视频 <input id="fmtVideo" type="text" placeholder="mp4,mkv" /></label>
+                    <label>图片 <input id="fmtPhoto" type="text" placeholder="jpg,png" /></label>
+                    <label>文档 <input id="fmtDocument" type="text" placeholder="pdf,zip" /></label>
+                    <label>音频 <input id="fmtAudio" type="text" placeholder="mp3,m4a" /></label>
+                  </div>
+                </details>
+                <div class="grid2">
+                  <label>最小 (MB)
+                    <input id="minFileMb" type="number" min="0" step="0.1" placeholder="不限" inputmode="decimal" />
+                  </label>
+                  <label>最大 (MB)
+                    <input id="maxFileMb" type="number" min="0" step="0.1" placeholder="不限" inputmode="decimal" />
+                  </label>
+                </div>
+                <div class="grid2">
+                  <label>延迟最小(秒)
+                    <input id="delayMin" type="number" min="0" step="0.1" value="0.5" />
+                  </label>
+                  <label>延迟最大(秒)
+                    <input id="delayMax" type="number" min="0" step="0.1" value="0.5" />
+                  </label>
+                </div>
+                <label class="check">
+                  <input type="checkbox" id="testMode" />
+                  <span>
+                    <strong>测试模式</strong>
+                    <small>不下载完整文件，约 10 秒后停止</small>
+                  </span>
+                </label>
+                <div id="advancedIds">
+                  <div class="grid2">
+                    <label>最旧消息 ID
+                      <input id="startMsgId" type="number" inputmode="numeric" value="0" />
+                    </label>
+                    <label>最新消息 ID
+                      <input id="endMsgId" type="number" inputmode="numeric" placeholder="空=最新" />
+                    </label>
+                  </div>
+                </div>
               </div>
             </details>
 
@@ -369,9 +347,9 @@
         </div>
       </div>
 
-      <div class="modal-foot">
+      <div class="modal-foot create-modal-foot">
         <button type="button" class="ghost" id="btnCancelCreate">取消</button>
-        <button id="btnCreateTask" class="primary" type="button">开始下载</button>
+        <button id="btnCreateTask" class="primary create-submit" type="button">开始下载</button>
       </div>
     </div>
   </div>
@@ -456,10 +434,10 @@
               <label>API ID<input id="apiId" type="number" inputmode="numeric" placeholder="123456" /></label>
               <label>API Hash<input id="apiHash" type="text" placeholder="api_hash" autocomplete="off" /></label>
             </div>
-            <label>代理 PROXY
-              <input id="proxy" type="text" placeholder="socks5://127.0.0.1:7897" value="socks5://127.0.0.1:7897" />
+            <label>代理 PROXY（可选）
+              <input id="proxy" type="text" placeholder="留空则直连，如 socks5://IP:7897" />
             </label>
-            <p class="hint">国内建议 Clash SOCKS5，否则可能连不上。</p>
+            <p class="hint">需要时再填；国内网络不稳可配 Clash SOCKS5。</p>
             <div class="actions-bar">
               <button id="btnTestConn" type="button" class="ghost">测试连接</button>
               <button id="btnTgNextPhone" type="button" class="primary">下一步</button>
@@ -494,9 +472,9 @@
 
         <div class="form-section" id="proxySettingsBlock">
           <h3 class="form-section-title">网络代理</h3>
-          <p class="hint">保存后写入本地配置，重启服务仍会使用。</p>
+          <p class="hint">可选；留空为直连。保存后写入本地配置，重启仍生效。</p>
           <label>PROXY
-            <input id="accProxy" type="text" placeholder="socks5://127.0.0.1:7897" />
+            <input id="accProxy" type="text" placeholder="留空则直连，如 socks5://IP:7897" autocomplete="off" />
           </label>
           <div class="actions-bar">
             <button type="button" class="ghost" id="btnAccTestProxy">测试连接</button>
@@ -551,8 +529,8 @@
       </div>
 
       <!-- Tab: Tag blacklist -->
-      <div id="tabTags" class="settings-tab-panel" role="tabpanel" aria-labelledby="tabBtnTags" hidden>
-        <div class="settings-card">
+      <div id="tabTags" class="settings-tab-panel settings-tab-panel-fill" role="tabpanel" aria-labelledby="tabBtnTags" hidden>
+        <div class="settings-card settings-card-fill">
           <div class="settings-card-head">
             <span class="ui-ico ui-ico-ban" aria-hidden="true"></span>
             <div>
@@ -859,6 +837,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260802-montag"></script>
+  <script src="/static/app.js?v=20260802-logcol"></script>
 </body>
 </html>

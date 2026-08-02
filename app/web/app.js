@@ -647,6 +647,10 @@ function bindUi() {
   document.querySelectorAll("#downloadModeTabs .mode-tab").forEach((btn) => {
     btn.addEventListener("click", () => setDownloadMode(btn.dataset.mode || "sequential"));
   });
+  window.addEventListener("resize", () => {
+    const modal = $("createModal");
+    if (modal && !modal.hidden) syncModeTabSlider();
+  });
   const btnScan = $("btnIndexScan");
   const btnFull = $("btnIndexFull");
   const btnStop = $("btnIndexStop");
@@ -987,6 +991,11 @@ async function openCreateModal() {
   cancelEditMonitorTag();
   renderMonitorTagList();
   setDownloadMode(($("downloadMode") && $("downloadMode").value) || "sequential");
+  requestAnimationFrame(() => {
+    syncModeTabSlider();
+    const body = el.querySelector(".modal-body");
+    if (body) body.scrollTop = 0;
+  });
   if (!state.tgAuthorized) {
     setMsg($("taskMsg"), "请先在设置中登录 Telegram", "err");
   } else {
@@ -1025,12 +1034,13 @@ function syncFolderModeUi() {
   const mode = ($("folderMode") && $("folderMode").value) || "caption";
   const wrap = $("useTextFolderWrap");
   const cb = $("useTextFolder");
-  if (!wrap || !cb) return;
+  if (!cb) return;
+  // Create modal: caption ⇒ auto folders on; no extra checkbox step
+  if (wrap) wrap.hidden = true;
   if (mode === "caption") {
-    wrap.hidden = false;
     cb.disabled = false;
+    cb.checked = true;
   } else {
-    wrap.hidden = true;
     cb.checked = false;
     cb.disabled = true;
   }
@@ -1042,28 +1052,61 @@ function normalizeDownloadMode(mode) {
   return "sequential"; // all / date / sequential
 }
 
+function syncModeTabSlider() {
+  const tabs = $("downloadModeTabs");
+  const slider = $("modeTabSlider");
+  if (!tabs || !slider) return;
+  const active = tabs.querySelector(".mode-tab.is-active");
+  if (!active) return;
+  const pad = 4; // matches .mode-tabs padding
+  slider.style.width = `${active.offsetWidth}px`;
+  slider.style.transform = `translateX(${active.offsetLeft - pad}px)`;
+  slider.classList.add("is-ready");
+}
+
+function setCreatePanelVisible(el, show) {
+  if (!el) return;
+  if (show) {
+    el.hidden = false;
+    // Force reflow so enter animation can play after un-hiding
+    void el.offsetWidth;
+    el.classList.add("create-panel-in");
+  } else {
+    el.classList.remove("create-panel-in");
+    el.hidden = true;
+  }
+}
+
 function setDownloadMode(mode) {
   const m = normalizeDownloadMode(mode);
   if ($("downloadMode")) $("downloadMode").value = m;
   document.querySelectorAll("#downloadModeTabs .mode-tab").forEach((btn) => {
     btn.classList.toggle("is-active", btn.dataset.mode === m);
   });
+  syncModeTabSlider();
   const datePanel = $("modeDateFields");
   const tagsPanel = $("modeTagsFields");
-  const adv = $("advancedIds");
+  const more = $("createMoreOptions");
   const hint = $("downloadModeHint");
   const mediaSec = $("createMediaSection");
   const folderSec = $("createFolderSection");
+  const createBtn = $("btnCreateTask");
   if (datePanel) datePanel.hidden = m !== "sequential";
-  if (tagsPanel) tagsPanel.hidden = m !== "monitor";
-  if (adv) adv.hidden = m === "monitor";
-  if (mediaSec) mediaSec.hidden = m === "monitor";
-  if (folderSec) folderSec.hidden = m === "monitor";
+  setCreatePanelVisible(tagsPanel, m === "monitor");
+  setCreatePanelVisible(more, m !== "monitor");
+  setCreatePanelVisible(mediaSec, m !== "monitor");
+  setCreatePanelVisible(folderSec, m !== "monitor");
   if (hint) {
+    hint.classList.remove("create-hint-flash");
+    void hint.offsetWidth;
+    hint.classList.add("create-hint-flash");
     hint.textContent =
       m === "sequential"
-        ? "按消息时间顺序扫描并下载；可选用日期范围，下完即结束"
-        : "监控模式：为所选群建立文案索引并持续跟踪；标签与下载在任务设置里再配";
+        ? "按时间顺序下载；日期、并发等见「更多选项」"
+        : "建索引并持续跟踪；标签在任务设置里再配";
+  }
+  if (createBtn) {
+    createBtn.textContent = m === "monitor" ? "开始建索引" : "开始下载";
   }
   if (m === "monitor") refreshIndexPanel();
   else stopIndexPolling();
@@ -1828,8 +1871,7 @@ async function refreshTgState() {
     ) {
       applyAccountChip({ ...prev, connecting: true });
       setTgBanner(false);
-      if (st.proxy && $("proxy")) $("proxy").value = st.proxy;
-      if (st.proxy && $("accProxy")) $("accProxy").value = st.proxy;
+      // Do not auto-fill proxy inputs — leave empty unless user opens settings / edits
       return prev;
     }
     state.tgAuthorized = !!st.authorized;
@@ -1839,8 +1881,6 @@ async function refreshTgState() {
     applyAccountChip(st);
     // Soft-connecting: keep banner hidden if session exists
     setTgBanner(!st.authorized && !st.connecting);
-    if (st.proxy && $("proxy")) $("proxy").value = st.proxy;
-    if (st.proxy && $("accProxy")) $("accProxy").value = st.proxy;
     return st;
   } catch (e) {
     if (isSoftAuthError(e)) return state._tgLastOk || null;
@@ -2029,9 +2069,20 @@ function fillAccountPanel(r) {
     $("accSessionStatus").textContent = r.session_exists ? "已保存（可自动重连）" : "无";
   }
   $("accDownloadDir").textContent = r.download_dir || "—";
-  const proxyVal = r.proxy || st.proxy || "";
-  if ($("accProxy")) $("accProxy").value = proxyVal || $("accProxy").value || "";
-  if ($("proxy") && proxyVal) $("proxy").value = proxyVal;
+  // Proxy fields stay empty by default; show current only as placeholder hint
+  const proxyVal = (r.proxy || st.proxy || "").trim();
+  if ($("accProxy")) {
+    $("accProxy").value = "";
+    $("accProxy").placeholder = proxyVal
+      ? `当前已保存（留空保存=清除）：${proxyVal}`
+      : "留空则直连，如 socks5://IP:7897";
+  }
+  if ($("proxy")) {
+    $("proxy").value = "";
+    $("proxy").placeholder = proxyVal
+      ? `当前已保存：${proxyVal}`
+      : "留空则直连，如 socks5://IP:7897";
+  }
   if (r.api_id && $("apiId") && !$("apiId").value) $("apiId").value = String(r.api_id);
   const pill = $("accStatusPill");
   pill.textContent = st.authorized ? "已登录" : "未登录";
@@ -2390,7 +2441,7 @@ function updateSelectedUi() {
     el.textContent = "未选择群组";
     el.classList.remove("has-selection");
     if (box) box.classList.remove("active");
-    if (hint) hint.textContent = "点选群组可多选，将为每个群各建一个任务";
+    if (hint) hint.textContent = "未选择";
     return;
   }
   if (n === 1) {
@@ -2401,12 +2452,7 @@ function updateSelectedUi() {
   }
   el.classList.add("has-selection");
   if (box) box.classList.add("active");
-  if (hint) {
-    hint.textContent =
-      n === 1
-        ? "已选 1 个群组；继续点选可批量创建"
-        : `已选 ${n} 个群组，将批量创建 ${n} 个任务`;
-  }
+  if (hint) hint.textContent = n === 1 ? "已选 1 个" : `已选 ${n} 个`;
 }
 
 function expandChatDropdown() {
@@ -4035,12 +4081,23 @@ function patchIndexProgressBox(box, t) {
 }
 
 function patchTaskCard(el, t) {
-  const statusClass = `status-${t.status || "pending"}`;
+  const status = t.status || "pending";
+  const statusClass = `status-${status}`;
+  const modeMeta = taskModeMeta(t);
+  el.dataset.status = status;
+  el.dataset.mode = modeMeta.mode;
   const pill = el.querySelector(".status-pill");
   if (pill) {
     pill.className = `status-pill ${statusClass}`;
     pill.textContent = statusLabel(t.status, t);
   }
+  const modeBadge = el.querySelector(".task-mode-badge");
+  if (modeBadge) {
+    modeBadge.dataset.mode = modeMeta.mode;
+    modeBadge.textContent = modeMeta.label;
+    modeBadge.title = modeMeta.tip;
+  }
+  const body = el.querySelector(".task-body") || el;
   const queueCount = Math.max(
     0,
     Number(t.tag_match_count ?? 0) - Number(t.tag_processed_count ?? 0)
@@ -4084,15 +4141,15 @@ function patchTaskCard(el, t) {
   el.querySelector(':scope > [data-role="task-tags-summary"]')?.remove();
 
   // error message
-  let errEl = el.querySelector(":scope > .msg.err");
+  let errEl = body.querySelector(":scope > .msg.err");
   if (t.last_error) {
     if (!errEl) {
       errEl = document.createElement("p");
       errEl.className = "msg err is-visible";
       errEl.innerHTML = `<span class="msg-icon" aria-hidden="true"></span><span class="msg-text"></span>`;
-      const actions = el.querySelector(".task-actions");
+      const actions = body.querySelector(".task-actions");
       if (actions) actions.after(errEl);
-      else el.prepend(errEl);
+      else body.prepend(errEl);
     }
     const text = errEl.querySelector(".msg-text");
     if (text) text.textContent = t.last_error;
@@ -4102,7 +4159,7 @@ function patchTaskCard(el, t) {
 
   // live progress — preserve indexing bar DOM to avoid animation flicker
   const sig = liveProgressSignature(t);
-  let liveHost = el.querySelector(":scope > .live-progress");
+  let liveHost = body.querySelector(":scope > .live-progress");
   const prevSig = liveHost?.dataset?.sig || "";
   if (sig === "indexing" && liveHost && liveHost.dataset.phase === "indexing") {
     patchIndexProgressBox(liveHost, t);
@@ -4118,9 +4175,9 @@ function patchTaskCard(el, t) {
       if (next) next.dataset.sig = sig;
       if (liveHost) liveHost.replaceWith(next);
       else {
-        const log = el.querySelector(":scope > .task-log");
+        const log = body.querySelector(":scope > .task-log");
         if (log) log.before(next);
-        else el.appendChild(next);
+        else body.appendChild(next);
       }
     }
   } else if (liveHost && sig !== "indexing" && sig !== "none" && sig !== "idle") {
@@ -4130,9 +4187,14 @@ function patchTaskCard(el, t) {
   }
 
   // log — replace when content changes, or UI shell is outdated (e.g. missing 清空)
-  const logEl = el.querySelector(":scope > .task-log");
+  const logEl = body.querySelector(":scope > .task-log");
   const logKey = String(t.last_log || "");
-  const logShellStale = !!(logEl && !logEl.querySelector(".log-clear-btn"));
+  const logShellStale = !!(
+    logEl &&
+    (!logEl.querySelector(".log-clear-btn") ||
+      logEl.querySelector(".log-aside") ||
+      !logEl.querySelector(".log-line > .log-time"))
+  );
   if (logEl && (logEl.dataset.logKey !== logKey || logShellStale)) {
     const scrollTop = logEl.querySelector(".task-log-body")?.scrollTop || 0;
     const pinTop = scrollTop < 12;
@@ -4178,7 +4240,12 @@ async function loadTasks(opts = {}) {
       const existing = [...list.querySelectorAll(".task[data-task-id]")];
       const sameLayout =
         existing.length === tasks.length &&
-        existing.every((el, i) => el.dataset.taskId === String(tasks[i].id));
+        existing.every(
+          (el, i) =>
+            el.dataset.taskId === String(tasks[i].id) &&
+            el.querySelector(".task-body") &&
+            el.querySelector(".task-mode-badge")
+        );
 
       if (sameLayout) {
         // Yield between patches so the UI stays responsive with many tasks
@@ -4510,14 +4577,11 @@ function renderTaskLog(raw, taskId) {
       const subHtml = parts.sub
         ? `<span class="log-sub">${escapeHtml(parts.sub)}</span>`
         : "";
-      const timeHtml = time
-        ? `<span class="log-time">${escapeHtml(time)}</span>`
-        : `<span class="log-time log-time-missing">无时间</span>`;
+      // No stamp usually means a truncated mid-line fragment — hide it
+      if (!time) return "";
       return `<div class="log-line log-${kind}" title="${escapeHtml(parts.full || text)}">
-        <div class="log-aside">
-          ${timeHtml}
-          <span class="log-badge">${badge}</span>
-        </div>
+        <span class="log-time">${escapeHtml(time)}</span>
+        <span class="log-badge">${badge}</span>
         <div class="log-main">
           <span class="log-title">${escapeHtml(parts.title)}</span>
           ${detailHtml}
@@ -4683,51 +4747,74 @@ function closeQueueModal() {
   syncBodyModalLock();
 }
 
+function taskModeMeta(t) {
+  const mode = normalizeDownloadMode(t && t.download_mode);
+  if (mode === "monitor") {
+    return {
+      mode: "monitor",
+      label: "监控下载",
+      tip: "按文案标签索引下载，并持续监控新消息",
+    };
+  }
+  return {
+    mode: "sequential",
+    label: "时间顺序",
+    tip: "按群消息时间顺序依次下载",
+  };
+}
+
 function renderTask(t) {
-  const statusClass = `status-${t.status || "pending"}`;
+  const status = t.status || "pending";
+  const statusClass = `status-${status}`;
+  const modeMeta = taskModeMeta(t);
   const q = queueRemaining(t);
   const title = t.chat_title || t.chat_id || "";
-  return `<div class="task" data-task-id="${t.id}">
+  return `<div class="task" data-task-id="${t.id}" data-status="${escapeHtml(status)}" data-mode="${modeMeta.mode}">
     <div class="task-head">
       <div class="task-head-main">
+        <div class="task-mode-row">
+          <span class="task-mode-badge" data-mode="${modeMeta.mode}" title="${escapeHtml(modeMeta.tip)}">${escapeHtml(modeMeta.label)}</span>
+        </div>
         <p class="task-title" title="${escapeHtml(title)}">${escapeHtml(title)}</p>
       </div>
       <span class="status-pill ${statusClass}">${escapeHtml(statusLabel(t.status, t))}</span>
     </div>
-    <div class="task-stats">
-      <button type="button" class="task-stat-btn" data-role="match-stat" data-action="show-matches" data-id="${t.id}" title="查看标签命中">
-        <span class="ui-ico ui-ico-tag" aria-hidden="true"></span>
-        <strong data-role="match-count">${t.tag_match_count ?? 0}</strong>
-        <span class="task-stat-label">命中</span>
-      </button>
-      <button type="button" class="task-stat-btn" data-role="done-stat" data-action="show-done" data-id="${t.id}" title="查看已处理">
-        <span class="ui-ico ui-ico-check" aria-hidden="true"></span>
-        <strong data-role="done-count">${t.tag_processed_count ?? 0}</strong>
-        <span class="task-stat-label">已处理</span>
-      </button>
-      <button type="button" class="task-stat-btn" data-role="queue-stat" data-action="show-queue" data-id="${t.id}" title="查看待下载队列">
-        <span class="ui-ico ui-ico-queue" aria-hidden="true"></span>
-        <strong data-role="queue-count">${q}</strong>
-        <span class="task-stat-label">队列</span>
-      </button>
+    <div class="task-body">
+      <div class="task-stats" aria-label="任务进度">
+        <button type="button" class="task-stat-btn" data-role="match-stat" data-action="show-matches" data-id="${t.id}" title="查看标签命中">
+          <span class="ui-ico ui-ico-tag" aria-hidden="true"></span>
+          <strong data-role="match-count">${t.tag_match_count ?? 0}</strong>
+          <span class="task-stat-label">命中</span>
+        </button>
+        <button type="button" class="task-stat-btn" data-role="done-stat" data-action="show-done" data-id="${t.id}" title="查看已处理">
+          <span class="ui-ico ui-ico-check" aria-hidden="true"></span>
+          <strong data-role="done-count">${t.tag_processed_count ?? 0}</strong>
+          <span class="task-stat-label">已处理</span>
+        </button>
+        <button type="button" class="task-stat-btn" data-role="queue-stat" data-action="show-queue" data-id="${t.id}" title="查看待下载队列">
+          <span class="ui-ico ui-ico-queue" aria-hidden="true"></span>
+          <strong data-role="queue-count">${q}</strong>
+          <span class="task-stat-label">队列</span>
+        </button>
+      </div>
+      <div class="task-actions">
+        <button data-action="start" data-id="${t.id}" ${t.status === "running" ? "disabled" : ""}>
+          <span class="ui-ico ui-ico-play" aria-hidden="true"></span><span>继续</span>
+        </button>
+        <button data-action="pause" data-id="${t.id}" ${t.status !== "running" ? "disabled" : ""}>
+          <span class="ui-ico ui-ico-pause" aria-hidden="true"></span><span>暂停</span>
+        </button>
+        <button type="button" class="ghost" data-action="open-settings" data-id="${t.id}">
+          <span class="ui-ico ui-ico-gear" aria-hidden="true"></span><span>设置</span>
+        </button>
+        <button class="danger" data-action="delete" data-id="${t.id}">
+          <span class="ui-ico ui-ico-trash" aria-hidden="true"></span><span>删除</span>
+        </button>
+      </div>
+      ${t.last_error ? `<p class="msg err is-visible"><span class="msg-icon" aria-hidden="true"></span><span class="msg-text">${escapeHtml(t.last_error)}</span></p>` : ""}
+      ${renderLiveProgress(t)}
+      ${renderTaskLog(t.last_log, t.id)}
     </div>
-    <div class="task-actions">
-      <button data-action="start" data-id="${t.id}" ${t.status === "running" ? "disabled" : ""}>
-        <span class="ui-ico ui-ico-play" aria-hidden="true"></span><span>继续</span>
-      </button>
-      <button data-action="pause" data-id="${t.id}" ${t.status !== "running" ? "disabled" : ""}>
-        <span class="ui-ico ui-ico-pause" aria-hidden="true"></span><span>暂停</span>
-      </button>
-      <button type="button" class="ghost" data-action="open-settings" data-id="${t.id}">
-        <span class="ui-ico ui-ico-gear" aria-hidden="true"></span><span>设置</span>
-      </button>
-      <button class="danger" data-action="delete" data-id="${t.id}">
-        <span class="ui-ico ui-ico-trash" aria-hidden="true"></span><span>删除</span>
-      </button>
-    </div>
-    ${t.last_error ? `<p class="msg err is-visible"><span class="msg-icon" aria-hidden="true"></span><span class="msg-text">${escapeHtml(t.last_error)}</span></p>` : ""}
-    ${renderLiveProgress(t)}
-    ${renderTaskLog(t.last_log, t.id)}
   </div>`;
 }
 

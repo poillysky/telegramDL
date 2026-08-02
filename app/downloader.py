@@ -91,6 +91,8 @@ class DownloadScheduler:
         self.db = database or db
         self._tasks: dict[int, asyncio.Task] = {}
         self._stop_flags: dict[int, asyncio.Event] = {}
+        # Monotonic generation so a dying worker never pops its replacement
+        self._worker_gen: dict[int, int] = {}
         self._lock = asyncio.Lock()
         # Dynamic parallel-chat slots (limit from app_meta / env)
         self._active_slots = 0
@@ -307,7 +309,16 @@ class DownloadScheduler:
                 "_t": now,
                 "_bytes": 0,
                 "_started": now,
+                "_base_bytes": 0,
+                "_seeded": False,
+                "_speed_ready": False,
             }
+
+    # Speed meter: ignore the first short burst (Telethon often dumps a large
+    # received jump in a few ms → hundreds of MB/s), then EMA with a hard cap.
+    _SPEED_WARMUP_S = 1.0
+    _SPEED_MIN_DT_S = 0.5
+    _SPEED_MAX_BPS = 80.0 * 1024 * 1024  # 80 MB/s — above this is almost always a spike
 
     def _on_bytes_progress(
         self,
@@ -341,18 +352,70 @@ class DownloadScheduler:
                     p["_pending_total"] = int(total)
                 return
 
-            prev_bytes = int(p.get("_bytes") or p.get("_pending_recv") or 0)
+            prev_bytes = int(p.get("_bytes") or 0)
             if "_pending_recv" in p:
-                prev_bytes = max(prev_bytes, int(p.pop("_pending_recv") or 0))
+                # Pending was only for UI coalesce — don't use it as the speed baseline
+                # or a burst of buffered callbacks looks like a huge instant spike.
+                p.pop("_pending_recv", None)
             if "_pending_total" in p:
                 total = int(p.pop("_pending_total") or total or 0)
 
+            started = float(p.get("_started") or now)
+            # First sample often arrives with a big recv and tiny dt — seed baseline
+            # without computing speed yet (avoids the "几百 MB/s" flash).
+            if not p.get("_speed_ready"):
+                if not p.get("_seeded"):
+                    p["_t"] = now
+                    p["_bytes"] = recv
+                    p["_base_bytes"] = recv  # exclude resume / already-on-disk bytes
+                    p["_seeded"] = True
+                    p["speed"] = 0.0
+                    p["received"] = recv
+                    if total:
+                        p["total"] = int(total)
+                    p["_ui_t"] = now
+                    p["_ui_bytes"] = recv
+                    return
+
+                elapsed = now - started
+                sample_dt = now - float(p.get("_t") or started)
+                if elapsed < self._SPEED_WARMUP_S or sample_dt < self._SPEED_MIN_DT_S:
+                    p["speed"] = 0.0
+                    p["received"] = recv
+                    if total:
+                        p["total"] = int(total)
+                    p["_ui_t"] = now
+                    p["_ui_bytes"] = recv
+                    return
+
+                base = int(p.get("_base_bytes") or 0)
+                full_dt = max(self._SPEED_MIN_DT_S, now - started)
+                full_delta = max(0, recv - base)
+                first = full_delta / full_dt
+                p["speed"] = min(first, self._SPEED_MAX_BPS)
+                p["_speed_ready"] = True
+                p["_t"] = now
+                p["_bytes"] = recv
+                p["received"] = recv
+                if total:
+                    p["total"] = int(total)
+                p["_ui_t"] = now
+                p["_ui_bytes"] = recv
+                return
+
             dt = now - float(p.get("_t") or now)
             delta = recv - prev_bytes
-            if dt >= 0.35 and delta >= 0:
-                inst = delta / dt if dt > 0 else 0.0
+            if dt >= self._SPEED_MIN_DT_S and delta >= 0:
+                inst = (delta / dt) if dt > 0 else 0.0
+                # Cap absurd spikes (connection pool catch-up / callback bunching)
+                if inst > self._SPEED_MAX_BPS:
+                    inst = self._SPEED_MAX_BPS
                 prev = float(p.get("speed") or 0)
-                p["speed"] = inst if prev <= 0 else prev * 0.78 + inst * 0.22
+                if prev <= 0:
+                    p["speed"] = inst
+                else:
+                    # Smooth toward new rate; slightly heavier on history to avoid jitter
+                    p["speed"] = prev * 0.82 + inst * 0.18
                 p["_t"] = now
                 p["_bytes"] = recv
             p["received"] = recv
@@ -381,9 +444,8 @@ class DownloadScheduler:
                     p["received"] = int(received or p.get("received") or 0)
                     if total:
                         p["total"] = int(total)
-                    started = float(p.get("_started") or time.monotonic())
-                    elapsed = max(0.001, time.monotonic() - started)
-                    p["speed"] = float(p["received"]) / elapsed
+                    # Keep last EMA speed — don't replace with whole-file average
+                    # (that often jumps when a file finishes just as the next starts).
                 if remove:
                     files.pop(int(message_id), None)
             if remove and not files:
@@ -447,43 +509,64 @@ class DownloadScheduler:
                 healed.append(tid)
         return healed
 
+    async def _stop_worker(
+        self,
+        task_id: int,
+        *,
+        grace_s: float = 1.5,
+        cancel_s: float = 1.0,
+        detach: bool = True,
+    ) -> None:
+        """Ask a worker to stop; never block longer than grace+cancel.
+
+        Telethon downloads often ignore CancelledError until the current chunk
+        finishes — awaiting them without a timeout freezes「继续」and hot-reload.
+        """
+        task_id = int(task_id)
+        flag = self._stop_flags.get(task_id)
+        worker = self._tasks.get(task_id)
+        if flag:
+            flag.set()
+        if worker and not worker.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(worker), timeout=grace_s)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                worker.cancel()
+                try:
+                    await asyncio.wait_for(worker, timeout=cancel_s)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    logger.warning(
+                        "task %s worker still running after stop timeout — detaching",
+                        task_id,
+                    )
+        if detach:
+            # Bump generation so a late finally on the old worker cannot clear
+            # a newly started replacement.
+            self._worker_gen[task_id] = int(self._worker_gen.get(task_id) or 0) + 1
+            cur = self._tasks.get(task_id)
+            if cur is worker:
+                self._tasks.pop(task_id, None)
+            fl = self._stop_flags.get(task_id)
+            if fl is flag:
+                self._stop_flags.pop(task_id, None)
+            self._clear_progress(task_id)
+
     async def start_task(self, task_id: int) -> None:
         """Start or force-restart a task worker."""
         task_id = int(task_id)
-        existing = self._tasks.get(task_id)
-        if existing and not existing.done():
-            # Brief graceful stop, then hard-cancel so「继续」never hangs the API.
-            flag = self._stop_flags.get(task_id)
-            if flag:
-                flag.set()
-            try:
-                await asyncio.wait_for(asyncio.shield(existing), timeout=5)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                existing.cancel()
-                try:
-                    await existing
-                except Exception:
-                    pass
-            self._tasks.pop(task_id, None)
-            self._stop_flags.pop(task_id, None)
-            self._clear_progress(task_id)
+        # Stop any live worker first (bounded wait — must not hang HTTP).
+        if self.is_worker_alive(task_id):
+            await self._stop_worker(task_id, grace_s=1.5, cancel_s=1.0, detach=True)
 
         async with self._lock:
-            existing = self._tasks.get(task_id)
-            if existing and not existing.done():
-                # Still shutting down — force replace
-                existing.cancel()
-                try:
-                    await existing
-                except Exception:
-                    pass
-                self._tasks.pop(task_id, None)
-                self._stop_flags.pop(task_id, None)
-                self._clear_progress(task_id)
+            if self.is_worker_alive(task_id):
+                await self._stop_worker(task_id, grace_s=0.2, cancel_s=0.5, detach=True)
             stop_event = asyncio.Event()
+            gen = int(self._worker_gen.get(task_id) or 0) + 1
+            self._worker_gen[task_id] = gen
             self._stop_flags[task_id] = stop_event
             self._tasks[task_id] = asyncio.create_task(
-                self._run_task(task_id, stop_event)
+                self._run_task(task_id, stop_event, gen)
             )
 
     async def pause_task(self, task_id: int) -> None:
@@ -491,38 +574,39 @@ class DownloadScheduler:
         if flag:
             flag.set()
         await self.db.update_task(task_id, status="paused")
-        await self.db.append_log(
-            task_id, "已请求暂停：当前文件下完后停止，已完成的不会重下"
-        )
 
     async def cancel_and_wait(self, task_id: int, timeout: float = 120) -> None:
         """Pause a running worker and wait until it exits before deleting."""
-        flag = self._stop_flags.get(task_id)
-        worker = self._tasks.get(task_id)
-        if flag:
-            flag.set()
-        if worker and not worker.done():
-            try:
-                await asyncio.wait_for(worker, timeout=timeout)
-            except asyncio.TimeoutError:
-                worker.cancel()
-                try:
-                    await worker
-                except Exception:
-                    pass
-            except asyncio.CancelledError:
-                pass
-        self._tasks.pop(task_id, None)
-        self._stop_flags.pop(task_id, None)
+        # Cap wait so delete API cannot hang forever on a stuck download.
+        await self._stop_worker(
+            task_id,
+            grace_s=min(8.0, max(1.0, float(timeout))),
+            cancel_s=2.0,
+            detach=True,
+        )
 
     async def stop_all(self) -> None:
-        for tid, flag in list(self._stop_flags.items()):
+        """Shutdown helper — must return quickly so uvicorn reload cannot wedge."""
+        for _tid, flag in list(self._stop_flags.items()):
             flag.set()
         tasks = [t for t in self._tasks.values() if not t.done()]
+        for t in tasks:
+            t.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=3.0,
+                )
+            except (asyncio.TimeoutError, Exception):
+                logger.warning(
+                    "stop_all: workers did not finish within 3s — continuing shutdown"
+                )
         self._tasks.clear()
         self._stop_flags.clear()
+        self._worker_gen.clear()
+        # Reset slots so a wedged worker cannot poison shutdown bookkeeping
+        self._active_slots = 0
 
     async def resume_running_on_startup(self) -> None:
         tasks = await self.db.list_tasks()
@@ -531,42 +615,56 @@ class DownloadScheduler:
                 await self.db.update_task(t["id"], status="paused")
                 await self.db.append_log(t["id"], "服务重启，任务已暂停，可手动继续")
 
-    async def _run_task(self, task_id: int, stop_event: asyncio.Event) -> None:
+    async def _run_task(
+        self, task_id: int, stop_event: asyncio.Event, gen: int
+    ) -> None:
+        me = asyncio.current_task()
         await self._acquire_slot()
         try:
+            # Superseded while waiting for a parallel slot
+            if int(self._worker_gen.get(task_id) or 0) != int(gen):
+                return
             try:
                 await self._download_loop(task_id, stop_event)
             except asyncio.CancelledError:
                 # Hot-reload / process stop cancels the worker; avoid zombie "running"
                 try:
-                    task = await self.db.get_task(task_id)
-                    if task and task.get("status") == "running":
-                        await self.db.update_task(task_id, status="paused")
-                        await self.db.append_log(
-                            task_id, "任务被中断（服务重载或停止），请点继续"
-                        )
+                    if int(self._worker_gen.get(task_id) or 0) == int(gen):
+                        task = await self.db.get_task(task_id)
+                        if task and task.get("status") == "running":
+                            await self.db.update_task(task_id, status="paused")
+                            await self.db.append_log(
+                                task_id, "任务被中断（服务重载或停止），请点继续"
+                            )
                 except Exception:
                     logger.exception("failed to mark task paused after cancel")
                 raise
             except Exception as e:
                 logger.exception("task %s failed", task_id)
-                await self.db.update_task(task_id, status="failed", last_error=str(e))
-                await self.db.append_log(task_id, f"任务失败: {e}")
-                try:
-                    failed_task = await self.db.get_task(task_id)
-                    await notify_event(
-                        "task_failed",
-                        task_id=task_id,
-                        title=str((failed_task or {}).get("chat_title") or ""),
-                        message=str(e),
+                if int(self._worker_gen.get(task_id) or 0) == int(gen):
+                    await self.db.update_task(
+                        task_id, status="failed", last_error=str(e)
                     )
-                except Exception:
-                    logger.debug("task_failed notify failed", exc_info=True)
+                    await self.db.append_log(task_id, f"任务失败: {e}")
+                    try:
+                        failed_task = await self.db.get_task(task_id)
+                        await notify_event(
+                            "task_failed",
+                            task_id=task_id,
+                            title=str((failed_task or {}).get("chat_title") or ""),
+                            message=str(e),
+                        )
+                    except Exception:
+                        logger.debug("task_failed notify failed", exc_info=True)
             finally:
-                self._clear_progress(task_id)
-                self._clear_task_filters(task_id)
-                self._tasks.pop(task_id, None)
-                self._stop_flags.pop(task_id, None)
+                # Only the current generation may clear registry / UI state
+                if int(self._worker_gen.get(task_id) or 0) == int(gen):
+                    self._clear_progress(task_id)
+                    self._clear_task_filters(task_id)
+                    if self._tasks.get(task_id) is me:
+                        self._tasks.pop(task_id, None)
+                    if self._stop_flags.get(task_id) is stop_event:
+                        self._stop_flags.pop(task_id, None)
         finally:
             await self._release_slot()
 
@@ -619,7 +717,6 @@ class DownloadScheduler:
             return
 
         await self.db.update_task(task_id, status="running", last_error=None)
-        await self.db.append_log(task_id, "开始下载")
 
         client = await tg_manager.ensure_client()
         if not await client.is_user_authorized():
@@ -654,8 +751,6 @@ class DownloadScheduler:
         failed = int(task.get("failed_count") or 0)
         skipped = int(task.get("skipped_count") or 0)
 
-        await self.db.append_log(task_id, f"群组目录: {group_dir}")
-
         download_order = (task.get("download_order") or "added_first").strip()
         if download_order not in ("added_first", "oldest_first", "newest_first"):
             download_order = "added_first"
@@ -667,17 +762,12 @@ class DownloadScheduler:
             "oldest_first": "从旧到新（按消息）",
             "newest_first": "从最近往前",
         }.get(download_order, download_order)
-        await self.db.append_log(task_id, f"下载方向: {order_label}")
 
         test_mode = bool(task.get("test_mode"))
         test_deadline = None
         if test_mode:
             dur = float(settings.test_duration_sec or 10)
             test_deadline = asyncio.get_event_loop().time() + max(1.0, dur)
-            await self.db.append_log(
-                task_id,
-                f"测试模式：不下载完整文件，约 {dur:.0f}s 后自动停止",
-            )
 
         # Official help.getAppConfig: large_queue=2, small_queue=5
         large_cap = int(getattr(settings, "large_file_concurrency", 2) or 2)
@@ -718,36 +808,27 @@ class DownloadScheduler:
             install_media_connection_pool(client, pool_size=media_conn)
         except Exception:
             logger.debug("media pool resize failed", exc_info=True)
-        await self.db.append_log(
-            task_id, f"同任务并发: {concurrency}（媒体连接 {media_conn}）"
-        )
-        fmt_text = self._formats_log_text(file_formats)
-        if fmt_text:
-            await self.db.append_log(task_id, f"扩展名过滤: {fmt_text}")
-        if min_file_bytes or max_file_bytes:
-            lo = f"{min_file_bytes / (1024 * 1024):.2f}MB" if min_file_bytes else "不限"
-            hi = f"{max_file_bytes / (1024 * 1024):.2f}MB" if max_file_bytes else "不限"
-            await self.db.append_log(task_id, f"大小过滤: {lo} ~ {hi}")
-        if include_tags:
-            joined = " ".join(f"#{t}" for t in include_tags)
-            await self.db.append_log(task_id, f"标签过滤: {joined}")
-        if caption_keywords:
-            await self.db.append_log(
-                task_id, f"文案关键词: {', '.join(caption_keywords)}"
-            )
-        if max_messages:
-            await self.db.append_log(task_id, f"最多下载: {max_messages} 个文件")
-        if delay_min != delay_max:
-            await self.db.append_log(task_id, f"随机延迟: {delay_min:.2f}–{delay_max:.2f}s")
-        await self.db.append_log(task_id, f"目录模式: {folder_mode}")
         download_mode = normalize_download_mode(task.get("download_mode"))
         mode_labels = {
             "sequential": "按时间顺序",
-            "monitor": "监控模式（文案索引）",
+            "monitor": "监控模式",
         }
-        await self.db.append_log(
-            task_id, f"任务模式: {mode_labels.get(download_mode, download_mode)}"
-        )
+        # One startup line — progress UI covers the rest (no per-setting spam)
+        is_resume = bool(processed or downloaded or last_id)
+        verb = "继续下载" if is_resume else "开始下载"
+        bits = [
+            verb,
+            mode_labels.get(download_mode, download_mode),
+            order_label,
+            f"并发{concurrency}",
+        ]
+        if test_mode:
+            bits.append(f"测试{float(settings.test_duration_sec or 10):.0f}s")
+        if include_tags:
+            bits.append(f"{len(include_tags)}个标签")
+        if max_messages:
+            bits.append(f"上限{max_messages}")
+        await self.db.append_log(task_id, " · ".join(bits))
 
         try:
             if download_mode == "monitor":
@@ -1160,7 +1241,6 @@ class DownloadScheduler:
                 failed_count=failed,
                 skipped_count=skipped,
             )
-            await self.db.append_log(task_id, "任务已暂停")
             return
 
         if max_messages and downloaded >= max_messages:
@@ -1201,7 +1281,9 @@ class DownloadScheduler:
                 failed_count=await self.db.count_failed(task_id),
                 skipped_count=int(counters["skipped"]),
             )
-            await self.db.append_log(task_id, reason)
+            # Skip generic pause — file path already logged「已暂停，保留进度」
+            if reason and reason not in ("任务已暂停", "监控已暂停"):
+                await self.db.append_log(task_id, reason)
 
         for tag, tag_message_ids in per_tag_ids:
             if not tag_message_ids:
@@ -1442,7 +1524,6 @@ class DownloadScheduler:
                         failed_count=await self.db.count_failed(task_id),
                         skipped_count=int(counters["skipped"]),
                     )
-                    await self.db.append_log(task_id, "任务已暂停")
                     return
             if tag:
                 await self.db.append_log(task_id, f"标签 #{tag} 已下完，进入下一标签")
@@ -1711,7 +1792,6 @@ class DownloadScheduler:
                             failed_count=await self.db.count_failed(task_id),
                             skipped_count=int(counters["skipped"]),
                         )
-                        await self.db.append_log(task_id, "监控已暂停")
                         return
 
                     if not has_media(message):
@@ -1858,7 +1938,6 @@ class DownloadScheduler:
                             failed_count=await self.db.count_failed(task_id),
                             skipped_count=int(counters["skipped"]),
                         )
-                        await self.db.append_log(task_id, "监控已暂停")
                         return
                     new_count += 1
 
@@ -1874,7 +1953,6 @@ class DownloadScheduler:
                         failed_count=await self.db.count_failed(task_id),
                         skipped_count=int(counters["skipped"]),
                     )
-                    await self.db.append_log(task_id, "监控已暂停")
                     return
 
             if pool["active"]:
@@ -1898,7 +1976,6 @@ class DownloadScheduler:
                         failed_count=await self.db.count_failed(task_id),
                         skipped_count=int(counters["skipped"]),
                     )
-                    await self.db.append_log(task_id, "监控已暂停")
                     return
 
             try:
@@ -2113,7 +2190,6 @@ class DownloadScheduler:
                 failed_count=failed,
                 skipped_count=skipped,
             )
-            await self.db.append_log(task_id, "任务已暂停")
             return
 
         # Phase 2: scan from checkpoint; sliding-window concurrency (free slot → next)
@@ -2163,7 +2239,8 @@ class DownloadScheduler:
                 failed_count=failed,
                 skipped_count=skipped,
             )
-            await self.db.append_log(task_id, reason)
+            if reason and reason not in ("任务已暂停", "监控已暂停"):
+                await self.db.append_log(task_id, reason)
 
         async def _complete_limit() -> None:
             await _sync_from_counters()
@@ -2478,7 +2555,6 @@ class DownloadScheduler:
                         failed_count=failed,
                         skipped_count=skipped,
                     )
-                    await self.db.append_log(task_id, "任务已暂停")
                     return
                 continue
 
@@ -3264,14 +3340,7 @@ class DownloadScheduler:
             watch_task: asyncio.Task | None = None
             try:
                 self._begin_file_progress(task_id, mid, rel, total=expected_size)
-                size_hint = (
-                    f"{expected_size / (1024 * 1024):.1f} MB"
-                    if expected_size
-                    else "大小未知"
-                )
-                await self.db.append_log(
-                    task_id, f"正在下载: {rel}（{size_hint}）"
-                )
+                # No "正在下载"/"断点续传" logs — live progress already shows that.
 
                 def _cb(
                     received: int,
@@ -3303,12 +3372,7 @@ class DownloadScheduler:
                             remove=True,
                         )
                         return True
-                    if psz > 0:
-                        await self.db.append_log(
-                            task_id,
-                            f"断点续传: {rel}（已有 {psz / (1024 * 1024):.1f} MB）",
-                        )
-                    elif psz == 0:
+                    if psz == 0:
                         tmp_path.unlink(missing_ok=True)
 
                 watch_task = asyncio.create_task(
