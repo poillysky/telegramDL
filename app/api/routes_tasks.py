@@ -1,3 +1,4 @@
+import time
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -154,10 +155,17 @@ async def _with_tag_progress(task: dict) -> dict:
     return out
 
 
+_last_heal_mono: float = 0.0
+
+
 @router.get("")
 async def list_tasks(_: None = Depends(require_web_auth)):
-    # Unstick「继续」disabled when DB says running but worker is dead
-    await scheduler.heal_stale_running(quiet=True)
+    global _last_heal_mono
+    # Unstick「继续」when DB says running but worker is dead — not every poll tick
+    now = time.monotonic()
+    if now - _last_heal_mono >= 15.0:
+        _last_heal_mono = now
+        await scheduler.heal_stale_running(quiet=True)
     tasks = await db.list_tasks()
     # Sequential on shared SQLite connection (gather can pile up waits)
     out = [await _with_tag_progress(t) for t in tasks]
@@ -339,17 +347,7 @@ async def update_task_settings(
                     tags = expanded
             except Exception:
                 pass
-        kws_for_check = (
-            normalize_keyword_list(body.caption_keywords)
-            if body.caption_keywords is not None
-            else (task.get("caption_keywords") or [])
-        )
-        if normalize_download_mode(task.get("download_mode")) == "monitor" and not tags:
-            if not kws_for_check:
-                return {
-                    "ok": False,
-                    "message": "监控模式请至少保留一个标签，或先填关键词",
-                }
+        # 监控任务允许清空标签（仅索引）；有标签时才按标签下载
         fields["include_tags"] = tags
         fields["tag_match_mode"] = mode
         joined = " ".join(f"#{t}" for t in tags) if tags else "（无）"

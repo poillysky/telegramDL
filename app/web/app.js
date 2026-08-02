@@ -62,6 +62,37 @@ function statusLabel(status, task) {
   return STATUS_LABELS[status] || status || "未知";
 }
 
+class SoftAuthError extends Error {
+  constructor(message) {
+    super(message || "需要 Web 登录");
+    this.name = "SoftAuthError";
+    this.softAuth = true;
+  }
+}
+
+function isSoftAuthError(e) {
+  return !!(e && (e.softAuth || e.name === "SoftAuthError"));
+}
+
+async function confirmWebSessionLost() {
+  try {
+    const web = await Promise.race([
+      fetch("/api/auth/web-session", { credentials: "same-origin" }).then((r) =>
+        r.json()
+      ),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), 3000)
+      ),
+    ]);
+    if (!web) return false;
+    if (!web.need_password) return false;
+    return !web.authenticated;
+  } catch (_) {
+    // Network blip — do NOT treat as logout (esp. iOS background resume)
+    return false;
+  }
+}
+
 async function api(path, options = {}) {
   const { headers: extraHeaders, signal, ...rest } = options;
   const opts = {
@@ -73,16 +104,27 @@ async function api(path, options = {}) {
   const res = await fetch(path, opts);
   if (res.status === 401) {
     const p = String(path);
-    if (
-      !p.includes("/web-login") &&
-      !p.includes("/web-status") &&
-      !p.includes("/web-session")
-    ) {
-      clearWebAuthedHint();
-      showWebLogin();
+    const authProbe =
+      p.includes("/web-login") ||
+      p.includes("/web-status") ||
+      p.includes("/web-session");
+    if (!authProbe) {
+      // Avoid kicking to login on a single 401 (iOS wake / proxy blip)
+      if (!state._authKickInflight) {
+        state._authKickInflight = confirmWebSessionLost()
+          .then((lost) => {
+            if (lost) {
+              clearWebAuthedHint();
+              showWebLogin();
+            }
+          })
+          .finally(() => {
+            state._authKickInflight = null;
+          });
+      }
     }
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || data.message || "需要 Web 登录");
+    throw new SoftAuthError(data.detail || data.message || "需要 Web 登录");
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -240,6 +282,7 @@ function isOverlayBlockingPoll() {
   if ($("accountDrawer") && !$("accountDrawer").hidden) return true;
   if ($("confirmModal") && !$("confirmModal").hidden) return true;
   if ($("queueModal") && !$("queueModal").hidden) return true;
+  if ($("historyPreviewModal") && !$("historyPreviewModal").hidden) return true;
   return false;
 }
 
@@ -293,12 +336,27 @@ function restoreTaskListCache() {
 }
 
 function toast(text, type = "info", ms = 3400) {
+  if (text && /需要 Web 登录|未登录|会话/.test(String(text)) && type === "err") {
+    // Soft auth noise — never spam during iOS wake
+    if (state._suppressAuthToasts) return;
+  }
   const host = $("toastHost");
   if (!host) {
+    if (type === "err" && isSoftAuthError({ message: text })) return;
     appAlert(text, { title: type === "err" ? "错误" : "提示" });
     return;
   }
   const kind = normalizeMsgType(text, type);
+  const msg = String(text || "");
+  // Dedupe: replace same toast instead of stacking
+  const twin = [...host.querySelectorAll(".toast")].find(
+    (t) => t.querySelector(".toast-text")?.textContent === msg
+  );
+  if (twin) {
+    twin.classList.add("show");
+    return;
+  }
+  while (host.children.length >= 3) host.firstElementChild?.remove();
   const el = document.createElement("div");
   el.className = `toast toast-${kind}`;
   el.setAttribute("role", "status");
@@ -307,7 +365,7 @@ function toast(text, type = "info", ms = 3400) {
     <span class="toast-text"></span>
     <button type="button" class="toast-close" aria-label="关闭">×</button>
   `;
-  el.querySelector(".toast-text").textContent = String(text || "");
+  el.querySelector(".toast-text").textContent = msg;
   const close = () => {
     el.classList.remove("show");
     window.setTimeout(() => el.remove(), 220);
@@ -318,14 +376,55 @@ function toast(text, type = "info", ms = 3400) {
   if (ms > 0) window.setTimeout(close, ms);
 }
 
+function syncBodyModalLock() {
+  const any =
+    ($("createModal") && !$("createModal").hidden) ||
+    ($("queueModal") && !$("queueModal").hidden) ||
+    ($("historyPreviewModal") && !$("historyPreviewModal").hidden);
+  document.body.classList.toggle("modal-open", !!any);
+}
+
+function closeAllOverlays() {
+  try {
+    closeConfirmDialog(false);
+  } catch (_) {}
+  try {
+    closeTagPicker();
+  } catch (_) {}
+  try {
+    closeTaskTagsModal();
+  } catch (_) {}
+  try {
+    closeQueueModal();
+  } catch (_) {}
+  try {
+    closeHistoryPreview();
+  } catch (_) {}
+  try {
+    closeAccountDrawer();
+  } catch (_) {}
+  try {
+    closeCreateModal();
+  } catch (_) {}
+  document.body.classList.remove(
+    "modal-open",
+    "confirm-open",
+    "drawer-open",
+    "under-picker"
+  );
+  document.querySelectorAll(".is-loading").forEach((el) => {
+    el.classList.remove("is-loading");
+  });
+}
+
 function showWebLogin() {
   clearWebAuthedHint();
+  closeAllOverlays();
+  stopKeepalive();
   $("stageLogin").hidden = false;
   $("stageApp").hidden = true;
   document.body.classList.add("is-login-stage");
   stopPolling();
-  closeAccountDrawer();
-  closeCreateModal();
 }
 
 function showApp() {
@@ -782,11 +881,14 @@ async function bootstrap() {
           markWebAuthedHint();
           return;
         }
-        clearWebAuthedHint();
-        showWebLogin();
+        // Only kick if server explicitly says unauthenticated (not timeout/network)
+        if (web && web.need_password && web.authenticated === false) {
+          clearWebAuthedHint();
+          showWebLogin();
+        }
       })
       .catch(() => {
-        /* keep app; next 401 will bounce to login */
+        /* keep app on timeout / offline — seamless resume */
       });
     return;
   }
@@ -800,13 +902,21 @@ async function bootstrap() {
       enterApp({ background: true, soft: false });
       return;
     }
+    // Explicit unauthenticated
+    clearWebAuthedHint();
+    showWebLogin();
   } catch (e) {
-    if (e && e.message && !/超时/.test(e.message)) {
+    // Slow NAS / timeout: if we had a prior hint or cookie may exist, enter soft
+    if (e && e.message && /超时/.test(e.message) && hasWebAuthedHint()) {
+      enterApp({ background: true, soft: true });
+      return;
+    }
+    if (e && e.message && !/超时/.test(e.message) && !isSoftAuthError(e)) {
       setMsg($("webAuthMsg"), e.message || String(e), "err");
     }
+    clearWebAuthedHint();
+    showWebLogin();
   }
-  clearWebAuthedHint();
-  showWebLogin();
 }
 
 /**
@@ -857,7 +967,9 @@ function switchPage(name) {
   $("btnNavTasks")?.classList.toggle("is-active", page === "tasks");
   $("btnNavHistory")?.classList.toggle("is-active", page === "history");
   if (page === "history") {
-    loadHistory(state.historyOffset || 0).catch((e) => toast(e.message || String(e), "err"));
+    loadHistory(state.historyOffset || 0).catch((e) => {
+      if (!isSoftAuthError(e)) toast(e.message || String(e), "err");
+    });
   } else {
     loadTasks().catch(() => {});
   }
@@ -868,7 +980,7 @@ async function openCreateModal() {
   const el = $("createModal");
   if (!el) return;
   el.hidden = false;
-  document.body.classList.add("modal-open");
+  syncBodyModalLock();
   setMsg($("taskMsg"), "");
   expandChatDropdown();
   syncFolderModeUi();
@@ -878,7 +990,9 @@ async function openCreateModal() {
   if (!state.tgAuthorized) {
     setMsg($("taskMsg"), "请先在设置中登录 Telegram", "err");
   } else {
-    loadChats().catch((e) => toast(e.message || String(e), "err"));
+    loadChats().catch((e) => {
+      if (!isSoftAuthError(e)) toast(e.message || String(e), "err");
+    });
   }
   refreshIndexPanel();
 }
@@ -887,7 +1001,7 @@ function closeCreateModal() {
   const el = $("createModal");
   if (!el) return;
   el.hidden = true;
-  document.body.classList.remove("modal-open");
+  syncBodyModalLock();
   stopIndexPolling();
 }
 
@@ -938,14 +1052,18 @@ function setDownloadMode(mode) {
   const tagsPanel = $("modeTagsFields");
   const adv = $("advancedIds");
   const hint = $("downloadModeHint");
+  const mediaSec = $("createMediaSection");
+  const folderSec = $("createFolderSection");
   if (datePanel) datePanel.hidden = m !== "sequential";
   if (tagsPanel) tagsPanel.hidden = m !== "monitor";
   if (adv) adv.hidden = m === "monitor";
+  if (mediaSec) mediaSec.hidden = m === "monitor";
+  if (folderSec) folderSec.hidden = m === "monitor";
   if (hint) {
     hint.textContent =
       m === "sequential"
         ? "按消息时间顺序扫描并下载；可选用日期范围，下完即结束"
-        : "按标签监控：先用文案索引补历史，再持续等待符合标签的新消息";
+        : "监控模式：为所选群建立文案索引并持续跟踪；标签与下载在任务设置里再配";
   }
   if (m === "monitor") refreshIndexPanel();
   else stopIndexPolling();
@@ -1013,7 +1131,10 @@ async function refreshIndexPanel() {
     else stopIndexPolling();
     refreshIndexPreview();
   } catch (e) {
-    if (metaEl) metaEl.textContent = e.message || "加载索引失败";
+    if (isSoftAuthError(e)) return;
+    if (metaEl && !(state.indexMeta)) {
+      metaEl.textContent = e.message || "加载索引失败";
+    }
   }
 }
 
@@ -1696,7 +1817,25 @@ function buildTaskOptions() {
 async function refreshTgState() {
   try {
     const st = await api("/api/auth/status");
+    const prev = state._tgLastOk;
+    // Soft timeout / connecting without user must not wipe a known-good online chip
+    if (
+      prev &&
+      prev.authorized &&
+      st &&
+      !st.authorized &&
+      (st.connecting || /连接中|超时|timeout/i.test(String(st.message || "")))
+    ) {
+      applyAccountChip({ ...prev, connecting: true });
+      setTgBanner(false);
+      if (st.proxy && $("proxy")) $("proxy").value = st.proxy;
+      if (st.proxy && $("accProxy")) $("accProxy").value = st.proxy;
+      return prev;
+    }
     state.tgAuthorized = !!st.authorized;
+    if (st.authorized || !prev?.authorized) {
+      state._tgLastOk = st;
+    }
     applyAccountChip(st);
     // Soft-connecting: keep banner hidden if session exists
     setTgBanner(!st.authorized && !st.connecting);
@@ -1704,6 +1843,11 @@ async function refreshTgState() {
     if (st.proxy && $("accProxy")) $("accProxy").value = st.proxy;
     return st;
   } catch (e) {
+    if (isSoftAuthError(e)) return state._tgLastOk || null;
+    // Keep last good status on transient network errors (iOS tab wake)
+    if (state._tgLastOk && state._tgLastOk.authorized) {
+      return state._tgLastOk;
+    }
     state.tgAuthorized = false;
     setTgBanner(true);
     applyAccountChip({ authorized: false });
@@ -2288,18 +2432,23 @@ async function loadChats(opts = {}) {
       const q = $("chatSearch").value.trim();
       const r = await api(`/api/chats?q=${encodeURIComponent(q)}`);
       if (!r.ok) {
-        if (listEl) {
+        if (listEl && !state.chats.length) {
           listEl.innerHTML = `<div class="chat-item"><span>${escapeHtml(r.message || "加载失败")}</span></div>`;
+        } else if (opts.force) {
+          toast(r.message || "群组刷新失败", "err");
         }
         return;
       }
       state.chats = r.chats || [];
       renderChats(q);
     } catch (e) {
-      if (listEl) {
+      if (isSoftAuthError(e)) return;
+      // Keep previous list on network blip
+      if (listEl && !state.chats.length) {
         listEl.innerHTML = `<div class="chat-item"><span>${escapeHtml(e.message || "加载失败")}</span></div>`;
+      } else if (opts.force) {
+        toast(e.message || "群组刷新失败", "err");
       }
-      throw e;
     }
   })();
   state._chatsInflight = run.finally(() => {
@@ -2352,24 +2501,15 @@ async function createTask() {
     return;
   }
   const opts = buildTaskOptions();
-  if (!opts.media_types.length) {
+  if (opts.download_mode === "monitor") {
+    // 监控模式 = 建索引任务：默认媒体类型，标签稍后在设置里配
+    if (!opts.media_types.length) {
+      opts.media_types = ["photo", "video", "document", "audio"];
+    }
+    opts.include_tags = [];
+    opts.caption_keywords = [];
+  } else if (!opts.media_types.length) {
     setMsg($("taskMsg"), "请至少勾选一种媒体类型", "err");
-    return;
-  }
-  if (
-    opts.download_mode === "monitor" &&
-    !(opts.include_tags && opts.include_tags.length) &&
-    !(opts.caption_keywords && opts.caption_keywords.length)
-  ) {
-    setMsg($("taskMsg"), "监控模式请选择标签或填写文案关键词", "err");
-    return;
-  }
-  if (opts.download_mode === "monitor" && state.selectedChats.length > 1) {
-    setMsg(
-      $("taskMsg"),
-      "监控模式请每次只选一个群组（索引按群复用）",
-      "err"
-    );
     return;
   }
   await withBusy([$("btnCreateTask"), $("btnCancelCreate")], async () => {
@@ -2512,7 +2652,7 @@ function openHistoryPreview(id, kind, name) {
     body.innerHTML = `<p class="muted">无法内嵌预览，请用「新窗口打开」。</p>`;
   }
   modal.hidden = false;
-  document.body.classList.add("modal-open");
+  syncBodyModalLock();
 }
 
 function closeHistoryPreview() {
@@ -2529,7 +2669,7 @@ function closeHistoryPreview() {
     body.innerHTML = "";
   }
   if (modal) modal.hidden = true;
-  document.body.classList.remove("modal-open");
+  syncBodyModalLock();
 }
 
 function captureTaskLogScroll() {
@@ -2594,7 +2734,9 @@ function bindTaskActions(root) {
     if (action === "show-queue" || action === "show-matches" || action === "show-done") {
       const kind =
         action === "show-matches" ? "matches" : action === "show-done" ? "done" : "queue";
-      openTaskFilesModal(id, kind).catch((e) => toast(e.message || String(e), "err"));
+      openTaskFilesModal(id, kind).catch((e) => {
+        if (!isSoftAuthError(e)) toast(e.message || String(e), "err");
+      });
       return;
     }
 
@@ -2635,8 +2777,10 @@ function bindTaskActions(root) {
       }
       await loadTasks({ force: true });
     } catch (e) {
-      toast("操作失败: " + (e.message || e), "err");
-      console.error(e);
+      if (!isSoftAuthError(e)) {
+        toast("操作失败: " + (e.message || e), "err");
+        console.error(e);
+      }
     } finally {
       state._taskActionBusy.delete(busyKey);
       btn.classList.remove("is-busy");
@@ -3804,6 +3948,49 @@ function indexProgressPercent(live) {
   return 0;
 }
 
+function patchDownloadProgressBox(box, t) {
+  const live = t.live || {};
+  const files = Array.isArray(live.files) ? live.files : [];
+  const speedText = formatSpeed(live.speed, { waiting: t.status === "running" });
+  if (box.classList.contains("multi") && files.length > 1) {
+    const title = box.querySelector(".live-summary-title");
+    const speed = box.querySelector(".live-summary-meta .live-speed");
+    const active = live.active_count || files.length || 1;
+    if (title) title.textContent = `并发下载中 · ${active} 路`;
+    if (speed) speed.textContent = `合计 ${speedText}`;
+    const host = box.querySelector(".live-files");
+    if (host) host.innerHTML = files.map(renderFileProgressRow).join("");
+    return true;
+  }
+  const name = live.file || (files[0] && files[0].file) || "";
+  const fileEl = box.querySelector(".live-file");
+  const metaSpans = box.querySelectorAll(".live-meta > span");
+  const fill = box.querySelector(".prog-fill");
+  const track = box.querySelector(".prog-track");
+  const pct = live.percent != null ? live.percent : null;
+  const sizeLine = live.total
+    ? `${formatBytes(live.received)} / ${formatBytes(live.total)}${pct != null ? ` (${pct}%)` : ""}`
+    : live.received
+      ? formatBytes(live.received)
+      : "准备中…";
+  if (fileEl) {
+    fileEl.textContent = `正在下载：${name}`;
+    fileEl.title = name;
+  }
+  if (metaSpans[0]) metaSpans[0].textContent = sizeLine;
+  if (metaSpans[1]) metaSpans[1].textContent = speedText;
+  if (track && fill) {
+    if (pct != null) {
+      track.classList.remove("indeterminate");
+      fill.style.width = `${Math.min(100, pct)}%`;
+    } else {
+      track.classList.add("indeterminate");
+      fill.style.width = "";
+    }
+  }
+  return true;
+}
+
 function patchIndexProgressBox(box, t) {
   const live = t.live || {};
   const scanned = Number(live.scanned) || 0;
@@ -3936,19 +4123,9 @@ function patchTaskCard(el, t) {
       }
     }
   } else if (liveHost && sig !== "indexing" && sig !== "none" && sig !== "idle") {
-    // same download shape — refresh numbers without killing determinate bar when possible
-    const html = renderLiveProgress(t);
-    const wrap = document.createElement("div");
-    wrap.innerHTML = html;
-    const next = wrap.firstElementChild;
-    if (next) {
-      next.dataset.sig = sig;
-      // preserve indeterminate track if both have one
-      const oldTrack = liveHost.querySelector(".prog-track.indeterminate");
-      const newTrack = next.querySelector(".prog-track.indeterminate");
-      liveHost.replaceWith(next);
-      if (oldTrack && newTrack) newTrack.replaceWith(oldTrack);
-    }
+    // same download shape — patch numbers in place (no DOM replace / flicker)
+    patchDownloadProgressBox(liveHost, t);
+    liveHost.dataset.sig = sig;
   }
 
   // log — replace when content changes, or UI shell is outdated (e.g. missing 清空)
@@ -4010,7 +4187,12 @@ async function loadTasks(opts = {}) {
         }
         restoreTaskLogScroll(scrollMap);
         bindTaskActions(list);
-        cacheTaskListHtml(list.innerHTML);
+        // sessionStorage rewrite is expensive — only every ~8s while polling
+        const now = Date.now();
+        if (!state._tasksCacheAt || now - state._tasksCacheAt > 8000) {
+          state._tasksCacheAt = now;
+          cacheTaskListHtml(list.innerHTML);
+        }
         return;
       }
 
@@ -4025,6 +4207,7 @@ async function loadTasks(opts = {}) {
       restoreTaskLogScroll(scrollMap);
       bindTaskActions(list);
     } catch (e) {
+      if (isSoftAuthError(e)) return;
       if (list && !list.querySelector(".task[data-task-id]")) {
         list.innerHTML = `<div class="empty-tasks">任务加载失败<br/><span class="muted">${escapeHtml(
           e.message || String(e)
@@ -4403,18 +4586,27 @@ async function openTaskFilesModal(taskId, kind = "queue") {
     done: "已处理",
     queue: "队列",
   };
+  const hadContent = !!body.querySelector(".queue-item, .queue-list");
   modal.hidden = false;
-  document.body.classList.add("modal-open");
+  syncBodyModalLock();
   if (title) title.textContent = labels[kindN];
-  if (sub) sub.textContent = "加载中…";
-  body.innerHTML = `<div class="empty-tasks list-loading">加载中…</div>`;
+  if (sub) sub.textContent = hadContent ? "刷新中…" : "加载中…";
+  // Keep previous list while refreshing — avoid empty flash
+  if (!hadContent) {
+    body.innerHTML = `<div class="empty-tasks list-loading">加载中…</div>`;
+  }
   let r;
   try {
     r = await api(`/api/tasks/${taskId}/files?kind=${kindN}&limit=80&offset=0`);
   } catch (e) {
+    if (isSoftAuthError(e)) throw e;
     const msg = e.message || String(e);
     if (sub) sub.textContent = "加载失败";
-    body.innerHTML = `<div class="empty-tasks">加载失败<br/><span class="muted">${escapeHtml(msg)}<br/>若刚更新过，请重启服务后再试</span></div>`;
+    if (!hadContent) {
+      body.innerHTML = `<div class="empty-tasks">加载失败<br/><span class="muted">${escapeHtml(msg)}<br/>若刚更新过，请重启服务后再试</span></div>`;
+    } else {
+      toast(msg, "err");
+    }
     throw e;
   }
   if (title) {
@@ -4487,7 +4679,7 @@ function closeQueueModal() {
   if (body) body.innerHTML = "";
   state._queueTaskId = null;
   state._filesKind = null;
-  document.body.classList.remove("modal-open");
+  syncBodyModalLock();
 }
 
 function renderTask(t) {
@@ -4538,20 +4730,90 @@ function renderTask(t) {
   </div>`;
 }
 
-function startPolling() {
+function startKeepalive() {
+  if (state._keepAliveTimer) return;
+  // Sliding cookie refresh — reduces iOS “woke up and logged out”
+  state._keepAliveTimer = setInterval(() => {
+    if (document.hidden) return;
+    if ($("stageApp")?.hidden) return;
+    fetch("/api/auth/web-session", { credentials: "same-origin" }).catch(() => {});
+  }, 4 * 60 * 1000);
+}
+
+function stopKeepalive() {
+  if (state._keepAliveTimer) {
+    clearInterval(state._keepAliveTimer);
+    state._keepAliveTimer = null;
+  }
+}
+
+function tasksPollIntervalMs() {
+  const tasks = state.tasks || [];
+  const busy = tasks.some(
+    (t) => t.status === "running" || (t.live && t.live.phase === "indexing")
+  );
+  return busy ? 2000 : 5000;
+}
+
+function scheduleTasksPoll() {
   stopPolling();
-  state.pollTimer = setInterval(() => {
-    if (isOverlayBlockingPoll()) return;
-    if (state._tasksInflight) return;
-    loadTasks().catch(() => {});
-  }, 1500);
+  const tick = () => {
+    if (document.hidden) {
+      state.pollTimer = setTimeout(tick, 8000);
+      return;
+    }
+    if (!isOverlayBlockingPoll() && !state._tasksInflight) {
+      loadTasks().catch(() => {});
+    }
+    state.pollTimer = setTimeout(tick, tasksPollIntervalMs());
+  };
+  state.pollTimer = setTimeout(tick, tasksPollIntervalMs());
+}
+
+function startPolling() {
+  scheduleTasksPoll();
+  startKeepalive();
+  // iOS Safari freezes timers in background — soft resume when tab visible again
+  if (!state._resumeBound) {
+    state._resumeBound = true;
+    let lastResume = 0;
+    const resume = (ev) => {
+      if (document.hidden) return;
+      // bfcache restore: only restart timers, skip heavy refetch churn
+      if (ev && ev.type === "pageshow" && ev.persisted) {
+        if ($("stageApp") && !$("stageApp").hidden && !state.pollTimer) {
+          startPolling();
+        }
+        return;
+      }
+      const now = Date.now();
+      if (now - lastResume < 2500) return;
+      lastResume = now;
+      if ($("stageApp") && !$("stageApp").hidden) {
+        if (!state.pollTimer) startPolling();
+        loadTasks().catch(() => {});
+        // TG chip: only refresh if we don't already have a good status
+        if (!state._tgLastOk || !state._tgLastOk.authorized) {
+          refreshTgState().catch(() => {});
+        }
+      }
+    };
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) resume({ type: "visibilitychange" });
+    });
+    window.addEventListener("pageshow", resume);
+    window.addEventListener("online", resume);
+    // Do NOT bind window "focus" — iOS fires it constantly and feels like full refresh
+  }
 }
 
 function stopPolling() {
   if (state.pollTimer) {
+    clearTimeout(state.pollTimer);
     clearInterval(state.pollTimer);
     state.pollTimer = null;
   }
+  // Keepalive is stopped only on logout (showWebLogin); polling pause should not kill session refresh
 }
 
 function escapeHtml(s) {

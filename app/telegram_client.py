@@ -963,7 +963,7 @@ class TelegramManager:
                 data = result.bytes or b""
                 if fetch_log_left > 0:
                     fetch_log_left -= 1
-                    logger.info(
+                    logger.debug(
                         "getFile OK off=%s lim=%sKiB got=%sKiB aligned=%s",
                         off,
                         limit // 1024,
@@ -1034,7 +1034,7 @@ class TelegramManager:
                 except Exception:
                     pass
 
-        logger.info(
+        logger.debug(
             "Pipelined download %s offset=%s pipeline=%s part=%sKiB dc=%s "
             "(1MiB-window aligned, pyrogram-style)",
             path.name,

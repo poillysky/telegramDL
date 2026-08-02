@@ -51,18 +51,58 @@ class TwoFABody(BaseModel):
     password: str
 
 
-def _set_web_cookie(response: Response, username: str, password_hash: str) -> None:
+def _host_is_local_or_lan(host: str | None) -> bool:
+    h = (host or "").strip().lower().split("%")[0]
+    if not h or h in ("localhost", "127.0.0.1", "::1"):
+        return True
+    # Private / link-local IPv4 — Feiniu NAS is usually opened via LAN HTTP
+    parts = h.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        a, b = int(parts[0]), int(parts[1])
+        if a == 10 or a == 127:
+            return True
+        if a == 192 and b == 168:
+            return True
+        if a == 172 and 16 <= b <= 31:
+            return True
+        if a == 169 and b == 254:
+            return True
+    return False
+
+
+def _request_is_https(request: Request | None) -> bool:
+    """Only mark Secure when the browser is truly on HTTPS (not LAN HTTP)."""
+    if request is None:
+        return False
+    host = request.url.hostname
+    if _host_is_local_or_lan(host):
+        return False
+    if request.url.scheme == "https":
+        return True
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    return proto == "https"
+
+
+def _set_web_cookie(
+    response: Response,
+    username: str,
+    password_hash: str,
+    request: Request | None = None,
+) -> None:
+    """Set session cookie. path=/ + long max_age helps iOS Safari keep login."""
     response.set_cookie(
-        "web_auth",
-        pack_web_cookie(username, password_hash),
+        key="web_auth",
+        value=pack_web_cookie(username, password_hash),
         httponly=True,
         samesite="lax",
+        path="/",
         max_age=60 * 60 * 24 * 30,
+        secure=_request_is_https(request),
     )
 
 
 @router.post("/web-login")
-async def web_login(body: WebLoginBody, response: Response):
+async def web_login(body: WebLoginBody, request: Request, response: Response):
     await db.ensure_web_users_seeded()
     username = body.username.strip()
     password = body.password
@@ -74,7 +114,7 @@ async def web_login(body: WebLoginBody, response: Response):
     if not user or not verify_password(password, user["password_hash"]):
         return {"ok": False, "message": "账号或密码错误"}
 
-    _set_web_cookie(response, user["username"], user["password_hash"])
+    _set_web_cookie(response, user["username"], user["password_hash"], request)
     return {
         "ok": True,
         "need_password": True,
@@ -89,8 +129,8 @@ async def web_status():
 
 
 @router.get("/web-session")
-async def web_session(request: Request):
-    """Lightweight session check — never touches Telegram."""
+async def web_session(request: Request, response: Response):
+    """Lightweight session check — never touches Telegram. Refreshes cookie (sliding)."""
     from app.auth_token import unpack_web_cookie, verify_web_token
 
     await db.ensure_web_users_seeded()
@@ -105,6 +145,8 @@ async def web_session(request: Request):
     user = await db.get_web_user(username)
     if not user or not verify_web_token(username, user["password_hash"], token):
         return {"ok": True, "need_password": True, "authenticated": False, "username": None}
+    # Sliding expiry — keeps iOS Safari sessions alive while the tab is open
+    _set_web_cookie(response, user["username"], user["password_hash"], request)
     return {
         "ok": True,
         "need_password": True,
@@ -133,6 +175,7 @@ async def create_web_user(
 @router.post("/web-users/change-password")
 async def change_web_password(
     body: WebPasswordBody,
+    request: Request,
     response: Response,
     current: Optional[str] = Depends(require_web_auth),
 ):
@@ -167,7 +210,9 @@ async def change_web_password(
     if current and target == current:
         updated = await db.get_web_user(target)
         if updated:
-            _set_web_cookie(response, updated["username"], updated["password_hash"])
+            _set_web_cookie(
+                response, updated["username"], updated["password_hash"], request
+            )
 
     return {"ok": True, "username": target}
 
@@ -189,11 +234,17 @@ async def delete_web_user(
 async def tg_status(_: Optional[str] = Depends(require_web_auth)):
     """Never block Web login / boot for more than a few seconds on Telegram I/O."""
     settings = get_settings()
+    has_session = False
+    try:
+        has_session = bool(tg_manager._session_has_auth())  # noqa: SLF001
+    except Exception:
+        has_session = False
     try:
         return await asyncio.wait_for(tg_manager.status(), timeout=3.5)
     except asyncio.TimeoutError:
+        # Soft: session exists → keep UI as "connecting", not hard offline
         return {
-            "authorized": False,
+            "authorized": has_session,
             "connected": False,
             "need_api": not bool(settings.api_id and settings.api_hash),
             "message": "Telegram 连接中…",
@@ -204,13 +255,14 @@ async def tg_status(_: Optional[str] = Depends(require_web_auth)):
         }
     except Exception as e:
         return {
-            "authorized": False,
+            "authorized": has_session,
             "connected": False,
             "need_api": not bool(settings.api_id and settings.api_hash),
             "message": str(e),
             "user": None,
             "api_configured": bool(settings.api_id and settings.api_hash),
             "proxy": settings.proxy or None,
+            "connecting": has_session,
         }
 
 
@@ -285,9 +337,14 @@ async def logout(_: Optional[str] = Depends(require_web_auth)):
 
 
 @router.post("/web-logout")
-async def web_logout(response: Response):
+async def web_logout(request: Request, response: Response):
     """Clear Web console session cookie (does not log out Telegram)."""
-    response.delete_cookie("web_auth")
+    response.delete_cookie(
+        "web_auth",
+        path="/",
+        samesite="lax",
+        secure=_request_is_https(request),
+    )
     return {"ok": True}
 
 

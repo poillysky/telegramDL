@@ -18,7 +18,7 @@
       }
     })();
   </script>
-  <link rel="stylesheet" href="/static/style.css?v=20260802-pickerx4" />
+  <link rel="stylesheet" href="/static/style.css?v=20260802-indexcreate" />
   <!-- Webfonts: non-blocking + optional (no 3s spinner / no late glyph swap stretch) -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -214,7 +214,7 @@
               </div>
             </div>
 
-            <div class="form-section">
+            <div class="form-section" id="createMediaSection">
               <h3 class="form-section-title">媒体类型</h3>
               <div class="types">
                 <label class="chip"><input type="checkbox" name="media" value="photo" checked /> 图片</label>
@@ -246,57 +246,30 @@
               </div>
 
               <div id="modeTagsFields" class="mode-panel" hidden>
-                <p class="field-hint index-create-hint">文案索引的增量/全量更新请在任务卡片「设置」里操作</p>
-
-                <div class="tag-manager">
-                  <div class="tag-manager-head">
-                    <span class="tag-manager-title">监控标签</span>
-                    <span class="tag-manager-count muted" id="monitorTagCount">已选 0</span>
-                  </div>
-
-                  <div class="tag-add-row tag-add-wrap">
-                    <div class="tag-suggest-box">
-                      <input id="tagAddInput" type="text" placeholder="输入标签名，自动补全…" enterkeyhint="done" autocomplete="off" />
-                      <div id="tagSuggestList" class="tag-suggest-list" hidden></div>
-                    </div>
-                    <button type="button" class="primary" id="btnTagAdd">添加</button>
-                  </div>
-                  <label class="check tag-auto-related">
-                    <input type="checkbox" id="tagAutoRelated" checked />
-                    <span>
-                      <strong>自动关联相关标签</strong>
-                      <small>同文案共现及间接关联的标签一并加入（如 #1+#2、#2+#3 → 选 #1 也带上 #2 #3）</small>
-                    </span>
-                  </label>
-
-                  <div id="monitorTagList" class="monitor-tag-list" aria-live="polite"></div>
-                  <p class="field-hint" id="monitorTagEmpty">尚未添加标签；可输入补全、或点下方索引标签加入</p>
-
-                  <div class="tag-edit-row" id="tagEditRow" hidden>
-                    <input id="tagEditInput" type="text" placeholder="修改标签名" />
-                    <button type="button" class="primary" id="btnTagEditSave">保存</button>
-                    <button type="button" class="ghost" id="btnTagEditCancel">取消</button>
-                  </div>
-
-                  <div class="tag-cloud-toolbar">
-                    <span class="tag-cloud-label">索引标签</span>
-                    <input id="tagSearchInput" type="search" placeholder="搜索索引标签…" />
-                  </div>
-                  <div id="indexTagCloud" class="tag-cloud"></div>
+                <div class="index-create-card">
+                  <p class="index-create-title">建立文案索引任务</p>
+                  <p class="field-hint index-create-hint">
+                    选好群组即可创建：先扫描建索引，再持续跟踪新消息。
+                    标签与下载筛选请在任务卡片「设置」里配置，创建时不必填写。
+                  </p>
                 </div>
-
+                <!-- 兼容旧逻辑：创建监控任务时标签为空，稍后在设置里添加 -->
                 <input type="hidden" id="includeTags" value="" />
                 <input type="hidden" id="tagMatchMode" value="any" />
-
-                <label>文案关键词
-                  <input id="captionKeywords" type="text" placeholder="可选，如 自录,合集" />
-                  <small class="field-hint">先按索引补下历史匹配，再持续监控新消息</small>
-                </label>
+                <input type="hidden" id="captionKeywords" value="" />
                 <div id="indexPreview" class="index-preview muted"></div>
+                <!-- 保留节点供设置页/脚本复用（创建弹窗内隐藏） -->
+                <div id="monitorTagList" class="monitor-tag-list" hidden aria-hidden="true"></div>
+                <span id="monitorTagCount" hidden>已选 0</span>
+                <span id="monitorTagEmpty" hidden></span>
+                <div id="indexTagCloud" class="tag-cloud" hidden aria-hidden="true"></div>
+                <input id="tagAddInput" type="hidden" />
+                <input id="tagSearchInput" type="hidden" />
+                <input id="tagAutoRelated" type="checkbox" checked hidden />
               </div>
             </div>
 
-            <div class="form-section">
+            <div class="form-section" id="createFolderSection">
               <h3 class="form-section-title">目录与选项</h3>
               <label>目录规则
                 <select id="folderMode">
@@ -886,6 +859,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260802-tagmerge"></script>
+  <script src="/static/app.js?v=20260802-cpulow"></script>
 </body>
 </html>

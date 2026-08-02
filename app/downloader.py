@@ -316,6 +316,7 @@ class DownloadScheduler:
         received: int,
         total: int,
     ) -> None:
+        """Update live progress. Throttled to cut CPU under pipelined downloads."""
         with self._progress_lock:
             bucket = self._progress.get(task_id)
             if not bucket:
@@ -324,24 +325,41 @@ class DownloadScheduler:
             if not p:
                 return
             now = time.monotonic()
-            prev_bytes = int(p.get("_bytes") or 0)
+            recv = int(received or 0)
+            # Always remember latest bytes for resume/UI, but skip heavy updates
+            last_ui = float(p.get("_ui_t") or 0)
+            last_ui_bytes = int(p.get("_ui_bytes") or 0)
+            byte_delta = recv - last_ui_bytes
+            if (
+                last_ui
+                and (now - last_ui) < 0.35
+                and byte_delta < 256 * 1024
+                and recv < int(p.get("total") or total or 0)
+            ):
+                p["_pending_recv"] = recv
+                if total:
+                    p["_pending_total"] = int(total)
+                return
+
+            prev_bytes = int(p.get("_bytes") or p.get("_pending_recv") or 0)
+            if "_pending_recv" in p:
+                prev_bytes = max(prev_bytes, int(p.pop("_pending_recv") or 0))
+            if "_pending_total" in p:
+                total = int(p.pop("_pending_total") or total or 0)
+
             dt = now - float(p.get("_t") or now)
-            delta = int(received or 0) - prev_bytes
-            # Longer window + heavier EMA → less flicker when chunks arrive in bursts
-            if dt >= 0.6 and delta >= 0:
+            delta = recv - prev_bytes
+            if dt >= 0.35 and delta >= 0:
                 inst = delta / dt if dt > 0 else 0.0
                 prev = float(p.get("speed") or 0)
-                p["speed"] = inst if prev <= 0 else prev * 0.75 + inst * 0.25
+                p["speed"] = inst if prev <= 0 else prev * 0.78 + inst * 0.22
                 p["_t"] = now
-                p["_bytes"] = int(received or 0)
-            elif int(received or 0) >= prev_bytes:
-                p["received"] = int(received or 0)
-                if total:
-                    p["total"] = int(total)
-                return
-            p["received"] = int(received or 0)
+                p["_bytes"] = recv
+            p["received"] = recv
             if total:
                 p["total"] = int(total)
+            p["_ui_t"] = now
+            p["_ui_bytes"] = recv
 
     def _finish_file_progress(
         self,
@@ -383,16 +401,26 @@ class DownloadScheduler:
         stop: asyncio.Event,
         total: int,
     ) -> None:
-        """Poll .part size so speed works even if Telethon callback is silent."""
+        """Fallback .part size poll when Telethon progress callbacks go silent."""
         try:
+            # Give pipelined callbacks a head start — avoid double-updating
+            await asyncio.sleep(2.0)
             while not stop.is_set():
+                # Skip if callback already refreshed recently
+                with self._progress_lock:
+                    bucket = self._progress.get(task_id) or {}
+                    p = (bucket.get("files") or {}).get(int(message_id)) or {}
+                    last_ui = float(p.get("_ui_t") or 0)
+                if last_ui and (time.monotonic() - last_ui) < 1.2:
+                    await asyncio.sleep(1.2)
+                    continue
                 if part_path.exists():
                     try:
                         size = part_path.stat().st_size
                     except OSError:
                         size = 0
                     self._on_bytes_progress(task_id, message_id, size, total)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(1.2)
         except asyncio.CancelledError:
             return
 
@@ -714,7 +742,7 @@ class DownloadScheduler:
         download_mode = normalize_download_mode(task.get("download_mode"))
         mode_labels = {
             "sequential": "按时间顺序",
-            "monitor": "监控模式（按标签）",
+            "monitor": "监控模式（文案索引）",
         }
         await self.db.append_log(
             task_id, f"任务模式: {mode_labels.get(download_mode, download_mode)}"
@@ -1008,13 +1036,40 @@ class DownloadScheduler:
         caption_keywords = normalize_keyword_list(fresh.get("caption_keywords") or [])
         tag_match_mode = "any"
         if not include_tags and not caption_keywords:
-            await self.db.update_task(
-                task_id,
-                status="failed",
-                last_error="监控模式需要选择标签或填写文案关键词",
-            )
+            # Index-only: no tags yet — keep watching/indexing; download after tags are set
             await self.db.append_log(
-                task_id, "失败：请选择至少一个标签，或填写文案关键词"
+                task_id,
+                f"索引完成，共 {media_count} 条媒体。未选标签：仅维护索引，"
+                "请在任务设置中添加标签后再下载",
+            )
+            meta = await self.db.get_index_meta(chat_id) or {}
+            last_seen = max(
+                int(meta.get("last_message_id") or 0),
+                int(counters.get("last_id") or 0),
+            )
+            await self._monitor_tagged_messages(
+                task_id=task_id,
+                stop_event=stop_event,
+                settings=settings,
+                client=client,
+                chat_id=chat_id,
+                group_dir=group_dir,
+                media_types=media_types,
+                use_text_as_folder=use_text_as_folder,
+                album_captions=album_captions,
+                counters=counters,
+                last_seen=last_seen,
+                concurrency=concurrency,
+                file_formats=file_formats,
+                max_messages=max_messages,
+                delay_min=delay_min,
+                delay_max=delay_max,
+                folder_mode=folder_mode,
+                include_tags=[],
+                caption_keywords=[],
+                tag_match_mode=tag_match_mode,
+                test_mode=test_mode,
+                test_deadline=test_deadline,
             )
             return
         # Expand with direct + indirect related tags from caption co-occurrence
@@ -1482,9 +1537,14 @@ class DownloadScheduler:
         include_tags = include_tags or []
         caption_keywords = caption_keywords or []
         last_seen = max(0, int(last_seen or 0))
+        filt = (
+            "仅维护索引（尚未配置标签）"
+            if not include_tags and not caption_keywords
+            else "按标签/关键词下载新匹配"
+        )
         await self.db.append_log(
             task_id,
-            f"进入监控：从消息 {last_seen} 之后检查新内容，约每 {poll_sec:.0f}s 一轮（暂停可停止）",
+            f"进入监控（{filt}）：从消息 {last_seen} 之后检查，约每 {poll_sec:.0f}s 一轮（暂停可停止）",
         )
         await self.db.update_task(
             task_id,
@@ -1620,6 +1680,10 @@ class DownloadScheduler:
                         await self.db.commit()
                     except Exception:
                         logger.debug("monitor index upsert failed", exc_info=True)
+
+                    # No tags/keywords yet: index-only watch (do not download all media)
+                    if not include_tags and not caption_keywords:
+                        continue
 
                     if not matches_include_tags(
                         tags, include_tags, mode=tag_match_mode
@@ -1794,12 +1858,12 @@ class DownloadScheduler:
                     task_id, f"本轮监控处理 {new_count} 条，继续等待新消息…"
                 )
 
-            # Interruptible sleep until next poll
+            # Interruptible sleep until next poll (coarser steps = less wakeups)
             remaining = float(poll_sec)
             while remaining > 0:
                 if stop_event.is_set() or self._test_time_up(test_deadline):
                     break
-                step = min(0.5, remaining)
+                step = min(2.0, remaining)
                 await asyncio.sleep(step)
                 remaining -= step
 
@@ -2628,21 +2692,27 @@ class DownloadScheduler:
                 quiet=True,
             )
 
-        failed = await self.db.count_failed(task_id)
+        # Prefer in-memory failed counter; COUNT(*) every reap is expensive under load
         counters["processed"] = processed
         counters["downloaded"] = downloaded
         counters["failed"] = failed
         counters["current_folder"] = current_folder
         counters["last_id"] = last_id
-        await self.db.update_task(
-            task_id,
-            current_folder=current_folder,
-            last_message_id=last_id,
-            processed_count=processed,
-            downloaded_count=downloaded,
-            failed_count=failed,
-            skipped_count=int(counters.get("skipped") or 0),
-        )
+        # Throttle task-row updates while many files finish quickly
+        now_m = time.monotonic()
+        last_flush = float(counters.get("_db_flush_t") or 0)
+        force_flush = paused or not active
+        if force_flush or (now_m - last_flush) >= 0.8:
+            counters["_db_flush_t"] = now_m
+            await self.db.update_task(
+                task_id,
+                current_folder=current_folder,
+                last_message_id=last_id,
+                processed_count=processed,
+                downloaded_count=downloaded,
+                failed_count=failed,
+                skipped_count=int(counters.get("skipped") or 0),
+            )
         return paused
 
     async def _pool_drain(

@@ -4155,6 +4155,26 @@ body:has(#stageLogin:not([hidden])) .login-card {
   opacity: 0.75;
 }
 
+.index-create-card {
+  margin: 4px 0 8px;
+  padding: 14px 14px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(62, 207, 154, 0.22);
+  background:
+    linear-gradient(145deg, rgba(62, 207, 154, 0.08), transparent 55%),
+    rgba(8, 14, 12, 0.35);
+}
+.index-create-title {
+  margin: 0 0 6px;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--ink);
+}
+.index-create-hint {
+  margin: 0;
+  line-height: 1.5;
+}
+
 .bl-add-row {
   display: flex;
   gap: 8px;
