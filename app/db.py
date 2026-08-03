@@ -275,7 +275,6 @@ CREATE TABLE IF NOT EXISTS web_users (
 
 CREATE INDEX IF NOT EXISTS idx_downloaded_task ON downloaded(task_id);
 CREATE INDEX IF NOT EXISTS idx_downloaded_status_id ON downloaded(status, id DESC);
-CREATE INDEX IF NOT EXISTS idx_downloaded_chat_status_id ON downloaded(chat_id, status, id DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 
 CREATE TABLE IF NOT EXISTS chat_completed (

@@ -1,6 +1,6 @@
 services:
   web:
-    image: poillysky/telegramdl:1.0.8
+    image: poillysky/telegramdl:1.0.9
     build: .
     container_name: telegram-group-downloader
     restart: unless-stopped
