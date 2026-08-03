@@ -5,7 +5,7 @@
 # 3. 同目录新建 .env（可参考仓库 .env.example），至少改 WEB_PASSWORD
 # 4. 飞牛 Docker → Compose → 新增项目 → 路径选 telegramdl → 启动
 #
-# 镜像：Docker Hub  poillysky/telegramdl:1.0.10
+# 镜像：Docker Hub  poillysky/telegramdl:1.0.11
 # 相对路径 ./ 落在项目目录下，飞牛会自动创建子目录：
 #   ./downloads  下载文件
 #   ./data       数据库 / 日志
@@ -13,7 +13,7 @@
 
 services:
   telegramdl:
-    image: poillysky/telegramdl:1.0.10
+    image: poillysky/telegramdl:1.0.11
     container_name: telegramdl
     restart: unless-stopped
     ports:

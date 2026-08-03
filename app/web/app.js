@@ -513,8 +513,22 @@ function confirmDialog(opts = {}) {
   const typeHint = $("confirmTypeHint");
   const typeInput = $("confirmTypeInput");
 
-  if (panel) panel.classList.toggle("is-danger", danger);
-  if (kicker) kicker.textContent = alertOnly ? "提示" : danger ? "危险操作" : "确认";
+  if (panel) {
+    panel.classList.toggle("is-danger", danger);
+    panel.classList.toggle("is-alert", alertOnly && !danger);
+  }
+  if (kicker) {
+    kicker.textContent = alertOnly ? "提示" : danger ? "不可撤销" : "请确认";
+  }
+  const icon = $("confirmIcon");
+  if (icon) {
+    const warn = icon.querySelector(".confirm-icon-warn");
+    const info = icon.querySelector(".confirm-icon-info");
+    const ask = icon.querySelector(".confirm-icon-ask");
+    if (warn) warn.hidden = !(danger);
+    if (info) info.hidden = !(alertOnly && !danger);
+    if (ask) ask.hidden = !(!danger && !alertOnly);
+  }
   if (titleEl) titleEl.textContent = title;
   if (msgEl) msgEl.textContent = message;
   if (btnOk) {
@@ -4562,6 +4576,9 @@ function stripBlacklistedTags(tags) {
 function clusterRelatedBundles(bundles, opts = {}) {
   const hubDegree = Math.max(3, Number(opts.hubDegree) || 6);
   const maxCluster = Math.max(4, Number(opts.maxClusterSize) || 16);
+  const manualLinks = (opts.manualLinks || [])
+    .map((link) => stripBlacklistedTags(link || []).filter(Boolean))
+    .filter((tags) => tags.length >= 2);
   const raw = [];
   for (const b of bundles || []) {
     // Drop blacklist first so #半糖 never enters any 关联 group
@@ -4577,7 +4594,26 @@ function clusterRelatedBundles(bundles, opts = {}) {
       uniq.push(t);
     }
     if (uniq.length < 2) continue;
-    raw.push({ tags: uniq, count: Number(b.count) || 0 });
+    raw.push({
+      tags: uniq,
+      count: Number(b.count) || 0,
+      manual: !!b.manual,
+    });
+  }
+  // Ensure each manual link is present as a bridge pattern
+  for (const link of manualLinks) {
+    const seen = new Set();
+    const uniq = [];
+    for (const t of link) {
+      const k = String(t).toLowerCase();
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      uniq.push(t);
+    }
+    if (uniq.length < 2) continue;
+    const key = groupKey(uniq);
+    if (raw.some((b) => groupKey(b.tags) === key)) continue;
+    raw.push({ tags: uniq, count: 0, manual: true });
   }
   const degree = new Map();
   for (const b of raw) {
@@ -4615,6 +4651,14 @@ function clusterRelatedBundles(bundles, opts = {}) {
       }
     }
   }
+  // Manual links always bridge — ignore hubDegree so two caption groups merge
+  for (const link of manualLinks) {
+    const keys = link
+      .map((t) => String(t).toLowerCase())
+      .filter(Boolean);
+    if (keys.length < 2) continue;
+    for (let i = 1; i < keys.length; i++) union(keys[0], keys[i]);
+  }
 
   // component(root) -> Set of non-hub keys
   const bridgeComps = new Map();
@@ -4627,28 +4671,39 @@ function clusterRelatedBundles(bundles, opts = {}) {
   // Attach each raw bundle onto a cluster:
   // - if bundle has >=1 non-hub: join that bridge component (+ hubs from this bundle)
   // - if bundle is only hubs / hub+nothing useful: keep as its own pattern row
-  const clusterMap = new Map(); // id -> { tags: Map lower->display, count }
+  // - manual / tags covered by a manual link: attach via any tag after force-union
+  const manualKeySet = new Set(
+    manualLinks.flatMap((link) => link.map((t) => String(t).toLowerCase()))
+  );
+  const clusterMap = new Map(); // id -> { tags: Map lower->display, count, manual }
   const ensureCluster = (id) => {
     if (!clusterMap.has(id)) {
-      clusterMap.set(id, { tagMap: new Map(), count: 0 });
+      clusterMap.set(id, { tagMap: new Map(), count: 0, manual: false });
     }
     return clusterMap.get(id);
   };
-  const addTo = (id, tags, count) => {
+  const addTo = (id, tags, count, manual) => {
     const c = ensureCluster(id);
     for (const t of tags) c.tagMap.set(t.toLowerCase(), t);
     c.count += count;
+    if (manual) c.manual = true;
   };
 
   let singletonSeq = 0;
   for (const b of raw) {
     const bridges = b.tags.filter((t) => !isHub(t));
+    const touchesManual = b.tags.some((t) =>
+      manualKeySet.has(String(t).toLowerCase())
+    );
     if (bridges.length >= 1) {
       const id = `c:${find(bridges[0].toLowerCase())}`;
-      addTo(id, b.tags, b.count);
+      addTo(id, b.tags, b.count, b.manual || touchesManual);
+    } else if (touchesManual || b.manual) {
+      const id = `c:${find(b.tags[0].toLowerCase())}`;
+      addTo(id, b.tags, b.count, true);
     } else {
       // all hubs — keep pattern separate
-      addTo(`s:${singletonSeq++}`, b.tags, b.count);
+      addTo(`s:${singletonSeq++}`, b.tags, b.count, false);
     }
   }
 
@@ -4656,17 +4711,21 @@ function clusterRelatedBundles(bundles, opts = {}) {
   for (const c of clusterMap.values()) {
     const tags = [...c.tagMap.values()];
     if (tags.length < 2) continue;
-    if (tags.length > maxCluster) {
+    if (tags.length > maxCluster && !c.manual) {
       // explode oversized clusters back to raw patterns involving these tags
       const keys = new Set(tags.map((t) => t.toLowerCase()));
       for (const b of raw) {
         if (!b.tags.some((t) => keys.has(t.toLowerCase()))) continue;
         // only emit if this bundle isn't dominated by a single mega-hub bridging
-        clusters.push({ tags: b.tags.slice(), count: b.count });
+        clusters.push({
+          tags: b.tags.slice(),
+          count: b.count,
+          manual: !!b.manual,
+        });
       }
       continue;
     }
-    clusters.push({ tags, count: c.count });
+    clusters.push({ tags, count: c.count, manual: !!c.manual });
   }
 
   // Dedupe identical tag-sets (from explode)
@@ -5039,6 +5098,106 @@ function renderTagPickerApplied() {
   });
 }
 
+/**
+ * Force-merge picker rows covered by the same manual link into one group.
+ * HubDegree clustering alone won't glue two caption patterns that share no
+ * non-hub tag — manual links must always show as a single「手动」row.
+ */
+function mergeRowsByManualLinks(rows, manualLinks, countBy) {
+  const links = (manualLinks || [])
+    .map((link) =>
+      stripBlacklistedTags(link || [])
+        .map((t) => normalizeTagName(t))
+        .filter(Boolean)
+    )
+    .filter((tags) => tags.length >= 2);
+  if (!links.length) return rows || [];
+
+  const list = [...(rows || [])];
+  const consumed = new Set();
+  const merged = [];
+
+  for (const link of links) {
+    const linkKeys = new Set(link.map((t) => t.toLowerCase()));
+    const hitIdx = [];
+    for (let i = 0; i < list.length; i++) {
+      if (consumed.has(i)) continue;
+      const names = (list[i].tags || []).map((t) => t.tag || t);
+      if (names.some((n) => linkKeys.has(String(n).toLowerCase()))) {
+        hitIdx.push(i);
+      }
+    }
+    if (!hitIdx.length) {
+      // no existing row — still surface the manual group from index counts
+      const members = [...linkKeys].map((k) => {
+        const hit = countBy?.get(k);
+        const display =
+          link.find((t) => t.toLowerCase() === k) || hit?.tag || k;
+        return { tag: hit?.tag || display, count: hit?.count || 0 };
+      });
+      members.sort(
+        (a, b) => b.count - a.count || a.tag.localeCompare(b.tag, "zh")
+      );
+      merged.push({
+        kind: "bundle",
+        tags: members,
+        count: members.reduce((s, m) => s + (m.count || 0), 0),
+        manual: true,
+      });
+      continue;
+    }
+    const tagMap = new Map();
+    let count = 0;
+    for (const i of hitIdx) {
+      consumed.add(i);
+      const row = list[i];
+      count += Number(row.count) || 0;
+      for (const t of row.tags || []) {
+        const name = t.tag || t;
+        const k = String(name).toLowerCase();
+        if (!k) continue;
+        const prev = tagMap.get(k);
+        tagMap.set(k, {
+          tag: prev?.tag || name,
+          count: Math.max(prev?.count || 0, Number(t.count) || 0),
+        });
+      }
+    }
+    // Ensure every manual-link tag is present even if it was a solo elsewhere
+    for (const raw of link) {
+      const k = raw.toLowerCase();
+      if (tagMap.has(k)) continue;
+      const hit = countBy?.get(k);
+      tagMap.set(k, { tag: hit?.tag || raw, count: hit?.count || 0 });
+    }
+    const members = [...tagMap.values()];
+    members.sort(
+      (a, b) => b.count - a.count || a.tag.localeCompare(b.tag, "zh")
+    );
+    merged.push({
+      kind: "bundle",
+      tags: members,
+      count,
+      manual: true,
+    });
+  }
+
+  const rest = list.filter((_, i) => !consumed.has(i));
+  // Drop solos/bundles whose tags were absorbed into a manual row
+  const absorbed = new Set();
+  for (const row of merged) {
+    for (const t of row.tags || []) absorbed.add(String(t.tag).toLowerCase());
+  }
+  const kept = rest.filter((row) => {
+    const names = (row.tags || []).map((t) => String(t.tag || t).toLowerCase());
+    if (names.some((k) => absorbed.has(k))) return false;
+    return true;
+  });
+  const out = merged.concat(kept);
+  out.sort((a, b) => b.count - a.count);
+  return out;
+}
+
 /** Rows for picker: related clusters first, then solo tags. */
 function buildTagPickerRows(items, bundles) {
   const countBy = new Map();
@@ -5050,7 +5209,9 @@ function buildTagPickerRows(items, bundles) {
       count: Number(t.count) || 0,
     });
   }
-  const { clusters } = clusterRelatedBundles(bundles);
+  const { clusters } = clusterRelatedBundles(bundles, {
+    manualLinks: state.tagPickerManualLinks || [],
+  });
   const inBundle = new Set();
   const rows = [];
   for (const c of clusters) {
@@ -5070,6 +5231,7 @@ function buildTagPickerRows(items, bundles) {
       kind: "bundle",
       tags: members,
       count: Number(c.count) || 0,
+      manual: !!c.manual,
     });
   }
   rows.sort((a, b) => b.count - a.count);
@@ -5082,7 +5244,11 @@ function buildTagPickerRows(items, bundles) {
   solos.sort(
     (a, b) => b.count - a.count || a.tags[0].tag.localeCompare(b.tags[0].tag, "zh")
   );
-  return rows.concat(solos);
+  return mergeRowsByManualLinks(
+    rows.concat(solos),
+    state.tagPickerManualLinks || [],
+    countBy
+  );
 }
 
 function getTagPickerIndexRows(q) {
@@ -5160,7 +5326,18 @@ function renderTagPickerIndex(opts = {}) {
       const names = group.map((t) => t.tag);
       const rowKey = groupKey(names);
       const isChecked = selected.has(rowKey);
-      const manualLink = findManualLinkForNames(names);
+      const manualLink =
+        findManualLinkForNames(names) ||
+        (row.manual
+          ? (state.tagPickerManualLinks || []).find((link) => {
+              const keys = new Set(
+                (link || []).map((t) => String(t).toLowerCase().replace(/^#/, ""))
+              );
+              return names.some((n) =>
+                keys.has(String(n).toLowerCase().replace(/^#/, ""))
+              );
+            }) || names
+          : null);
       const exactApplied = isBundle
         ? isDraftGroupApplied(names)
         : isTagApplied(names[0]);
