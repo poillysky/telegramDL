@@ -23,8 +23,16 @@ WHITESPACE = re.compile(r"\s+")
 HASHTAG_RE = re.compile(r"#([^\s#@/\\<>:|?*【】［］〖〗〔〕〈〉《》\[\]（）()『』「」]+)")
 # 7.18 / 07.18
 DATE_DOT_RE = re.compile(r"(?<!\d)(\d{1,2}\.\d{1,2})(?!\d)")
+# 7.24-8.25 / 7.24~8.25 / 7.24至8.25
+DATE_DOT_RANGE_RE = re.compile(
+    r"(?<!\d)(\d{1,2}\.\d{1,2})\s*[-~～—–至到]\s*(\d{1,2}\.\d{1,2})(?!\d)"
+)
 # 7月18日
 DATE_CN_RE = re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]?")
+# 7月24日-8月25日
+DATE_CN_RANGE_RE = re.compile(
+    r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]?\s*[-~～—–至到]\s*(\d{1,2})月(\d{1,2})[日号]?"
+)
 
 # 标签名清理：去掉误吸入的括号索引尾巴（含全角］等）
 _TAG_CUT_RE = re.compile(r"[】］〗〕〉》\]）)』」].*$")
@@ -201,6 +209,16 @@ def matches_file_size(
 def extract_date_token(text: str) -> Optional[str]:
     if not text:
         return None
+    # Prefer ranges so「7.24-8.25」keeps both ends (not just 7.24)
+    m = DATE_DOT_RANGE_RE.search(text)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    m = DATE_CN_RANGE_RE.search(text)
+    if m:
+        return (
+            f"{int(m.group(1))}.{int(m.group(2))}"
+            f"-{int(m.group(3))}.{int(m.group(4))}"
+        )
     m = DATE_DOT_RE.search(text)
     if m:
         return m.group(1)
@@ -787,6 +805,9 @@ def caption_filename_stem(caption: str) -> str:
         return ""
     text = caption
     text = HASHTAG_RE.sub(" ", text)
+    # Strip ranges before singles so「7.24-8.25」does not leave「-8.25」
+    text = DATE_DOT_RANGE_RE.sub(" ", text)
+    text = DATE_CN_RANGE_RE.sub(" ", text)
     text = DATE_CN_RE.sub(" ", text)
     text = DATE_DOT_RE.sub(" ", text)
     text = MENTION_RE.sub(" ", text)

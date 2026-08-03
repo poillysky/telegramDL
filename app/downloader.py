@@ -103,6 +103,8 @@ class DownloadScheduler:
         self._progress_lock = threading.Lock()
         # chat_id -> bumped after index scan so local monitor wakes
         self._index_bumps: set[str] = set()
+        # chat_id -> tag/keyword filters changed (sticky wake; survives Event.clear)
+        self._filter_dirty: set[str] = set()
         self._index_wake: dict[str, asyncio.Event] = {}
         self._index_bump_lock = threading.Lock()
         # task_id -> pending count when we last returned gap_found (blocks spin loops)
@@ -130,9 +132,22 @@ class DownloadScheduler:
         """Wake idle local-monitor loops (tag edits, etc.). Event.set is thread-safe."""
         key = str(chat_id)
         with self._index_bump_lock:
+            # Sticky flag survives Event.clear() race around wait entry
+            self._filter_dirty.add(key)
             ev = self._index_wake.get(key)
         if ev is not None:
             ev.set()
+
+    def peek_filter_dirty(self, chat_id: str | int) -> bool:
+        return str(chat_id) in self._filter_dirty
+
+    def consume_filter_dirty(self, chat_id: str | int) -> bool:
+        key = str(chat_id)
+        with self._index_bump_lock:
+            if key not in self._filter_dirty:
+                return False
+            self._filter_dirty.discard(key)
+            return True
 
     async def apply_live_concurrency(
         self, task_id: int, concurrency: int | None = None
@@ -149,6 +164,37 @@ class DownloadScheduler:
             except Exception:
                 return
         await self._apply_pool_concurrency(pool, int(concurrency))
+
+    def apply_live_task_settings(
+        self, task_id: int, task: dict | None = None
+    ) -> None:
+        """Hot-apply file filters + wake monitor without stopping the worker."""
+        tid = int(task_id)
+        try:
+            if task is None:
+                # Sync helper — filters from last known snapshot only when provided
+                task = {}
+            self._set_task_filters(
+                tid,
+                file_formats=task.get("file_formats") or [],
+                min_file_bytes=int(task.get("min_file_bytes") or 0),
+                max_file_bytes=int(task.get("max_file_bytes") or 0),
+            )
+        except Exception:
+            logger.debug("live filter apply failed", exc_info=True)
+        try:
+            if task and task.get("chat_id") is not None:
+                self.wake_local_monitor(task.get("chat_id"))
+        except Exception:
+            pass
+        # Desired concurrency for next pool / live resize
+        try:
+            conc = max(1, min(5, int((task or {}).get("concurrency") or 1)))
+            pool = self._live_pools.get(tid)
+            if pool is not None:
+                pool["desired_concurrency"] = conc
+        except Exception:
+            pass
 
     def notify_index_updated(self, chat_id: str | int) -> None:
         """After manual/auto/full index scan: mark bump and wake monitor."""
@@ -186,12 +232,16 @@ class DownloadScheduler:
         if stop_event.is_set() or self._test_time_up(test_deadline):
             return "stop"
         wake = self._chat_wake_event(chat_id)
-        # Avoid lost wake: bump already set → return immediately
+        # Avoid lost wake: bump / filter dirty already set → return immediately
         if self.peek_index_bump(chat_id):
             return "bump"
+        if self.consume_filter_dirty(chat_id):
+            return "wake"
         wake.clear()
         if self.peek_index_bump(chat_id):
             return "bump"
+        if self.consume_filter_dirty(chat_id):
+            return "wake"
 
         stop_task = asyncio.create_task(stop_event.wait())
         wake_task = asyncio.create_task(wake.wait())
@@ -215,8 +265,10 @@ class DownloadScheduler:
 
         if stop_event.is_set() or self._test_time_up(test_deadline):
             return "stop"
-        if self.peek_index_bump(chat_id) or wake_task in done:
-            return "bump" if self.peek_index_bump(chat_id) else "wake"
+        if self.peek_index_bump(chat_id):
+            return "bump"
+        if self.consume_filter_dirty(chat_id) or wake_task in done:
+            return "wake"
         return "heartbeat"
 
     def _slot_condition(self) -> asyncio.Condition:
@@ -1546,11 +1598,54 @@ class DownloadScheduler:
         media_count = await self.db.count_media_index(chat_id)
         await self.db.append_log(task_id, f"本地索引 {media_count} 条")
 
-        # Reload filters (user may edit tags on the tasks page while indexing)
+        # Reload filters/settings (hot switch — no worker restart)
         fresh = await self.db.get_task(task_id) or {}
         include_tags = normalize_tag_list(fresh.get("include_tags") or [])
         caption_keywords = normalize_keyword_list(fresh.get("caption_keywords") or [])
         tag_match_mode = "any"
+        media_types = set(fresh.get("media_types") or media_types or []) or set(
+            media_types or []
+        )
+        folder_mode = str(fresh.get("folder_mode") or folder_mode or "caption")
+        use_text_as_folder = bool(
+            fresh.get("use_text_as_folder")
+            if fresh.get("use_text_as_folder") is not None
+            else use_text_as_folder
+        )
+        try:
+            concurrency = max(1, min(5, int(fresh.get("concurrency") or concurrency or 1)))
+        except (TypeError, ValueError):
+            pass
+        delay_min = float(
+            fresh.get("delay_min") if fresh.get("delay_min") is not None else delay_min
+        )
+        delay_max = float(
+            fresh.get("delay_max") if fresh.get("delay_max") is not None else delay_max
+        )
+        if delay_max < delay_min:
+            delay_max = delay_min
+        file_formats = fresh.get("file_formats") if "file_formats" in fresh else file_formats
+        file_formats = file_formats or []
+        self._set_task_filters(
+            task_id,
+            file_formats=file_formats,
+            min_file_bytes=int(fresh.get("min_file_bytes") or 0),
+            max_file_bytes=int(fresh.get("max_file_bytes") or 0),
+        )
+        download_order = (fresh.get("download_order") or "added_first").strip()
+        if download_order not in ("added_first", "oldest_first", "newest_first"):
+            download_order = "added_first"
+        newest_first = download_order == "newest_first"
+        index_order_by = "id" if download_order == "added_first" else "message_id"
+        max_messages = fresh.get("max_messages")
+        if max_messages is not None:
+            try:
+                max_messages = int(max_messages)
+                if max_messages <= 0:
+                    max_messages = None
+            except (TypeError, ValueError):
+                max_messages = None
+        self.consume_filter_dirty(chat_id)
         if not include_tags and not caption_keywords:
             # Index-only: no tags yet — wait for settings; download after tags are set
             await self.db.append_log(task_id, "未选标签，等待配置")
@@ -1723,7 +1818,10 @@ class DownloadScheduler:
             if reason and reason not in ("任务已暂停", "监控已暂停"):
                 await self.db.append_log(task_id, reason)
 
+        soft_reload = False
         for tag, tag_message_ids in per_tag_ids:
+            if soft_reload:
+                break
             if not tag_message_ids:
                 continue
             if tag:
@@ -1741,6 +1839,24 @@ class DownloadScheduler:
                     )
                     await _pause_and_return(reason)
                     return
+
+                # Settings/tags changed mid-backlog → finish in-flight, then
+                # fall through to monitor which returns filters_ready (no restart).
+                if self.peek_filter_dirty(chat_id):
+                    self.consume_filter_dirty(chat_id)
+                    if self._pool_busy(pool):
+                        await self._pool_drain(
+                            pool,
+                            task_id=task_id,
+                            settings=settings,
+                            group_dir=group_dir,
+                            use_text_as_folder=use_text_as_folder,
+                            counters=counters,
+                            test_mode=test_mode,
+                        )
+                    await self.db.append_log(task_id, "设置已更新，切换补下")
+                    soft_reload = True
+                    break
 
                 captions_map = await self.db.get_index_captions(chat_id, chunk)
 
@@ -2184,30 +2300,55 @@ class DownloadScheduler:
             fresh = await self.db.get_task(task_id) or {}
             prev_tags = set(include_tags)
             prev_kws = set(caption_keywords)
+            prev_media = set(media_types or [])
             include_tags = normalize_tag_list(fresh.get("include_tags") or [])
             caption_keywords = normalize_keyword_list(
                 fresh.get("caption_keywords") or []
             )
             tag_match_mode = "any"
-            filters_changed = set(include_tags) != prev_tags or set(
-                caption_keywords
-            ) != prev_kws
+            new_media = set(fresh.get("media_types") or []) or prev_media
+            media_changed = new_media != prev_media
+            media_types = new_media
+            # Hot-refresh folder / delay / concurrency for next gap download
+            folder_mode = str(fresh.get("folder_mode") or folder_mode or "caption")
+            use_text_as_folder = bool(
+                fresh.get("use_text_as_folder")
+                if fresh.get("use_text_as_folder") is not None
+                else use_text_as_folder
+            )
+            try:
+                concurrency = max(
+                    1, min(5, int(fresh.get("concurrency") or concurrency or 1))
+                )
+            except (TypeError, ValueError):
+                pass
+            filters_changed = (
+                set(include_tags) != prev_tags
+                or set(caption_keywords) != prev_kws
+                or media_changed
+            )
             if filters_changed:
-                if not include_tags and not caption_keywords:
+                if not include_tags and not caption_keywords and not media_changed:
                     await self.db.append_log(task_id, "标签已清空，等待配置")
                 else:
-                    await self.db.append_log(task_id, "标签已更新，开始补下")
-                    await self.db.update_task(
+                    await self.db.append_log(
                         task_id,
-                        status="running",
-                        last_message_id=last_seen,
-                        current_folder=counters.get("current_folder"),
-                        processed_count=int(counters["processed"]),
-                        downloaded_count=int(counters["downloaded"]),
-                        failed_count=await self.db.count_failed(task_id),
-                        skipped_count=int(counters["skipped"]),
-                        last_error=None,
+                        "设置已更新，开始补下"
+                        if media_changed and set(include_tags) == prev_tags
+                        else "标签已更新，开始补下",
                     )
+                    if str(fresh.get("status") or "") != "running":
+                        await self.db.update_task(
+                            task_id,
+                            status="running",
+                            last_message_id=last_seen,
+                            current_folder=counters.get("current_folder"),
+                            processed_count=int(counters["processed"]),
+                            downloaded_count=int(counters["downloaded"]),
+                            failed_count=await self.db.count_failed(task_id),
+                            skipped_count=int(counters["skipped"]),
+                            last_error=None,
+                        )
                     return "filters_ready"
 
             if max_messages and int(counters["downloaded"]) >= max_messages:
@@ -3152,6 +3293,9 @@ class DownloadScheduler:
             "worker_tasks": {},  # worker_id -> Task
             "started": False,
             "in_flight": 0,
+            "settle_pending": 0,
+            "settle_db_lock": asyncio.Lock(),
+            "settle_tasks": set(),
             "blocked": False,
             "_stopping": False,
             "done_event": asyncio.Event(),
@@ -3169,6 +3313,7 @@ class DownloadScheduler:
         pri = pool.get("priority")
         return bool(pool.get("started")) and (
             int(pool.get("in_flight") or 0) > 0
+            or int(pool.get("settle_pending") or 0) > 0
             or not pool["queue"].empty()
             or bool(pri)
             or bool(pool.get("workers"))
@@ -3194,7 +3339,7 @@ class DownloadScheduler:
         ctx = pool.get("_ctx") or {}
         task_id = int(ctx.get("task_id") or pool.get("_task_id") or 0)
 
-        # Shrink: ask workers above the new limit to yield their current file
+        # Shrink: ask workers above the new limit to yield ASAP (keep .part, requeue)
         yielded = 0
         for wid, info in list((pool.get("active") or {}).items()):
             if int(wid) > desired:
@@ -3207,11 +3352,13 @@ class DownloadScheduler:
                 asyncio.get_running_loop().create_task(
                     self.db.append_log(
                         task_id,
-                        f"并发 {prev}→{desired}：多余下载改排队续传（当前文件下完后立即处理）",
+                        f"并发 {prev}→{desired}：多余路让出并排队续传（.part 保留，不丢进度）",
                     )
                 )
             except Exception:
                 pass
+        # Park excess worker ids; they stop pulling until concurrency grows again
+        pool["desired_concurrency"] = desired
 
         # Grow / refill: spawn missing workers
         if desired > len(pool.get("worker_tasks") or {}):
@@ -3352,24 +3499,46 @@ class DownloadScheduler:
                         pool["in_flight"] = max(0, int(pool.get("in_flight") or 0) - 1)
                     self._pool_signal_done(pool)
 
-                try:
-                    await self._settle_pool_job(
-                        pool,
-                        job,
-                        result,
-                        task_id=task_id,
-                        settings=ctx["settings"],
-                        group_dir=ctx["group_dir"],
-                        use_text_as_folder=bool(ctx.get("use_text_as_folder")),
-                        counters=ctx["counters"],
-                        test_mode=bool(ctx.get("test_mode")),
-                        log_prefix=str(ctx.get("log_prefix") or ""),
-                    )
-                except Exception:
-                    logger.exception("settle failed msg %s", job.message_id)
-                    pool["settled"][job.message_id] = False
-                    pool["blocked"] = True
-                    self._pool_signal_done(pool)
+                # Settle in background so this lane can immediately take the next job
+                # (otherwise concurrency=2 looks like "wait for sibling").
+                async with pool["lock"]:
+                    pool["settle_pending"] = int(pool.get("settle_pending") or 0) + 1
+
+                async def _bg_settle(
+                    _job=job,
+                    _result=result,
+                    _task_id=task_id,
+                    _ctx=ctx,
+                ) -> None:
+                    try:
+                        await self._settle_pool_job(
+                            pool,
+                            _job,
+                            _result,
+                            task_id=_task_id,
+                            settings=_ctx["settings"],
+                            group_dir=_ctx["group_dir"],
+                            use_text_as_folder=bool(_ctx.get("use_text_as_folder")),
+                            counters=_ctx["counters"],
+                            test_mode=bool(_ctx.get("test_mode")),
+                            log_prefix=str(_ctx.get("log_prefix") or ""),
+                        )
+                    except Exception:
+                        logger.exception("settle failed msg %s", _job.message_id)
+                        pool["settled"][_job.message_id] = False
+                        pool["blocked"] = True
+                        self._pool_signal_done(pool)
+                    finally:
+                        async with pool["lock"]:
+                            pool["settle_pending"] = max(
+                                0, int(pool.get("settle_pending") or 0) - 1
+                            )
+                        self._pool_signal_done(pool)
+
+                settle_task = asyncio.create_task(_bg_settle())
+                tasks_set = pool.setdefault("settle_tasks", set())
+                tasks_set.add(settle_task)
+                settle_task.add_done_callback(tasks_set.discard)
             finally:
                 if from_queue:
                     q.task_done()
@@ -3391,46 +3560,57 @@ class DownloadScheduler:
         """Apply one finished job to counters / checkpoint (worker-safe)."""
         merge_groups: list[list[str]] = []
         deferred_rel = None
-        async with pool["lock"]:
-            if result == "deferred":
-                # Concurrency shrink: keep .part, resume ASAP on a free slot
+
+        # Salvage / deferred path — no pool lock across awaits
+        if result == "deferred":
+            # Keep incomplete .part in temp; never delete on concurrency yield
+            part = self._part_path(job.target_path)
+            async with pool["lock"]:
                 pool["settled"].pop(job.message_id, None)
+                # Prefer front of queue so a free lane resumes immediately
                 pool.setdefault("priority", deque()).appendleft(job)
+            try:
+                deferred_rel = str(part.relative_to(settings.temp_dir))
+            except Exception:
                 try:
                     deferred_rel = str(job.target_path.relative_to(settings.download_dir))
                 except Exception:
                     deferred_rel = str(job.target_path)
-                self._pool_signal_done(pool)
-            elif result == "paused":
-                if await self._salvage_complete_file(
-                    task_id=task_id,
-                    message_id=job.message_id,
-                    target_path=job.target_path,
-                    message=job.message,
-                ):
-                    result = True
-                else:
-                    pool["settled"][job.message_id] = False
-                    pool["blocked"] = True
-                    return
-
-        if deferred_rel is not None:
+            self._pool_signal_done(pool)
             await self.db.append_log(
                 task_id, f"排队续传（并发已调整）: {deferred_rel}"
             )
             return
 
-        async with pool["lock"]:
-            if result == "paused":
-                # already handled above
+        if result == "paused":
+            if await self._salvage_complete_file(
+                task_id=task_id,
+                message_id=job.message_id,
+                target_path=job.target_path,
+                message=job.message,
+            ):
+                result = True
+            else:
+                async with pool["lock"]:
+                    pool["settled"][job.message_id] = False
+                    pool["blocked"] = True
                 return
-            pool["settled"][job.message_id] = True
-            downloaded = int(counters["downloaded"])
-            failed = int(counters["failed"])
-            current_folder = counters.get("current_folder")
 
-            if result is True:
-                downloaded += 1
+        # Serialize DB + counter updates across concurrent settles
+        db_lock = pool.get("settle_db_lock")
+        if db_lock is None:
+            db_lock = asyncio.Lock()
+            pool["settle_db_lock"] = db_lock
+
+        async with db_lock:
+            mark_ok = result is True
+            label = "测试占位" if test_mode else (log_prefix or "已下载")
+            try:
+                rel = job.target_path.relative_to(settings.download_dir)
+            except ValueError:
+                rel = job.target_path
+
+            if mark_ok:
                 await self.db.mark_message(
                     task_id,
                     job.message_id,
@@ -3439,16 +3619,10 @@ class DownloadScheduler:
                     chat_id=counters.get("chat_id"),
                     commit=False,
                 )
-                label = "测试占位" if test_mode else (log_prefix or "已下载")
-                try:
-                    rel = job.target_path.relative_to(settings.download_dir)
-                except ValueError:
-                    rel = job.target_path
                 await self.db.append_log(task_id, f"{label}: {rel}")
                 if use_text_as_folder and len(job.tags) >= 2:
                     merge_groups.append(job.tags)
             else:
-                failed += 1
                 await self.db.mark_message(
                     task_id,
                     job.message_id,
@@ -3460,45 +3634,63 @@ class DownloadScheduler:
                     task_id,
                     f"下载失败: message {job.message_id}（下次继续时重试）",
                 )
-            current_folder = job.rel_dir or current_folder
 
-            processed = int(counters["processed"])
-            last_id = int(counters.get("last_id") or 0)
-            order: list[DownloadJob] = pool["order"]
-            idx = int(pool["order_idx"])
-            settled: dict = pool["settled"]
-            while idx < len(order):
-                mid = order[idx].message_id
-                if mid not in settled:
-                    break
-                if not settled[mid]:
-                    break
-                last_id = mid
-                processed += 1
-                idx += 1
-            pool["order_idx"] = idx
+            # Sync counter / checkpoint under pool lock (no awaits)
+            flush_snapshot = None
+            async with pool["lock"]:
+                pool["settled"][job.message_id] = True
+                downloaded = int(counters["downloaded"])
+                failed = int(counters["failed"])
+                if mark_ok:
+                    downloaded += 1
+                else:
+                    failed += 1
+                current_folder = job.rel_dir or counters.get("current_folder")
 
-            counters["processed"] = processed
-            counters["downloaded"] = downloaded
-            counters["failed"] = failed
-            counters["current_folder"] = current_folder
-            counters["last_id"] = last_id
+                processed = int(counters["processed"])
+                last_id = int(counters.get("last_id") or 0)
+                order: list[DownloadJob] = pool["order"]
+                idx = int(pool["order_idx"])
+                settled: dict = pool["settled"]
+                while idx < len(order):
+                    mid = order[idx].message_id
+                    if mid not in settled:
+                        break
+                    if not settled[mid]:
+                        break
+                    last_id = mid
+                    processed += 1
+                    idx += 1
+                pool["order_idx"] = idx
 
-            now_m = time.monotonic()
-            last_flush = float(counters.get("_db_flush_t") or 0)
-            force_flush = bool(pool.get("blocked")) or int(pool.get("in_flight") or 0) == 0
-            if force_flush or (now_m - last_flush) >= 0.8:
-                counters["_db_flush_t"] = now_m
-                await self.db.update_task(
-                    task_id,
-                    commit=False,
-                    current_folder=current_folder,
-                    last_message_id=last_id,
-                    processed_count=processed,
-                    downloaded_count=downloaded,
-                    failed_count=failed,
-                    skipped_count=int(counters.get("skipped") or 0),
+                counters["processed"] = processed
+                counters["downloaded"] = downloaded
+                counters["failed"] = failed
+                counters["current_folder"] = current_folder
+                counters["last_id"] = last_id
+
+                now_m = time.monotonic()
+                last_flush = float(counters.get("_db_flush_t") or 0)
+                force_flush = (
+                    bool(pool.get("blocked"))
+                    or (
+                        int(pool.get("in_flight") or 0) == 0
+                        and int(pool.get("settle_pending") or 0) <= 1
+                    )
                 )
+                if force_flush or (now_m - last_flush) >= 0.8:
+                    counters["_db_flush_t"] = now_m
+                    flush_snapshot = {
+                        "current_folder": current_folder,
+                        "last_message_id": last_id,
+                        "processed_count": processed,
+                        "downloaded_count": downloaded,
+                        "failed_count": failed,
+                        "skipped_count": int(counters.get("skipped") or 0),
+                    }
+
+            if flush_snapshot is not None:
+                await self.db.update_task(task_id, commit=False, **flush_snapshot)
             await self.db.commit()
 
         if merge_groups:
@@ -3534,13 +3726,21 @@ class DownloadScheduler:
             return False
         if not wait:
             return bool(pool.get("blocked"))
-        if int(pool.get("in_flight") or 0) <= 0 and self._pool_pending_count(pool) <= 0:
+        if (
+            int(pool.get("in_flight") or 0) <= 0
+            and int(pool.get("settle_pending") or 0) <= 0
+            and self._pool_pending_count(pool) <= 0
+        ):
             return bool(pool.get("blocked"))
         ev: asyncio.Event = pool["done_event"]
         while True:
             if pool.get("blocked"):
                 return True
-            if int(pool.get("in_flight") or 0) <= 0 and self._pool_pending_count(pool) <= 0:
+            if (
+                int(pool.get("in_flight") or 0) <= 0
+                and int(pool.get("settle_pending") or 0) <= 0
+                and self._pool_pending_count(pool) <= 0
+            ):
                 return bool(pool.get("blocked"))
             ev.clear()
             try:
@@ -3569,7 +3769,11 @@ class DownloadScheduler:
         while True:
             if pool.get("blocked"):
                 break
-            if int(pool.get("in_flight") or 0) <= 0 and self._pool_pending_count(pool) <= 0:
+            if (
+                int(pool.get("in_flight") or 0) <= 0
+                and int(pool.get("settle_pending") or 0) <= 0
+                and self._pool_pending_count(pool) <= 0
+            ):
                 break
             await self._pool_reap(
                 pool,
@@ -3582,6 +3786,11 @@ class DownloadScheduler:
                 log_prefix=log_prefix,
                 wait=True,
             )
+        # Wait for background settles before tearing down workers
+        pending_settles = [t for t in (pool.get("settle_tasks") or set()) if not t.done()]
+        if pending_settles:
+            await asyncio.gather(*pending_settles, return_exceptions=True)
+        pool.get("settle_tasks", set()).clear()
 
         # On pause/error, discard jobs that never started
         if pool.get("blocked"):
@@ -3647,10 +3856,20 @@ class DownloadScheduler:
                     if not w.done():
                         w.cancel()
                 await asyncio.gather(*workers, return_exceptions=True)
+        # Any leftover priority jobs were already waited out above; if somehow
+        # still present, leave their .part on disk — index gap check will resume.
+        leftover = list(pool.get("priority") or [])
+        if leftover:
+            logger.warning(
+                "pool drain: %s deferred job(s) left — .part kept for resume",
+                len(leftover),
+            )
         pool["workers"] = []
         pool["worker_tasks"] = {}
         pool["active"] = {}
         pool["priority"] = deque()
+        pool["settle_pending"] = 0
+        pool["settle_tasks"] = set()
         pool["started"] = False
         pool["_stopping"] = False
         pool["_ctx"] = None
@@ -4220,6 +4439,21 @@ class DownloadScheduler:
                     )
                 )
                 combined_stop, bridge_task = await _combined_stop()
+                # Tangyoha-style: concurrency≥2 → each file holds its own media
+                # sender (no shared getFile pipeline across workers).
+                conc = 1
+                try:
+                    live = self._live_pools.get(int(task_id)) or {}
+                    conc = max(1, int(live.get("concurrency") or 0))
+                except Exception:
+                    conc = 1
+                if conc < 2:
+                    try:
+                        fresh = await self.db.get_task(task_id) or {}
+                        conc = max(1, min(5, int(fresh.get("concurrency") or 1)))
+                    except Exception:
+                        conc = 1
+                dedicated = conc >= 2
                 try:
                     result = await asyncio.wait_for(
                         tg_manager.download_media_to(
@@ -4228,6 +4462,8 @@ class DownloadScheduler:
                             progress_callback=_cb,
                             resume=True,
                             stop_event=combined_stop,
+                            dedicated=dedicated,
+                            file_concurrency=conc,
                         ),
                         timeout=7200,
                     )

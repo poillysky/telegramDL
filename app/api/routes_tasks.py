@@ -576,17 +576,10 @@ async def update_task_settings(
     if body.include_tags is not None:
         tags = normalize_tag_list(body.include_tags)
         mode = "any"
-        # Skip expensive full-index co-occurrence expand when tag set is unchanged
-        # (common path: user only tweaks concurrency / delay / media / auto-index).
+        # Skip write when unchanged (common: only concurrency / delay / media).
+        # Do NOT expand related into stored tags — worker expands at query time.
         same_tags = {t.lower() for t in tags} == {t.lower() for t in old_tags}
         if not same_tags:
-            if body.expand_related and tags:
-                try:
-                    expanded = await db.expand_related_tags(task["chat_id"], tags)
-                    if len(expanded) > len(tags):
-                        tags = expanded
-                except Exception:
-                    pass
             # 监控任务允许清空标签（仅索引）；有标签时才按标签下载
             fields["include_tags"] = tags
             fields["tag_match_mode"] = mode
@@ -648,7 +641,6 @@ async def update_task_settings(
         folder_mode = str(body.folder_mode or "caption")
         if folder_mode not in ("caption", "media_type", "flat"):
             folder_mode = "caption"
-        fields["folder_mode"] = folder_mode
         use_text = (
             bool(body.use_text_as_folder)
             if body.use_text_as_folder is not None
@@ -656,10 +648,17 @@ async def update_task_settings(
         )
         if folder_mode != "caption":
             use_text = False
-        fields["use_text_as_folder"] = use_text
-        log_bits.append(f"目录 {folder_mode}")
+        old_folder = str(task.get("folder_mode") or "caption")
+        old_use = bool(task.get("use_text_as_folder"))
+        if folder_mode != old_folder or use_text != old_use:
+            fields["folder_mode"] = folder_mode
+            fields["use_text_as_folder"] = use_text
+            log_bits.append(f"目录 {folder_mode}")
     elif body.use_text_as_folder is not None:
-        fields["use_text_as_folder"] = bool(body.use_text_as_folder)
+        use_text = bool(body.use_text_as_folder)
+        if use_text != bool(task.get("use_text_as_folder")):
+            fields["use_text_as_folder"] = use_text
+            log_bits.append(f"文案目录 {'开' if use_text else '关'}")
 
     if body.clear_start_date:
         fields["start_date"] = None
@@ -681,8 +680,10 @@ async def update_task_settings(
         order = str(body.download_order or "added_first")
         if order not in ("added_first", "oldest_first", "newest_first"):
             order = "added_first"
-        fields["download_order"] = order
-        log_bits.append(f"方向 {order}")
+        old_order = str(task.get("download_order") or "added_first")
+        if order != old_order:
+            fields["download_order"] = order
+            log_bits.append(f"方向 {order}")
 
     if body.clear_max_messages:
         fields["max_messages"] = None
@@ -741,13 +742,16 @@ async def update_task_settings(
         except Exception:
             pass
 
-    # Wake idle local monitor (non-tag settings, or tag clear)
+    # Hot-apply file filters / wake monitor without restarting the worker
     try:
-        scheduler.wake_local_monitor(task.get("chat_id"))
+        scheduler.apply_live_task_settings(task_id, task)
     except Exception:
-        pass
+        try:
+            scheduler.wake_local_monitor(task.get("chat_id"))
+        except Exception:
+            pass
 
-    # Monitor: any tag/keyword change → immediately re-check local index gaps
+    # Monitor: tag/keyword change → soft wake when running; never flash pending if paused
     mode = normalize_download_mode(task.get("download_mode") or "")
     if mode == "monitor" and (
         body.include_tags is not None or body.caption_keywords is not None
@@ -755,24 +759,48 @@ async def update_task_settings(
         new_tags = normalize_tag_list(task.get("include_tags") or [])
         new_kws = normalize_keyword_list(task.get("caption_keywords") or [])
         changed = set(new_tags) != set(old_tags) or set(new_kws) != set(old_kws)
+        status_now = str(task.get("status") or "").lower()
         if changed and (new_tags or new_kws):
             try:
                 import asyncio
 
                 async def _kick_tags() -> None:
                     try:
-                        await db.append_log(task_id, "标签已更新，开始补下")
-                        await db.update_task(task_id, status="pending", last_error=None)
-                        await scheduler.start_task(task_id)
+                        chat_id = task.get("chat_id")
+                        # Running worker → wake only (no pause / pending)
+                        if scheduler.is_worker_alive(task_id):
+                            await db.append_log(task_id, "标签已更新，开始补下")
+                            scheduler.wake_local_monitor(chat_id)
+                            return
+                        # Stale "running" without worker → soft restart, stay running
+                        if status_now == "running":
+                            await db.append_log(task_id, "标签已更新，开始补下")
+                            await db.update_task(
+                                task_id, status="running", last_error=None
+                            )
+                            await scheduler.start_task(task_id)
+                            return
+                        # Paused / completed / failed: persist only; user clicks 继续
+                        await db.append_log(
+                            task_id, "标签已更新（点继续后按新标签补下）"
+                        )
                     except Exception:
                         pass
 
                 asyncio.get_running_loop().create_task(_kick_tags())
             except Exception:
-                await db.append_log(task_id, "标签已更新，开始补下")
-                await db.update_task(task_id, status="pending", last_error=None)
-                await scheduler.start_task(task_id)
-                task = await db.get_task(task_id)
+                if scheduler.is_worker_alive(task_id):
+                    await db.append_log(task_id, "标签已更新，开始补下")
+                    scheduler.wake_local_monitor(task.get("chat_id"))
+                elif status_now == "running":
+                    await db.append_log(task_id, "标签已更新，开始补下")
+                    await db.update_task(task_id, status="running", last_error=None)
+                    await scheduler.start_task(task_id)
+                    task = await db.get_task(task_id)
+                else:
+                    await db.append_log(
+                        task_id, "标签已更新（点继续后按新标签补下）"
+                    )
         elif changed:
             try:
                 import asyncio

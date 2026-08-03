@@ -4872,6 +4872,7 @@ function fillTaskSettingsFields(task) {
     groups: tags.map((t) => [normalizeTagName(t)]).filter((g) => g[0]),
     mode: "any",
     downloadMode,
+    status: String(task.status || ""),
     title: task.chat_title || String(task.chat_id),
     concurrency: Math.max(1, Math.min(5, Number(task.concurrency) || 2)),
     delayMin: Number(task.delay_min != null ? task.delay_min : 0.5),
@@ -5862,9 +5863,12 @@ async function saveTaskTagsModal() {
   const tagsChanged =
     downloadMode === "monitor" && Object.prototype.hasOwnProperty.call(body, "include_tags");
   const tagN = (draft.tags || []).length;
+  const wasRunning = String(draft.status || "").toLowerCase() === "running";
   let msg = "任务设置已保存";
   if (downloadMode === "monitor") {
-    if (tagsChanged && tagN) msg += " · 开始按标签下载";
+    if (tagsChanged && tagN) {
+      msg += wasRunning ? " · 正在按新标签补下" : " · 点继续后按新标签补下";
+    }
     if (autoEnabled) msg += ` · 自动增量每 ${autoInterval} 分钟`;
   }
 
@@ -5884,6 +5888,21 @@ async function saveTaskTagsModal() {
       if (!r || r.ok === false) {
         toast("保存失败: " + ((r && r.message) || "未知错误"), "err");
         return;
+      }
+      // Patch local task card from response — avoid force reload flicker
+      if (r.task && Array.isArray(state.tasks)) {
+        const idx = state.tasks.findIndex((t) => Number(t.id) === Number(taskId));
+        if (idx >= 0) {
+          state.tasks[idx] = { ...state.tasks[idx], ...r.task };
+          const card = document.querySelector(
+            `.task[data-task-id="${CSS.escape(String(taskId))}"]`
+          );
+          if (card) {
+            try {
+              patchTaskCard(card, state.tasks[idx]);
+            } catch (_) {}
+          }
+        }
       }
       if (downloadMode === "monitor") {
         api(`/api/index/${encodeURIComponent(chatId)}/auto-scan`, {
@@ -5920,7 +5939,6 @@ async function saveTaskTagsModal() {
           }
         }
       }
-      loadTasks({ force: true }).catch(() => {});
     })
     .catch((e) => {
       toast("保存失败: " + (e.message || e), "err");

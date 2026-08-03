@@ -23,7 +23,7 @@ from app.config import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 # Same meta style as dineshkarthik_ref/utils/meta.py
-APP_VERSION = "Telegram Media Downloader 1.0.12"
+APP_VERSION = "Telegram Media Downloader 1.0.13"
 DEVICE_MODEL = f"{platform.python_implementation()} {platform.python_version()}"
 SYSTEM_VERSION = f"{platform.system()} {platform.release()}"
 LANG_CODE = "en"
@@ -1248,6 +1248,145 @@ class TelegramManager:
 
         return next_write
 
+    async def _dedicated_download(
+        self,
+        client: TelegramClient,
+        media: Any,
+        path: Path,
+        *,
+        offset: int,
+        expected: int,
+        mode: str,
+        progress_callback=None,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> int:
+        """
+        Tangyoha-style: one file holds one media sender for the whole download.
+
+        Sequential getFile on a dedicated connection — concurrent files do not
+        RR-share the pool mid-chunk the way pipelined multi-conn does.
+        """
+        from telethon import utils
+        from telethon.errors import FileMigrateError
+        from telethon.tl import functions, types
+
+        from app import runtime_tune
+
+        dc_id, location = utils.get_input_location(media)
+        home = int(getattr(client.session, "dc_id", 0) or 0)
+        dc_id = int(dc_id or home or 0)
+        if dc_id <= 0:
+            raise RuntimeError("unknown media dc_id")
+
+        part = int(runtime_tune.download_part_size() or _TG_MAX_REQUEST_SIZE)
+        part = max(_TG_OFFSET_ALIGN, min(_TG_MAX_REQUEST_SIZE, part))
+        part -= part % _TG_OFFSET_ALIGN
+        if _TG_MAX_REQUEST_SIZE % part != 0:
+            for candidate in _TG_VALID_LIMITS:
+                if candidate <= part:
+                    part = candidate
+                    break
+
+        next_off = int(offset)
+        sender = await client._borrow_exported_sender(dc_id)
+        try:
+            with path.open(mode) as f:
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        f.flush()
+                        raise DownloadPaused()
+                    if expected > 0 and next_off >= expected:
+                        break
+                    limit = part
+                    if expected > 0:
+                        limit = min(limit, max(0, expected - next_off))
+                    if limit <= 0:
+                        break
+                    use_precise = (
+                        (limit % _TG_OFFSET_ALIGN) != 0 or limit < _TG_OFFSET_ALIGN
+                    )
+                    try:
+                        result = await asyncio.wait_for(
+                            client._call(
+                                sender,
+                                functions.upload.GetFileRequest(
+                                    location,
+                                    next_off,
+                                    limit,
+                                    precise=True if use_precise else None,
+                                    cdn_supported=True,
+                                ),
+                            ),
+                            timeout=60,
+                        )
+                    except FileMigrateError as e:
+                        # Rebind sender to the new DC
+                        try:
+                            await client._return_exported_sender(sender)
+                        except Exception:
+                            pass
+                        dc_id = int(e.new_dc)
+                        sender = await client._borrow_exported_sender(dc_id)
+                        continue
+                    except LimitInvalidError:
+                        if part > _TG_SAFE_REQUEST_SIZE:
+                            part = _TG_SAFE_REQUEST_SIZE
+                            continue
+                        raise
+                    if isinstance(result, types.upload.FileCdnRedirect):
+                        raise RuntimeError("cdn_redirect")
+                    data = result.bytes or b""
+                    if not data:
+                        break
+                    f.write(data)
+                    next_off += len(data)
+                    if progress_callback:
+                        progress_callback(next_off, expected or next_off)
+                    if expected > 0 and next_off >= expected:
+                        break
+                    if len(data) < limit:
+                        break
+        finally:
+            try:
+                await client._return_exported_sender(sender)
+            except Exception:
+                pass
+        return next_off
+
+    async def _iter_download_tail(
+        self,
+        client: TelegramClient,
+        media: Any,
+        path: Path,
+        *,
+        offset: int,
+        expected: int,
+        mode: str,
+        progress_callback=None,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> int:
+        """Sequential Telethon iter_download (CDN / incomplete fallback)."""
+        downloaded = int(offset)
+        with path.open(mode) as f:
+            async for chunk in client.iter_download(
+                media,
+                offset=offset,
+                request_size=_TG_SAFE_REQUEST_SIZE,
+                chunk_size=_TG_SAFE_REQUEST_SIZE,
+            ):
+                if stop_event is not None and stop_event.is_set():
+                    f.flush()
+                    raise DownloadPaused()
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback:
+                    progress_callback(downloaded, expected or downloaded)
+                if expected > 0 and downloaded >= expected:
+                    break
+        return downloaded
+
     async def download_media_to(
         self,
         message,
@@ -1256,12 +1395,16 @@ class TelegramManager:
         *,
         resume: bool = True,
         stop_event: Optional[asyncio.Event] = None,
+        dedicated: bool = False,
+        file_concurrency: int = 1,
     ) -> Optional[Path]:
         """
         Download message media to path.
 
-        Prefers pipelined multi-connection getFile (resume-safe .part). Falls
-        back to Telethon iter_download on CDN / unsupported media.
+        dedicated=False (concurrency 1): pipelined multi-connection getFile.
+        dedicated=True (concurrency ≥ 2): tangyoha-style — one file, one media
+        sender for the whole download; concurrent files do not share a pipeline.
+        Falls back to Telethon iter_download on CDN / unsupported media.
         """
         client = await self.ensure_client()
         path = Path(path)
@@ -1316,42 +1459,68 @@ class TelegramManager:
 
         from app import runtime_tune
 
-        install_media_connection_pool(
-            client,
-            pool_size=runtime_tune.media_connections(),
+        # Dedicated multi-file: pool slots ≥ concurrency so each file can hold one
+        pool_need = max(
+            1,
+            int(runtime_tune.media_connections() or 1),
+            int(file_concurrency or 1) if dedicated else 1,
         )
+        install_media_connection_pool(client, pool_size=pool_need)
 
         media = getattr(message, "media", None) or message
         downloaded = offset
         if progress_callback:
             progress_callback(downloaded, expected or 0)
 
-        pipeline = runtime_tune.download_pipeline()
         try:
-            try:
-                downloaded = await self._pipelined_download(
-                    client,
-                    media,
-                    path,
-                    offset=offset,
-                    expected=expected,
-                    mode=mode,
-                    progress_callback=progress_callback,
-                    stop_event=stop_event,
-                    pipeline=pipeline,
-                )
-            except DownloadPaused:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "pipelined download fallback for %s: %s: %r",
-                    path.name,
-                    type(exc).__name__,
-                    exc,
-                )
-                downloaded = -1  # force sequential path below
+            if dedicated:
+                try:
+                    downloaded = await self._dedicated_download(
+                        client,
+                        media,
+                        path,
+                        offset=offset,
+                        expected=expected,
+                        mode=mode,
+                        progress_callback=progress_callback,
+                        stop_event=stop_event,
+                    )
+                except DownloadPaused:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "dedicated download fallback for %s: %s: %r",
+                        path.name,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    downloaded = -1
+            else:
+                pipeline = runtime_tune.download_pipeline()
+                try:
+                    downloaded = await self._pipelined_download(
+                        client,
+                        media,
+                        path,
+                        offset=offset,
+                        expected=expected,
+                        mode=mode,
+                        progress_callback=progress_callback,
+                        stop_event=stop_event,
+                        pipeline=pipeline,
+                    )
+                except DownloadPaused:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "pipelined download fallback for %s: %s: %r",
+                        path.name,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    downloaded = -1
 
-            # Incomplete after pipeline (common on odd EOF tails) → Telethon iter_download
+            # Incomplete / CDN → Telethon iter_download
             need_seq = False
             if downloaded < 0:
                 need_seq = True
@@ -1364,7 +1533,8 @@ class TelegramManager:
                     need_seq = True
                     downloaded = have
                     logger.warning(
-                        "incomplete after pipeline %s: %s/%s → sequential tail",
+                        "incomplete after %s %s: %s/%s → sequential tail",
+                        "dedicated" if dedicated else "pipeline",
                         path.name,
                         have,
                         expected,
@@ -1379,26 +1549,16 @@ class TelegramManager:
                 else:
                     offset = max(0, int(downloaded or 0))
                 mode = "ab" if offset > 0 else "wb"
-                downloaded = offset
-                with path.open(mode) as f:
-                    # Telethon clamps request_size to 512KiB (valid 1MiB divisor)
-                    async for chunk in client.iter_download(
-                        media,
-                        offset=offset,
-                        request_size=_TG_SAFE_REQUEST_SIZE,
-                        chunk_size=_TG_SAFE_REQUEST_SIZE,
-                    ):
-                        if stop_event is not None and stop_event.is_set():
-                            f.flush()
-                            raise DownloadPaused()
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if progress_callback:
-                            progress_callback(downloaded, expected or downloaded)
-                        if expected > 0 and downloaded >= expected:
-                            break
+                downloaded = await self._iter_download_tail(
+                    client,
+                    media,
+                    path,
+                    offset=offset,
+                    expected=expected,
+                    mode=mode,
+                    progress_callback=progress_callback,
+                    stop_event=stop_event,
+                )
         except DownloadPaused:
             raise
         except Exception:
