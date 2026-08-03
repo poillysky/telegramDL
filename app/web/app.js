@@ -2630,6 +2630,16 @@ async function loadRuntimeSettings() {
   if ($("maxParallelChats")) {
     $("maxParallelChats").value = String(r.max_parallel_chats || 1);
   }
+  if ($("mediaConnections")) {
+    $("mediaConnections").value = String(r.media_connections || 3);
+  }
+  if ($("downloadPipeline")) {
+    $("downloadPipeline").value = String(r.download_pipeline || 4);
+  }
+  if ($("downloadPartSize")) {
+    const part = Number(r.download_part_size) || 1048576;
+    $("downloadPartSize").value = String(part >= 768 * 1024 ? 1048576 : 524288);
+  }
   if ($("failedRetryIntervalSec")) {
     $("failedRetryIntervalSec").value = String(r.failed_retry_interval_sec || 900);
   }
@@ -2641,19 +2651,22 @@ async function loadRuntimeSettings() {
   }
   if ($("notifyEnabled")) $("notifyEnabled").checked = !!r.notify_enabled;
   if ($("notifyWebhook")) $("notifyWebhook").value = r.notify_webhook || "";
-  const hint = $("runtimeLogHint");
-  if (hint && r.log_dir) {
-    hint.textContent = `日志目录：${r.log_dir}`;
-  }
 }
 
 async function saveRuntimeSettings() {
   const parallel = _clampInt($("maxParallelChats")?.value, 1, 10, 1);
+  const mediaConn = _clampInt($("mediaConnections")?.value, 1, 8, 3);
+  const pipeline = _clampInt($("downloadPipeline")?.value, 1, 8, 4);
+  const partRaw = Number(($("downloadPartSize") && $("downloadPartSize").value) || 1048576);
+  const partSize = partRaw >= 768 * 1024 ? 1048576 : 524288;
   const failedRetry = _clampInt($("failedRetryIntervalSec")?.value, 120, 86400, 900);
   const heartbeat = _clampInt($("monitorHeartbeatSec")?.value, 60, 86400, 600);
   const floodWait = _clampInt($("maxFloodWait")?.value, 60, 86400, 1800);
   const body = {
     max_parallel_chats: parallel,
+    media_connections: mediaConn,
+    download_pipeline: pipeline,
+    download_part_size: partSize,
     failed_retry_interval_sec: failedRetry,
     monitor_heartbeat_sec: heartbeat,
     max_flood_wait: floodWait,
@@ -2662,6 +2675,12 @@ async function saveRuntimeSettings() {
   };
   const r = await api("/api/settings/runtime", { method: "PUT", body: JSON.stringify(body) });
   if ($("maxParallelChats")) $("maxParallelChats").value = String(r.max_parallel_chats || parallel);
+  if ($("mediaConnections")) $("mediaConnections").value = String(r.media_connections || mediaConn);
+  if ($("downloadPipeline")) $("downloadPipeline").value = String(r.download_pipeline || pipeline);
+  if ($("downloadPartSize")) {
+    const part = Number(r.download_part_size) || partSize;
+    $("downloadPartSize").value = String(part >= 768 * 1024 ? 1048576 : 524288);
+  }
   if ($("failedRetryIntervalSec")) {
     $("failedRetryIntervalSec").value = String(r.failed_retry_interval_sec || failedRetry);
   }
@@ -4421,7 +4440,6 @@ function fillTaskSettingsFields(task) {
   if ($("tagsModalDelayMax")) {
     $("tagsModalDelayMax").value = String(state.taskTagsDraft.delayMax);
   }
-
   document.querySelectorAll('input[name="settingsMedia"]').forEach((cb) => {
     cb.checked = media.includes(cb.value);
   });

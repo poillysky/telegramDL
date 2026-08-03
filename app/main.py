@@ -34,6 +34,12 @@ async def lifespan(app: FastAPI):
     settings.ensure_dirs()
     await db.connect()
     await db.ensure_web_users_seeded()
+    try:
+        from app import runtime_tune
+
+        await runtime_tune.load_from_db(db)
+    except Exception:
+        logger.debug("runtime_tune load failed", exc_info=True)
     await scheduler.resume_running_on_startup()
 
     # Restore Web-saved API/proxy and reconnect Telegram in background

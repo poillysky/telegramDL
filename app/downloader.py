@@ -1288,8 +1288,10 @@ class DownloadScheduler:
         tag_blacklist = await self.db.get_tag_relation_blacklist()
         # Tag filter is always OR: hit any selected tag → download
         tag_match_mode = "any"
-        # Cap ≤8; safe operating range is 2–3 (see .env MEDIA_CONNECTIONS)
-        media_conn = max(1, min(8, int(getattr(settings, "media_connections", 3) or 3)))
+        # Cap ≤8; safe operating range is 2–3 (see 运行设置 → 媒体连接数)
+        from app import runtime_tune
+
+        media_conn = runtime_tune.media_connections()
         try:
             from app.telegram_client import install_media_connection_pool
 

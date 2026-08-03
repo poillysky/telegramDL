@@ -23,7 +23,7 @@ from app.config import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 # Same meta style as dineshkarthik_ref/utils/meta.py
-APP_VERSION = "Telegram Media Downloader 1.0.7"
+APP_VERSION = "Telegram Media Downloader 1.0.8"
 DEVICE_MODEL = f"{platform.python_implementation()} {platform.python_version()}"
 SYSTEM_VERSION = f"{platform.system()} {platform.release()}"
 LANG_CODE = "en"
@@ -367,10 +367,9 @@ def install_media_connection_pool(
     client._borrow_exported_sender = borrow  # type: ignore[method-assign]
     client._return_exported_sender = ret  # type: ignore[method-assign]
     client._media_pool_cfg = cfg
-    chunk_kib = int(
-        getattr(get_settings(), "download_part_size", _TG_MAX_REQUEST_SIZE)
-        or _TG_MAX_REQUEST_SIZE
-    ) // 1024
+    from app import runtime_tune
+
+    chunk_kib = int(runtime_tune.download_part_size() or _TG_MAX_REQUEST_SIZE) // 1024
     logger.info(
         "Installed media connection pool size≤%s chunk=%sKiB",
         pool_size,
@@ -603,12 +602,11 @@ class TelegramManager:
 
             # Media connection pool (sized to official-safe defaults)
             if self.client is not None and self.client.is_connected():
+                from app import runtime_tune
+
                 install_media_connection_pool(
                     self.client,
-                    pool_size=int(
-                        getattr(self.settings, "media_connections", _TG_SAFE_POOL_SIZE)
-                        or _TG_SAFE_POOL_SIZE
-                    ),
+                    pool_size=runtime_tune.media_connections(),
                 )
 
         if persist and (changed or aid):
@@ -915,10 +913,9 @@ class TelegramManager:
         if dc_id <= 0:
             raise RuntimeError("unknown media dc_id")
 
-        part = int(
-            getattr(get_settings(), "download_part_size", _TG_MAX_REQUEST_SIZE)
-            or _TG_MAX_REQUEST_SIZE
-        )
+        from app import runtime_tune
+
+        part = int(runtime_tune.download_part_size() or _TG_MAX_REQUEST_SIZE)
         # Align and clamp; Telegram allows up to 1MiB when 1MiB % limit == 0
         part = max(_TG_OFFSET_ALIGN, min(_TG_MAX_REQUEST_SIZE, part))
         part -= part % _TG_OFFSET_ALIGN
@@ -1019,10 +1016,9 @@ class TelegramManager:
             return 1024
 
         # Warm media pool so the first pipeline wave is truly parallel
-        warm_n = max(1, min(pipeline, int(
-            getattr(get_settings(), "media_connections", _TG_SAFE_POOL_SIZE)
-            or _TG_SAFE_POOL_SIZE
-        )))
+        from app import runtime_tune
+
+        warm_n = max(1, min(pipeline, runtime_tune.media_connections()))
         warm_senders = []
         try:
             for _ in range(warm_n):
@@ -1318,12 +1314,11 @@ class TelegramManager:
             if path.exists():
                 path.unlink(missing_ok=True)
 
+        from app import runtime_tune
+
         install_media_connection_pool(
             client,
-            pool_size=int(
-                getattr(self.settings, "media_connections", _TG_SAFE_POOL_SIZE)
-                or _TG_SAFE_POOL_SIZE
-            ),
+            pool_size=runtime_tune.media_connections(),
         )
 
         media = getattr(message, "media", None) or message
@@ -1331,10 +1326,7 @@ class TelegramManager:
         if progress_callback:
             progress_callback(downloaded, expected or 0)
 
-        pipeline = int(
-            getattr(self.settings, "download_pipeline", _TG_SAFE_PIPELINE)
-            or _TG_SAFE_PIPELINE
-        )
+        pipeline = runtime_tune.download_pipeline()
         try:
             try:
                 downloaded = await self._pipelined_download(

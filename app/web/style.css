@@ -5835,13 +5835,23 @@ body:has(#stageLogin:not([hidden])) .login-card {
   transform: translateX(1px);
 }
 
-/* —— Account drawer —— */
+/* —— Account drawer ——
+   Unified spacing tokens on .drawer-panel; children inherit — don't patch one-off.
+   --drawer-inset  : gap from viewport edge
+   --drawer-gutter : left/right inset on head / tabs / tab panels (margin-inline)
+   --drawer-stack  : vertical rhythm between blocks
+   --drawer-card-pad: padding inside cards / sections
+*/
 .drawer {
+  --drawer-inset: 14px;
   position: fixed;
   inset: 0;
   z-index: 80;
   display: flex;
   justify-content: flex-end;
+  align-items: stretch;
+  padding: var(--drawer-inset);
+  box-sizing: border-box;
 }
 
 .drawer[hidden] { display: none !important; }
@@ -5854,19 +5864,36 @@ body:has(#stageLogin:not([hidden])) .login-card {
 }
 
 .drawer-panel {
+  /* Insets live on direct children — panel padding was not reliably spacing content. */
+  --drawer-gutter: 32px;
+  --drawer-stack: 14px;
+  --drawer-card-pad: 16px;
+  --drawer-soft-radius: 14px;
   position: relative;
   display: flex;
   flex-direction: column;
-  width: min(440px, 100%);
+  width: min(704px, 100%);
   height: 100%;
+  max-height: 100%;
   overflow: hidden;
   background:
     radial-gradient(120% 60% at 100% 0%, rgba(59, 130, 246, 0.08), transparent 55%),
     linear-gradient(185deg, #ffffff 0%, #f7f9fc 100%);
-  border-left: 1px solid var(--line);
-  padding: calc(16px + var(--safe-top)) 18px 0;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 0;
   box-shadow: -16px 0 48px rgba(40, 60, 90, 0.12);
   animation: drawer-in 0.22s ease;
+}
+
+.drawer-panel > .drawer-head,
+.drawer-panel > .settings-tabs,
+.drawer-panel > .settings-tab-panel {
+  margin-inline: var(--drawer-gutter);
+  width: auto;
+  max-width: none;
+  min-width: 0;
+  box-sizing: border-box;
 }
 
 @keyframes drawer-in {
@@ -5876,34 +5903,94 @@ body:has(#stageLogin:not([hidden])) .login-card {
 
 .drawer-head {
   display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
+  justify-content: flex-end;
+  align-items: center;
   gap: 12px;
-  margin-bottom: 14px;
+  margin-bottom: var(--drawer-stack);
+  /* Reserve space under panel top + leave room for absolute close btn */
+  padding: 16px 44px 0 0;
   flex-shrink: 0;
+  position: relative;
+  min-height: 44px;
 }
 
 .drawer-head .section-kicker {
   color: var(--accent);
 }
+.drawer-head > div:first-child {
+  position: absolute;
+  left: 0;
+  right: 44px;
+  top: 16px;
+  text-align: center;
+  pointer-events: none;
+}
 .drawer-head h2 {
   margin: 0;
   font-size: 1.28rem;
   letter-spacing: -0.02em;
+  text-align: center;
 }
-.drawer-head .icon-btn {
-  border-radius: 10px;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
+
+.drawer-close-btn {
+  position: absolute;
+  top: 10px;
+  right: 0;
+  z-index: 2;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0;
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid rgba(120, 145, 175, 0.28);
+  background: rgba(243, 246, 250, 0.95);
+  color: #5b6b7f;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(30, 58, 95, 0.04);
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease,
+    transform 0.14s ease,
+    box-shadow 0.16s ease;
+}
+.drawer-close-btn > span {
+  width: 14px;
+  height: 14px;
+  background:
+    no-repeat center / 14px 14px
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14' fill='none' stroke='%235b6b7f' stroke-width='1.8' stroke-linecap='round'%3E%3Cpath d='M3 3l8 8M11 3l-8 8'/%3E%3C/svg%3E");
+}
+.drawer-close-btn:hover {
+  background: #fff;
+  border-color: rgba(47, 127, 240, 0.35);
+  color: var(--accent-hover);
+  box-shadow: 0 4px 12px rgba(47, 127, 240, 0.12);
+}
+.drawer-close-btn:hover > span {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14' fill='none' stroke='%231d6fe0' stroke-width='1.8' stroke-linecap='round'%3E%3Cpath d='M3 3l8 8M11 3l-8 8'/%3E%3C/svg%3E");
+}
+.drawer-close-btn:active {
+  transform: scale(0.94);
+}
+.drawer-close-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(47, 127, 240, 0.28);
 }
 
 .settings-tabs {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 4px;
-  margin-bottom: 14px;
+  margin-bottom: var(--drawer-stack);
   padding: 5px;
-  border-radius: 14px;
+  border-radius: var(--drawer-soft-radius);
   background: var(--surface-2);
   border: 1px solid var(--line);
   box-shadow: none;
@@ -6066,7 +6153,8 @@ body:has(#stageLogin:not([hidden])) .login-card {
   overflow: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
-  padding: 2px 2px calc(24px + var(--safe-bottom));
+  /* horizontal inset: margin-inline via .drawer-panel > .settings-tab-panel */
+  padding: 0 0 calc(var(--drawer-stack) + 12px + var(--safe-bottom));
 }
 
 .settings-tab {
@@ -6108,9 +6196,9 @@ body:has(#stageLogin:not([hidden])) .login-card {
 
 /* Drawer content cards */
 .settings-card {
-  margin: 0 0 12px;
-  padding: 14px 14px 12px;
-  border-radius: 14px;
+  margin: 0 0 var(--drawer-stack);
+  padding: var(--drawer-card-pad);
+  border-radius: var(--drawer-soft-radius);
   border: 1px solid rgba(35, 50, 70, 0.08);
   background: #ffffff;
   box-shadow: 0 8px 24px rgba(59, 130, 246, 0.04);
@@ -6191,29 +6279,16 @@ body:has(#stageLogin:not([hidden])) .login-card {
   width: 15px;
   height: 15px;
 }
-.settings-log-hint {
-  margin: 10px 0 0;
-  padding: 8px 10px;
-  border-radius: 8px;
-  font-size: 0.75rem;
-  color: var(--muted);
-  background: rgba(59, 130, 246, 0.05);
-  border: 1px dashed rgba(35, 50, 70, 0.1);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.settings-log-hint:empty { display: none; }
 
 .drawer-panel .form-section {
-  margin: 0 0 12px;
-  padding: 14px;
-  border-radius: 14px;
+  margin: 0 0 var(--drawer-stack);
+  padding: var(--drawer-card-pad);
+  border-radius: var(--drawer-soft-radius);
   border: 1px solid rgba(35, 50, 70, 0.08);
   background:
     linear-gradient(160deg, rgba(35, 50, 70, 0.04), transparent 42%),
     rgba(243, 246, 250, 0.95);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+  box-shadow: 0 8px 24px rgba(30, 58, 95, 0.05);
 }
 .drawer-panel .form-section-title {
   margin: 0 0 6px;
@@ -6233,13 +6308,16 @@ body:has(#stageLogin:not([hidden])) .login-card {
   line-height: 1.45;
 }
 .drawer-panel .actions-bar {
-  gap: 8px;
+  gap: 10px;
 }
 .drawer-panel .account-actions {
   border-top-color: rgba(35, 50, 70, 0.08);
+  margin-top: var(--drawer-stack);
+  padding-top: var(--drawer-stack);
+  gap: 10px;
 }
 .drawer-panel .settings-inline-actions {
-  margin-bottom: 14px;
+  margin-bottom: var(--drawer-stack);
 }
 .drawer-panel .settings-inline-actions .ghost,
 .drawer-panel .settings-inline-actions .primary {
@@ -6264,8 +6342,8 @@ body:has(#stageLogin:not([hidden])) .login-card {
 .drawer-panel input[type="password"],
 .drawer-panel select {
   border-radius: 10px;
-  border-color: rgba(255, 255, 255, 0.1);
-  background: rgba(59, 130, 246, 0.06);
+  border-color: rgba(148, 163, 184, 0.35);
+  background: #ffffff;
 }
 .drawer-panel input:focus,
 .drawer-panel select:focus {
@@ -6281,14 +6359,14 @@ body:has(#stageLogin:not([hidden])) .login-card {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 14px;
-  border-radius: 14px;
+  padding: var(--drawer-card-pad, 16px);
+  border-radius: var(--drawer-soft-radius, 14px);
   border: 1px solid rgba(59, 130, 246, 0.18);
   background:
     linear-gradient(135deg, rgba(59, 130, 246, 0.1), transparent 55%),
     rgba(243, 246, 250, 0.95);
-  margin-bottom: 14px;
-  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.16);
+  margin-bottom: var(--drawer-stack, 14px);
+  box-shadow: 0 8px 22px rgba(30, 58, 95, 0.06);
 }
 
 .account-profile-text { flex: 1; min-width: 0; }
@@ -6310,10 +6388,10 @@ body:has(#stageLogin:not([hidden])) .login-card {
 }
 
 .account-dl {
-  margin: 0 0 12px;
+  margin: 0 0 var(--drawer-stack, 14px);
   padding: 0;
   border: 1px solid rgba(35, 50, 70, 0.08);
-  border-radius: 14px;
+  border-radius: var(--drawer-soft-radius, 14px);
   overflow: hidden;
   background: rgba(243, 246, 250, 0.9);
 }
@@ -6322,7 +6400,7 @@ body:has(#stageLogin:not([hidden])) .login-card {
   display: grid;
   grid-template-columns: 88px minmax(0, 1fr);
   gap: 8px;
-  padding: 10px 12px;
+  padding: 10px var(--drawer-card-pad, 14px);
   border-bottom: 1px solid rgba(35, 50, 70, 0.06);
   font-size: 0.86rem;
   align-items: center;
@@ -6348,9 +6426,9 @@ body:has(#stageLogin:not([hidden])) .login-card {
 .account-actions {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-top: 18px;
-  padding-top: 14px;
+  gap: 10px;
+  margin-top: var(--drawer-stack, 14px);
+  padding-top: var(--drawer-stack, 14px);
   border-top: 1px solid var(--line);
 }
 
@@ -7172,16 +7250,18 @@ body.confirm-open { overflow: hidden; }
   .account-chip-chevron { display: none; }
 }
 
-/* iPad / 大屏手机：设置抽屉也全屏，避免右侧只占 420px */
+/* iPad / 大屏手机：设置抽屉铺满但仍用统一 gutter */
 @media (max-width: 920px) {
   .drawer {
+    --drawer-inset: 10px;
     justify-content: stretch;
   }
   .drawer-panel {
+    --drawer-gutter: 24px;
     width: 100% !important;
     max-width: 100% !important;
-    border-left: 0;
-    box-shadow: none;
+    border-radius: 16px;
+    box-shadow: 0 12px 36px rgba(40, 60, 90, 0.12);
   }
 }
 
@@ -7574,22 +7654,25 @@ body.confirm-open { overflow: hidden; }
     max-height: min(62vh, 520px);
   }
 
-  /* —— Settings drawer: full-screen sheet —— */
+  /* —— Settings drawer: inset sheet —— */
   .drawer {
+    --drawer-inset: 10px;
     align-items: stretch;
     justify-content: stretch;
   }
   .drawer-panel {
+    --drawer-gutter: 20px;
+    --drawer-stack: 12px;
+    --drawer-card-pad: 14px;
     width: 100% !important;
     max-width: 100% !important;
     height: 100%;
-    height: 100dvh;
-    max-height: 100dvh;
-    border-left: 0;
-    border-radius: 0;
-    padding: calc(10px + var(--safe-top)) 14px 0;
+    max-height: 100%;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 0;
     animation: drawer-up 0.22s ease;
-    box-shadow: none;
+    box-shadow: 0 12px 36px rgba(40, 60, 90, 0.12);
   }
   @keyframes drawer-up {
     from { transform: translateY(12px); opacity: 0.6; }
@@ -7598,9 +7681,17 @@ body.confirm-open { overflow: hidden; }
   .drawer-head {
     margin-bottom: 10px;
     align-items: center;
+    padding: 14px 48px 0 0;
+  }
+  .drawer-head > div:first-child {
+    top: 14px;
+    right: 48px;
   }
   .drawer-head h2 { font-size: 1.12rem; }
-  .drawer-head .icon-btn {
+  .drawer-close-btn {
+    top: 8px;
+    width: 40px;
+    height: 40px;
     min-width: 40px;
     min-height: 40px;
   }

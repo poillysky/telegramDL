@@ -44,7 +44,7 @@
     html.touch-ui .task,
     html.touch-ui .page-tasks .tasks > .task { animation: none !important; transform: none !important; }
   </style>
-  <link rel="stylesheet" href="/static/style.min.css?v=20260803-log-bottom2" />
+  <link rel="stylesheet" href="/static/style.min.css?v=20260803-no-loghint" />
   <!-- Webfonts: non-blocking + optional (no 3s spinner / no late glyph swap stretch) -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -396,10 +396,11 @@
     <aside class="drawer-panel" role="dialog" aria-labelledby="accountTitle" aria-modal="true">
       <div class="drawer-head">
         <div>
-          <div class="section-kicker">设置</div>
           <h2 id="accountTitle">账号与设置</h2>
         </div>
-        <button type="button" class="ghost icon-btn" id="btnCloseAccount" aria-label="关闭">✕</button>
+        <button type="button" class="drawer-close-btn" id="btnCloseAccount" aria-label="关闭">
+          <span aria-hidden="true"></span>
+        </button>
       </div>
 
       <div class="settings-tabs" role="tablist" aria-label="设置分类">
@@ -540,6 +541,32 @@
         </div>
         <div class="settings-card">
           <div class="settings-card-head">
+            <span class="ui-ico ui-ico-runtime" aria-hidden="true"></span>
+            <div>
+              <h3 class="settings-card-title">下载连接 / 吞吐</h3>
+              <p class="settings-card-desc">媒体 DC 连接数与分块流水线。代理环境可适当提高；出现 FloodWait 请立刻降回 3 / 4。保存后对新下载立即生效。</p>
+            </div>
+          </div>
+          <div class="settings-field-grid">
+            <label class="settings-field">媒体连接数
+              <input id="mediaConnections" type="number" min="1" max="8" value="3" inputmode="numeric" title="MEDIA_CONNECTIONS" />
+              <span class="field-hint">默认 3，范围 1–8；安全 2–3，加速可试 5</span>
+            </label>
+            <label class="settings-field">分块流水线
+              <input id="downloadPipeline" type="number" min="1" max="8" value="4" inputmode="numeric" title="DOWNLOAD_PIPELINE" />
+              <span class="field-hint">默认 4，范围 1–8；单文件同时在途分块数</span>
+            </label>
+            <label class="settings-field">分块大小
+              <select id="downloadPartSize" title="DOWNLOAD_PART_SIZE">
+                <option value="1048576">1024 KiB（推荐）</option>
+                <option value="524288">512 KiB（兼容）</option>
+              </select>
+              <span class="field-hint">官方上限 1MiB；遇拒时会自动回退</span>
+            </label>
+          </div>
+        </div>
+        <div class="settings-card">
+          <div class="settings-card-head">
             <span class="ui-ico ui-ico-refresh" aria-hidden="true"></span>
             <div>
               <h3 class="settings-card-title">自动重试 / 限流</h3>
@@ -583,7 +610,6 @@
             </button>
           </div>
           <p id="runtimeMsg" class="msg" role="status"></p>
-          <p class="settings-log-hint" id="runtimeLogHint"></p>
         </div>
       </div>
 
@@ -992,6 +1018,6 @@
     </div>
   </div>
 
-  <script src="/static/app.min.js?v=20260803-log-bottom2"></script>
+  <script src="/static/app.min.js?v=20260803-no-loghint"></script>
 </body>
 </html>

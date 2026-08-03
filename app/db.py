@@ -141,6 +141,9 @@ _META_MAX_PARALLEL = "max_parallel_chats"
 _META_FAILED_RETRY = "failed_retry_interval_sec"
 _META_MONITOR_HEARTBEAT = "monitor_heartbeat_sec"
 _META_MAX_FLOOD_WAIT = "max_flood_wait"
+_META_MEDIA_CONNECTIONS = "media_connections"
+_META_DOWNLOAD_PIPELINE = "download_pipeline"
+_META_DOWNLOAD_PART_SIZE = "download_part_size"
 
 
 def normalize_file_formats(raw: Any) -> list[str] | dict[str, list[str]]:
@@ -407,7 +410,6 @@ class Database:
             await self.conn.execute(
                 "ALTER TABLE tasks ADD COLUMN max_file_bytes INTEGER NOT NULL DEFAULT 0"
             )
-
         async with self.conn.execute("PRAGMA table_info(chat_index_meta)") as cur:
             idx_cols = {row["name"] for row in await cur.fetchall()}
         if "auto_incremental" not in idx_cols:
@@ -485,6 +487,7 @@ class Database:
             )
             """
         )
+
 
     async def close(self) -> None:
         try:
@@ -1174,6 +1177,47 @@ class Database:
     async def set_max_flood_wait(self, n: int) -> int:
         val = max(60, min(86400, int(n)))
         await self.set_meta(_META_MAX_FLOOD_WAIT, str(val))
+        return val
+
+    async def get_media_connections(self) -> int:
+        env = int(get_settings().media_connections or 3)
+        return await self._get_meta_int(
+            _META_MEDIA_CONNECTIONS, default=env, min_v=1, max_v=8
+        )
+
+    async def set_media_connections(self, n: int) -> int:
+        val = max(1, min(8, int(n)))
+        await self.set_meta(_META_MEDIA_CONNECTIONS, str(val))
+        return val
+
+    async def get_download_pipeline(self) -> int:
+        env = int(get_settings().download_pipeline or 4)
+        return await self._get_meta_int(
+            _META_DOWNLOAD_PIPELINE, default=env, min_v=1, max_v=8
+        )
+
+    async def set_download_pipeline(self, n: int) -> int:
+        val = max(1, min(8, int(n)))
+        await self.set_meta(_META_DOWNLOAD_PIPELINE, str(val))
+        return val
+
+    async def get_download_part_size(self) -> int:
+        env = int(get_settings().download_part_size or (1024 * 1024))
+        raw = await self.get_meta(_META_DOWNLOAD_PART_SIZE)
+        if raw is None or str(raw).strip() == "":
+            part = env
+        else:
+            try:
+                part = int(raw)
+            except (TypeError, ValueError):
+                part = env
+        if part >= 1024 * 1024:
+            return 1024 * 1024
+        return 512 * 1024
+
+    async def set_download_part_size(self, n: int) -> int:
+        val = 1024 * 1024 if int(n) >= 768 * 1024 else 512 * 1024
+        await self.set_meta(_META_DOWNLOAD_PART_SIZE, str(val))
         return val
 
     async def append_log(self, task_id: int, message: str, keep: int = 80) -> None:
@@ -2435,6 +2479,5 @@ class Database:
         )
         await self.conn.commit()
         return len(new_ids)
-
 
 db = Database()
