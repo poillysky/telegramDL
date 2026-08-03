@@ -16,7 +16,7 @@ RUN pip install -r requirements.txt
 
 COPY app ./app
 
-RUN mkdir -p /app/downloads /app/data /app/sessions
+RUN mkdir -p /app/downloads /app/temp /app/data /app/sessions
 
 EXPOSE 9345
 

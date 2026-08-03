@@ -107,6 +107,7 @@ async def get_runtime_settings(_user=Depends(require_web_auth)):
         "notify_enabled": bool(notify.get("enabled")),
         "notify_webhook": notify.get("webhook") or "",
         "download_dir": str(s.download_dir),
+        "temp_dir": str(s.temp_dir),
         "log_dir": str(Path(s.data_dir) / "logs"),
     }
 

@@ -377,4 +377,5 @@ async def account(current: Optional[str] = Depends(require_web_auth)):
         "session_exists": session_file.exists(),
         "session_file": str(session_file),
         "download_dir": str(settings.download_dir),
+        "temp_dir": str(settings.temp_dir),
     }

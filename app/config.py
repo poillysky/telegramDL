@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     port: int = 9345
 
     download_dir: Path = Path("downloads")
+    # Incomplete downloads stage here; moved into download_dir when finished
+    temp_dir: Path = Path("temp")
     data_dir: Path = Path("data")
     session_dir: Path = Path("sessions")
     session_name: str = "telegram_downloader"
@@ -66,6 +68,7 @@ class Settings(BaseSettings):
 
     def ensure_dirs(self) -> None:
         self.download_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.session_dir.mkdir(parents=True, exist_ok=True)
 

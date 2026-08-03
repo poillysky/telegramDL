@@ -2954,7 +2954,42 @@ class DownloadScheduler:
         return 0
 
     def _part_path(self, target_path: Path) -> Path:
-        return target_path.with_suffix(target_path.suffix + ".part")
+        """Stage incomplete downloads under temp_dir (mirror of download_dir tree)."""
+        settings = get_settings()
+        target_path = Path(target_path)
+        try:
+            rel = target_path.resolve().relative_to(Path(settings.download_dir).resolve())
+        except ValueError:
+            rel = Path(target_path.name)
+        part = (Path(settings.temp_dir) / rel).with_suffix(
+            target_path.suffix + ".part"
+        )
+        # Migrate legacy sidecar next to final file (pre-temp_dir layout)
+        legacy = target_path.with_suffix(target_path.suffix + ".part")
+        if legacy.exists() and legacy.is_file() and not part.exists():
+            try:
+                part.parent.mkdir(parents=True, exist_ok=True)
+                self._move_path(legacy, part)
+            except OSError:
+                logger.debug(
+                    "migrate legacy .part failed: %s -> %s", legacy, part, exc_info=True
+                )
+        return part
+
+    @staticmethod
+    def _move_path(src: Path, dst: Path) -> None:
+        """Rename when possible; fall back to copy+delete across volumes."""
+        import shutil
+
+        src = Path(src)
+        dst = Path(dst)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            dst.unlink()
+        try:
+            src.rename(dst)
+        except OSError:
+            shutil.move(str(src), str(dst))
 
     async def _salvage_complete_file(
         self,
@@ -2981,9 +3016,7 @@ class DownloadScheduler:
             if part.exists() and part.is_file():
                 size = part.stat().st_size
                 if size > 0 and (not expected_size or size == expected_size):
-                    if target_path.exists():
-                        target_path.unlink()
-                    part.rename(target_path)
+                    self._move_path(part, target_path)
                     if file_looks_complete(target_path, expected_size):
                         await self.db.mark_message(
                             task_id,
@@ -4160,16 +4193,15 @@ class DownloadScheduler:
                     )
 
                 tmp_path = self._part_path(target_path)
-                # Keep incomplete .part for Telegram ranged resume (iter_download offset)
+                tmp_path.parent.mkdir(parents=True, exist_ok=True)
+                # Keep incomplete .part in temp for Telegram ranged resume
                 if tmp_path.exists():
                     try:
                         psz = tmp_path.stat().st_size
                     except OSError:
                         psz = 0
                     if expected_size and psz >= expected_size > 0:
-                        if target_path.exists():
-                            target_path.unlink()
-                        tmp_path.rename(target_path)
+                        self._move_path(tmp_path, target_path)
                         self._finish_file_progress(
                             task_id,
                             mid,
@@ -4221,21 +4253,20 @@ class DownloadScheduler:
                     result.unlink(missing_ok=True)
                     raise IOError("empty download result (0 bytes)")
                 if expected_size and actual_size != expected_size:
-                    # Keep .part for resume — do not delete on size mismatch mid-way
+                    # Keep .part in temp for resume — do not delete on size mismatch
                     raise IOError(
                         f"size mismatch: got {actual_size}, expected {expected_size}"
                     )
-                if target_path.exists():
-                    target_path.unlink()
-                result.rename(target_path)
+                # Finished in temp → promote into downloads/
+                self._move_path(result, target_path)
                 actual_size = target_path.stat().st_size
                 if actual_size <= 0:
                     target_path.unlink(missing_ok=True)
-                    raise IOError("empty file after rename")
+                    raise IOError("empty file after move")
                 if expected_size and actual_size != expected_size:
-                    # rename back to part so resume can continue
+                    # move back to temp part so resume can continue
                     try:
-                        target_path.rename(tmp_path)
+                        self._move_path(target_path, tmp_path)
                     except OSError:
                         target_path.unlink(missing_ok=True)
                     raise IOError(

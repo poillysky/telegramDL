@@ -78,13 +78,14 @@ docker compose up -d --build
 或直接使用已发布镜像（[Docker Hub](https://hub.docker.com/r/poillysky/telegramdl)）：
 
 ```bash
-docker pull poillysky/telegramdl:1.0.11
+docker pull poillysky/telegramdl:1.0.12
 docker run -d --name telegramdl -p 9345:9345 \
   --env-file .env \
   -v "$(pwd)/downloads:/app/downloads" \
+  -v "$(pwd)/temp:/app/temp" \
   -v "$(pwd)/data:/app/data" \
   -v "$(pwd)/sessions:/app/sessions" \
-  poillysky/telegramdl:1.0.11
+  poillysky/telegramdl:1.0.12
 ```
 
 浏览器打开 [http://localhost:9345](http://localhost:9345)：
@@ -97,7 +98,8 @@ docker run -d --name telegramdl -p 9345:9345 \
 
 | 宿主机目录 | 说明 |
 |-----------|------|
-| `./downloads` | 下载的文件 |
+| `./downloads` | 已完成的下载文件 |
+| `./temp` | 下载中的临时 `.part`（完成后移入 downloads） |
 | `./data` | SQLite 任务数据库 |
 | `./sessions` | Telethon 登录会话（勿泄露） |
 

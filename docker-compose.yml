@@ -1,6 +1,6 @@
 services:
   web:
-    image: poillysky/telegramdl:1.0.11
+    image: poillysky/telegramdl:1.0.12
     build: .
     container_name: telegram-group-downloader
     restart: unless-stopped
@@ -10,11 +10,13 @@ services:
       - .env
     volumes:
       - ./downloads:/app/downloads
+      - ./temp:/app/temp
       - ./data:/app/data
       - ./sessions:/app/sessions
     environment:
       - HOST=0.0.0.0
       - PORT=9345
       - DOWNLOAD_DIR=/app/downloads
+      - TEMP_DIR=/app/temp
       - DATA_DIR=/app/data
       - SESSION_DIR=/app/sessions

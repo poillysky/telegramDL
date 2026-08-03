@@ -9,6 +9,8 @@ data/**
 !data/.gitkeep
 downloads/*
 !downloads/.gitkeep
+temp/*
+!temp/.gitkeep
 sessions/*
 !sessions/.gitkeep
 *.session
