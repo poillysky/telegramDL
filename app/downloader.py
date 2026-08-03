@@ -29,8 +29,11 @@ from app.organizer import (
     matches_file_formats,
     matches_file_size,
     matches_include_tags,
+    batch_filenames_for_message,
+    build_caption_batch_filenames,
     merge_related_tag_folders,
     message_text,
+    migrate_legacy_date_dirs,
     next_folder_state,
     normalize_keyword_list,
     normalize_tag_list,
@@ -39,6 +42,7 @@ from app.organizer import (
     resolve_download_path,
     resolve_media_subdir,
     sanitize_name,
+    sync_download_temp_moves,
     unique_path,
 )
 from app.telegram_client import DownloadPaused, tg_manager
@@ -1886,6 +1890,9 @@ class DownloadScheduler:
                 # Preserve order of chunk (get_messages may reorder)
                 by_id = {m.id: m for m in messages if m}
                 ordered = [by_id[i] for i in chunk if i in by_id]
+                album_batches, caption_batches = build_caption_batch_filenames(
+                    ordered, captions_map
+                )
 
                 for message in ordered:
                     if self._pool_busy(pool) and await self._pool_reap(
@@ -1974,6 +1981,12 @@ class DownloadScheduler:
                         caption_override=indexed_caption or None,
                     )
                     tags = extract_tags(caption or "")
+                    batch_names = batch_filenames_for_message(
+                        message,
+                        caption=caption or "",
+                        album_batches=album_batches,
+                        caption_batches=caption_batches,
+                    )
                     subdir = resolve_media_subdir(
                         message,
                         album_captions=album_captions,
@@ -1983,6 +1996,7 @@ class DownloadScheduler:
                         caption_override=caption or None,
                         tag_folder_map=counters.get("tag_folder_map") or None,
                         tag_blacklist=counters.get("tag_blacklist") or None,
+                        batch_filenames=batch_names,
                     )
                     filename = build_filename(
                         message,
@@ -1993,6 +2007,10 @@ class DownloadScheduler:
                     rel_dir = subdir if subdir is not None else "_未分类"
                     target_dir = group_dir / rel_dir if rel_dir else group_dir
                     target_dir.mkdir(parents=True, exist_ok=True)
+                    # New date folder name → pull leftover files from old date dirs
+                    await self._sync_legacy_date_dir(
+                        task_id, target_dir, caption=caption or ""
+                    )
                     if counters.get("current_folder") != (rel_dir or "."):
                         await self.db.append_log(
                             task_id, f"目录: {rel_dir or '（群根目录）'}"
@@ -2560,15 +2578,12 @@ class DownloadScheduler:
             for line in logs:
                 await self.db.append_log(task_id, line)
 
-        if chat_id is None:
-            return
-        try:
-            captions = await self.db.list_index_captions(chat_id)
-        except Exception:
-            logger.debug("list_index_captions failed", exc_info=True)
-            return
-        if not captions:
-            return
+        captions: list[str] = []
+        if chat_id is not None:
+            try:
+                captions = await self.db.list_index_captions(chat_id)
+            except Exception:
+                logger.debug("list_index_captions failed", exc_info=True)
         try:
             moves = await asyncio.to_thread(
                 repair_date_folders, group_dir, captions
@@ -2580,13 +2595,66 @@ class DownloadScheduler:
         if not moves:
             return
         if not quiet:
-            await self.db.append_log(task_id, "日期目录已按文案区间修复")
+            await self.db.append_log(task_id, "日期目录已同步到新文件夹")
         for line, src, dst in moves:
             await self.db.append_log(task_id, line)
             try:
                 await self.db.rewrite_file_paths_dir_move(src, dst)
             except Exception:
                 logger.debug("rewrite paths after date repair failed", exc_info=True)
+        await self._mirror_moves_to_temp(moves, prune_under=group_dir)
+
+    async def _mirror_moves_to_temp(
+        self,
+        moves: list[tuple[str, Path, Path]] | None,
+        *,
+        prune_under: Path | None = None,
+    ) -> None:
+        """Keep temp_dir tree in lockstep with download_dir renames; drop empty zombies."""
+        if not moves:
+            return
+        settings = get_settings()
+        try:
+            await asyncio.to_thread(
+                sync_download_temp_moves,
+                moves,
+                download_root=Path(settings.download_dir),
+                temp_root=Path(settings.temp_dir),
+                prune_under=prune_under,
+            )
+        except Exception:
+            logger.debug("sync_download_temp_moves failed", exc_info=True)
+
+    async def _sync_legacy_date_dir(
+        self,
+        task_id: int,
+        target_dir: Path,
+        *,
+        caption: str = "",
+    ) -> None:
+        """When using a new date folder, merge leftover legacy siblings into it."""
+        from app.organizer import looks_like_date_folder
+
+        if not looks_like_date_folder(target_dir.name):
+            return
+        parent = target_dir.parent
+        try:
+            moves = await asyncio.to_thread(
+                migrate_legacy_date_dirs,
+                parent,
+                target_dir.name,
+                caption=caption or "",
+            )
+        except Exception:
+            logger.debug("migrate_legacy_date_dirs failed", exc_info=True)
+            return
+        for line, src, dst in moves or []:
+            await self.db.append_log(task_id, line)
+            try:
+                await self.db.rewrite_file_paths_dir_move(src, dst)
+            except Exception:
+                logger.debug("rewrite paths after date migrate failed", exc_info=True)
+        await self._mirror_moves_to_temp(moves, prune_under=parent)
 
     async def _download_loop_body(
         self,
@@ -2955,6 +3023,9 @@ class DownloadScheduler:
                     rel_dir = subdir if subdir is not None else "_未分类"
                     target_dir = group_dir / rel_dir if rel_dir else group_dir
                     target_dir.mkdir(parents=True, exist_ok=True)
+                    await self._sync_legacy_date_dir(
+                        task_id, target_dir, caption=caption or ""
+                    )
                     if current_folder != (rel_dir or "."):
                         await self.db.append_log(
                             task_id, f"目录: {rel_dir or '（群根目录）'}"
@@ -4228,6 +4299,9 @@ class DownloadScheduler:
                 rel_dir = subdir if subdir is not None else (current_folder or "_未分类")
                 target_dir = group_dir / rel_dir if rel_dir else group_dir
                 target_dir.mkdir(parents=True, exist_ok=True)
+                await self._sync_legacy_date_dir(
+                    task_id, target_dir, caption=caption or ""
+                )
                 existing = await self._skip_if_already_downloaded(
                     task_id=task_id,
                     chat_id=chat_id,
@@ -4550,6 +4624,15 @@ class DownloadScheduler:
                     raise IOError(
                         f"size mismatch: got {actual_size}, expected {expected_size}"
                     )
+                # Drop empty temp dirs left after .part promotion (no zombies)
+                try:
+                    from app.organizer import prune_empty_dirs
+
+                    prune_empty_dirs(
+                        tmp_path.parent, stop_at=Path(settings.temp_dir)
+                    )
+                except Exception:
+                    logger.debug("prune empty temp after promote failed", exc_info=True)
                 self._finish_file_progress(
                     task_id,
                     mid,

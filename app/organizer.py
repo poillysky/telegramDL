@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 from telethon.tl.custom.message import Message
 from telethon.tl.types import (
@@ -249,6 +249,119 @@ def extract_date_token(text: str) -> Optional[str]:
     if m:
         return f"{int(m.group(1))}.{int(m.group(2))}"
     return None
+
+
+# VID_20250711_xxx / 2025-07-11 / 2025.07.11 / 20250711
+_FILENAME_YMD_RE = re.compile(
+    r"(?<!\d)(20\d{2})[._\- ]?(0[1-9]|1[0-2])[._\- ]?(0[1-9]|[12]\d|3[01])(?!\d)"
+)
+
+
+def extract_ymd_from_filename(name: Optional[str]) -> Optional[tuple[int, int, int]]:
+    """Full calendar date (Y, M, D) from media filename; None if incomplete."""
+    if not name:
+        return None
+    m = _FILENAME_YMD_RE.search(str(name).strip())
+    if not m:
+        return None
+    y, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if 2000 <= y <= 2100 and _valid_month_day(month, day):
+        return y, month, day
+    return None
+
+
+def format_ymd_token(year: int, month: int, day: int) -> str:
+    return f"{int(year)}.{int(month)}.{int(day)}"
+
+
+def date_token_from_filenames(names: Iterable[Optional[str]]) -> Optional[str]:
+    """
+    Earliest~latest YMD from filenames.
+    One day →「2025.7.11」; span →「2025.7.11-2025.7.14」.
+    """
+    dates: list[tuple[int, int, int]] = []
+    for n in names or []:
+        ymd = extract_ymd_from_filename(n)
+        if ymd:
+            dates.append(ymd)
+    if not dates:
+        return None
+    dates.sort()
+    lo, hi = dates[0], dates[-1]
+    if lo == hi:
+        return format_ymd_token(*lo)
+    return f"{format_ymd_token(*lo)}-{format_ymd_token(*hi)}"
+
+
+def date_token_from_dir(dir_path: Path, *, sample: int = 80) -> Optional[str]:
+    """YMD range from file names inside a folder."""
+    names: list[str] = []
+    try:
+        for p in dir_path.iterdir():
+            if p.is_file():
+                names.append(p.name)
+            if len(names) >= sample:
+                break
+    except OSError:
+        return None
+    return date_token_from_filenames(names)
+
+
+def build_caption_batch_filenames(
+    messages: Iterable[Any],
+    captions_by_id: Optional[dict[int, str]] = None,
+) -> tuple[dict[Any, list[str]], dict[str, list[str]]]:
+    """
+    Group original filenames by album grouped_id and by caption text.
+    Used so one 文案 batch shares earliest~latest file dates.
+    """
+    album: dict[Any, list[str]] = {}
+    by_caption: dict[str, list[str]] = {}
+    caps = captions_by_id or {}
+    for message in messages or []:
+        if not message:
+            continue
+        name = _original_filename(message)
+        if not name:
+            continue
+        gid = getattr(message, "grouped_id", None)
+        if gid:
+            album.setdefault(gid, []).append(name)
+        mid = int(getattr(message, "id", 0) or 0)
+        cap = (caps.get(mid) if mid else None) or message_text(message) or ""
+        key = str(cap).strip()
+        if key:
+            by_caption.setdefault(key, []).append(name)
+    return album, by_caption
+
+
+def batch_filenames_for_message(
+    message: Any,
+    *,
+    caption: str = "",
+    album_batches: Optional[dict[Any, list[str]]] = None,
+    caption_batches: Optional[dict[str, list[str]]] = None,
+) -> list[str]:
+    """Filenames for the same 文案/album batch; falls back to this file only."""
+    gid = getattr(message, "grouped_id", None) if message else None
+    if gid and album_batches and album_batches.get(gid):
+        return list(album_batches[gid])
+    key = str(caption or "").strip()
+    if key and caption_batches and caption_batches.get(key):
+        return list(caption_batches[key])
+    name = _original_filename(message) if message else None
+    return [name] if name else []
+
+
+def looks_like_date_folder(name: str) -> bool:
+    """7.11 / 7.11-7.14 / 2025.7.11 / 2025.7.11-2025.7.14 / 7.11-14"""
+    return bool(
+        re.match(
+            r"^(?:20\d{2}\.)?\d{1,2}\.\d{1,2}"
+            r"(?:-(?:(?:20\d{2}\.)?\d{1,2}(?:\.\d{1,2})?|\d{1,2}))?$",
+            str(name or ""),
+        )
+    )
 
 
 def extract_tags(text: str) -> list[str]:
@@ -706,6 +819,116 @@ def _merge_tree_into(src: Path, dst: Path) -> None:
         pass
 
 
+def _rel_under_root(path: Path, root: Path) -> Optional[Path]:
+    """Relative path of path under root, or None if outside."""
+    try:
+        rel = Path(path).resolve().relative_to(Path(root).resolve())
+    except (ValueError, OSError):
+        try:
+            import os
+
+            rel = Path(os.path.relpath(str(path), str(root)))
+        except ValueError:
+            return None
+    if rel.is_absolute() or str(rel).startswith(".."):
+        return None
+    return rel
+
+
+def prune_empty_dirs(root: Path, *, stop_at: Optional[Path] = None) -> int:
+    """Remove empty directories under root (depth-first). Returns how many removed."""
+    if not root.is_dir():
+        return 0
+    removed = 0
+    stop = Path(stop_at).resolve() if stop_at is not None else None
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return 0
+    for item in entries:
+        if item.is_dir():
+            removed += prune_empty_dirs(item, stop_at=stop_at)
+    try:
+        if root.exists() and not any(root.iterdir()):
+            if stop is not None and root.resolve() == stop:
+                return removed
+            root.rmdir()
+            removed += 1
+    except OSError:
+        pass
+    return removed
+
+
+def mirror_merge_dirs(
+    src: Path,
+    dst: Path,
+    *,
+    download_root: Path,
+    temp_root: Path,
+) -> bool:
+    """
+    Apply the same directory merge under temp_dir (mirrors download_dir tree).
+    Keeps .part layout in sync so renames do not leave zombie temp folders.
+    """
+    src_rel = _rel_under_root(src, download_root)
+    dst_rel = _rel_under_root(dst, download_root)
+    if src_rel is None or dst_rel is None:
+        return False
+    t_src = Path(temp_root) / src_rel
+    t_dst = Path(temp_root) / dst_rel
+    if t_src.is_dir():
+        _merge_tree_into(t_src, t_dst)
+        prune_empty_dirs(t_src, stop_at=temp_root)
+        # Also prune empty parents up to temp root
+        parent = t_src.parent
+        try:
+            stop = Path(temp_root).resolve()
+            while parent.exists() and parent.resolve() != stop:
+                if any(parent.iterdir()):
+                    break
+                nxt = parent.parent
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = nxt
+        except OSError:
+            pass
+        return True
+    # Source already gone — still drop empty zombie temp dirs at that path
+    if t_src.exists():
+        prune_empty_dirs(t_src, stop_at=temp_root)
+    return False
+
+
+def sync_download_temp_moves(
+    moves: Iterable[tuple[Any, Path, Path]],
+    *,
+    download_root: Path,
+    temp_root: Path,
+    prune_under: Optional[Path] = None,
+) -> int:
+    """
+    For each (log, src, dst) download-dir move, mirror into temp_dir.
+    Optionally prune empty dirs under prune_under (download) and its temp mirror.
+    """
+    mirrored = 0
+    for item in moves or []:
+        if not item or len(item) < 3:
+            continue
+        _log, src, dst = item[0], item[1], item[2]
+        if mirror_merge_dirs(
+            Path(src), Path(dst), download_root=download_root, temp_root=temp_root
+        ):
+            mirrored += 1
+    if prune_under is not None and Path(prune_under).is_dir():
+        prune_empty_dirs(Path(prune_under), stop_at=prune_under)
+        rel = _rel_under_root(Path(prune_under), download_root)
+        if rel is not None:
+            prune_empty_dirs(Path(temp_root) / rel, stop_at=temp_root)
+    return mirrored
+
+
 def canonical_tag_folder(
     group_dir: Optional[Path],
     tags: list[str],
@@ -823,19 +1046,111 @@ def build_date_folder_repairs(captions: Iterable[str]) -> dict[str, str]:
     return repair
 
 
+def _strip_year_date_part(part: str) -> str:
+    m = re.match(r"^20\d{2}\.(\d{1,2}\.\d{1,2})$", (part or "").strip())
+    return m.group(1) if m else (part or "").strip()
+
+
+def date_folder_legacy_aliases(token: str) -> set[str]:
+    """Legacy / shorthand folder names that should merge into token."""
+    token = str(token or "").strip()
+    if not token:
+        return set()
+    out = {token}
+    parts = token.split("-")
+    left = parts[0]
+    right = parts[1] if len(parts) > 1 else ""
+    bl = _strip_year_date_part(left)
+    br = _strip_year_date_part(right) if right else ""
+    if bl:
+        out.add(bl)
+        out.add(left)
+    if right:
+        out.add(f"{left}-{right}")
+        if bl and br:
+            out.add(f"{bl}-{br}")
+            if "." in bl and "." in br:
+                lm, ld = bl.split(".", 1)
+                rm, rd = br.split(".", 1)
+                if lm == rm:
+                    out.add(f"{lm}.{ld}-{rd}")
+            out.add(bl)  # old start-only folder
+            out.add(left)
+    return {x for x in out if x}
+
+
+def migrate_legacy_date_dirs(
+    parent_dir: Path,
+    canonical: str,
+    *,
+    extra_aliases: Optional[Iterable[str]] = None,
+    caption: Optional[str] = None,
+) -> list[tuple[str, Path, Path]]:
+    """
+    Move sibling legacy date folders into canonical under parent_dir.
+
+    Pulls: name aliases of canonical, caption date folders (e.g. 7.11), and
+    siblings whose file YMD range equals canonical. Old files move with rename.
+    """
+    canonical = sanitize_name(str(canonical or "").strip(), max_len=40)
+    if not canonical or not parent_dir.is_dir():
+        return []
+    aliases = date_folder_legacy_aliases(canonical)
+    for a in extra_aliases or []:
+        a = str(a or "").strip()
+        if a:
+            aliases.add(a)
+            aliases |= date_folder_legacy_aliases(a)
+    cap_tok = extract_date_token(caption or "")
+    if cap_tok:
+        aliases.add(cap_tok)
+        aliases |= date_folder_legacy_aliases(cap_tok)
+        if "-" in cap_tok:
+            aliases.add(cap_tok.split("-", 1)[0])
+    aliases.discard(canonical)
+
+    dst = parent_dir / canonical
+    moves: list[tuple[str, Path, Path]] = []
+    try:
+        children = [p for p in parent_dir.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+    for child in children:
+        if child.name == canonical:
+            continue
+        if not looks_like_date_folder(child.name) and child.name not in aliases:
+            continue
+        pull = child.name in aliases
+        if not pull and looks_like_date_folder(child.name):
+            # Same batch already partially under a different date name
+            pull = date_token_from_dir(child) == canonical
+        if not pull:
+            continue
+        try:
+            if child.resolve() == dst.resolve():
+                continue
+        except OSError:
+            pass
+        src_snap = Path(child)
+        dst.mkdir(parents=True, exist_ok=True)
+        _merge_tree_into(child, dst)
+        line = f"日期目录: {parent_dir.name}/{src_snap.name} → {dst.name}"
+        moves.append((line, src_snap, dst))
+    return moves
+
+
 def repair_date_folders(
     group_dir: Path, captions: Iterable[str]
 ) -> list[tuple[str, Path, Path]]:
     """
-    Rename/merge date subfolders under tag dirs (and group root) using captions.
+    Rename/merge date subfolders under tag dirs (and group root).
 
-    Returns list of (log_line, src_dir, dst_dir) for path rewrites.
+    Prefer full YMD range from files; else caption range. Always merge legacy
+    alias folders into the canonical target so old data moves with the rename.
     """
     if not group_dir.is_dir():
         return []
-    mapping = build_date_folder_repairs(captions)
-    if not mapping:
-        return []
+    mapping = build_date_folder_repairs(captions or [])
 
     parents = [group_dir]
     try:
@@ -849,24 +1164,103 @@ def repair_date_folders(
             children = [p for p in parent.iterdir() if p.is_dir()]
         except OSError:
             continue
-        for child in children:
-            target_name = mapping.get(child.name)
-            if not target_name or target_name == child.name:
-                continue
-            dst = parent / sanitize_name(target_name, max_len=32)
-            try:
-                if child.resolve() == dst.resolve():
+        date_dirs = [
+            p
+            for p in children
+            if looks_like_date_folder(p.name) or p.name in mapping
+        ]
+        if not date_dirs:
+            continue
+
+        # preferred target per dir
+        preferred: dict[Path, str] = {}
+        for child in date_dirs:
+            file_token = date_token_from_dir(child)
+            preferred[child] = (
+                file_token or mapping.get(child.name) or child.name
+            )
+
+        # Group sources by canonical target; pull caption/file aliases too
+        from collections import defaultdict
+
+        groups: dict[str, list[Path]] = defaultdict(list)
+        for child, target in preferred.items():
+            groups[sanitize_name(target, max_len=40)].append(child)
+
+        # Reverse caption map: canonical caption token → legacy names
+        reverse_caption: dict[str, set[str]] = defaultdict(set)
+        for legacy, canon in mapping.items():
+            reverse_caption[canon].add(legacy)
+
+        for target_name, sources in list(groups.items()):
+            aliases = date_folder_legacy_aliases(target_name)
+            aliases |= reverse_caption.get(target_name, set())
+            # Also alias caption expansion that maps into this file target:
+            # e.g. sources preferred 2026.4.11-… but disk still has 7.11 / 7.11-7.14
+            for child in date_dirs:
+                if child in sources:
                     continue
-            except OSError:
-                pass
-            src_snap = Path(child)
-            dst.mkdir(parents=True, exist_ok=True)
-            _merge_tree_into(child, dst)
-            if parent == group_dir:
-                line = f"日期目录: {src_snap.name} → {dst.name}"
-            else:
-                line = f"日期目录: {parent.name}/{src_snap.name} → {dst.name}"
-            moves.append((line, src_snap, dst))
+                if child.name in aliases or mapping.get(child.name) in (
+                    target_name,
+                    preferred.get(child),
+                ):
+                    # If child prefers a different *file* YMD span, don't steal it
+                    child_pref = preferred.get(child) or child.name
+                    child_file = date_token_from_dir(child)
+                    if child_file and child_file != target_name:
+                        # unless child's name is explicit alias of target
+                        if child.name not in aliases:
+                            continue
+                    sources.append(child)
+                    aliases |= date_folder_legacy_aliases(child_pref)
+                    aliases.add(child.name)
+
+            # Include any remaining alias-named dirs under parent
+            for child in date_dirs:
+                if child not in sources and child.name in aliases:
+                    child_file = date_token_from_dir(child)
+                    if child_file and child_file != target_name:
+                        if child.name not in date_folder_legacy_aliases(target_name):
+                            continue
+                    sources.append(child)
+
+            dst = parent / target_name
+            # Dedupe sources
+            seen_src: set[Path] = set()
+            uniq_sources: list[Path] = []
+            for s in sources:
+                key = s.resolve() if s.exists() else s
+                if key in seen_src:
+                    continue
+                seen_src.add(key)
+                uniq_sources.append(s)
+
+            for src in uniq_sources:
+                if not src.exists():
+                    continue
+                try:
+                    if src.resolve() == dst.resolve():
+                        continue
+                except OSError:
+                    if src.name == dst.name:
+                        continue
+                src_snap = Path(src)
+                dst.mkdir(parents=True, exist_ok=True)
+                _merge_tree_into(src, dst)
+                if parent == group_dir:
+                    line = f"日期目录: {src_snap.name} → {dst.name}"
+                else:
+                    line = f"日期目录: {parent.name}/{src_snap.name} → {dst.name}"
+                moves.append((line, src_snap, dst))
+
+            # After creating/filling target, sweep leftover aliases once more
+            moves.extend(
+                migrate_legacy_date_dirs(
+                    parent,
+                    target_name,
+                    extra_aliases=aliases,
+                )
+            )
     return moves
 
 
@@ -934,12 +1328,13 @@ def resolve_media_subdir(
     folder_mode: str = "caption",
     caption_override: Optional[str] = None,
     tag_blacklist: Optional[Iterable[str]] = None,
+    batch_filenames: Optional[Iterable[str]] = None,
 ) -> str:
     """
     Resolve relative folder under group dir.
 
     folder_mode:
-      - caption: full related #tags + date from 文案
+      - caption: #tags + date (file YMD range first, else 文案)
       - media_type: photo/video/...
       - flat: no subfolder (files directly under group dir)
     """
@@ -963,9 +1358,17 @@ def resolve_media_subdir(
         caption_override=caption_override,
     )
     tags = extract_tags(combined)
-    date_token = extract_date_token(combined)
+    # 1) 这批文件名有年月日 → 最早~最晚；2) 否则回退文案日期
+    names = list(batch_filenames) if batch_filenames is not None else []
+    if not names:
+        fn = _original_filename(message)
+        if fn:
+            names = [fn]
+    date_token = date_token_from_filenames(names)
+    if not date_token:
+        date_token = extract_date_token(combined)
     if date_token:
-        date_token = sanitize_name(date_token, max_len=32)
+        date_token = sanitize_name(date_token, max_len=40)
 
     # Use full related multi-tag folder name (index co-occurrence + disk),
     # not only the tags present on this single caption.
