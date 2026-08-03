@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#2f7ff0" />
   <meta name="application-name" content="TG下载" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -43,8 +43,14 @@
     html.touch-ui .card,
     html.touch-ui .task,
     html.touch-ui .page-tasks .tasks > .task { animation: none !important; transform: none !important; }
+    /* iOS focus-zoom lock: fields must be ≥16px before first tap */
+    html.touch-ui input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="hidden"]):not([type="color"]),
+    html.touch-ui textarea,
+    html.touch-ui select {
+      font-size: 16px !important;
+    }
   </style>
-  <link rel="stylesheet" href="/static/style.min.css?v=20260803-no-loghint" />
+  <link rel="stylesheet" href="/static/style.min.css?v=20260803-multi-fix" />
   <!-- Webfonts: non-blocking + optional (no 3s spinner / no late glyph swap stretch) -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -256,7 +262,7 @@
                     选群后创建。标签在「设置」配置；索引用手动/自动/全量更新。
                   </p>
                   <p class="field-hint index-create-defaults">
-                    将使用默认媒体类型与保存目录，可在任务设置中修改。
+                    将使用默认媒体类型与保存方式，可在任务设置中修改。
                   </p>
                 </div>
                 <input type="hidden" id="includeTags" value="" />
@@ -284,7 +290,7 @@
             </div>
 
             <div class="form-section create-block" id="createFolderSection">
-              <h3 class="form-section-title">保存目录</h3>
+              <h3 class="form-section-title">保存方式</h3>
               <label class="create-field">
                 <select id="folderMode">
                   <option value="caption" selected>按文案 #标签 + 日期（推荐）</option>
@@ -730,8 +736,8 @@
         </div>
       </div>
 
+      <div class="tags-modal-body">
       <div class="tags-modal-section" id="tagsModalIndexSection" data-settings-for="monitor">
-        <div class="tags-modal-section-title">文案索引</div>
         <div class="index-panel index-panel-row">
           <div class="index-meta-block">
             <span class="index-meta-kicker">索引状态</span>
@@ -820,7 +826,7 @@
 
       <!-- Both: folder mode -->
       <div class="tags-modal-section" id="tagsModalFolderSection" data-settings-for="both">
-        <div class="tags-modal-section-title">保存目录</div>
+        <div class="tags-modal-section-title">保存方式</div>
         <label class="create-field">
           <select id="tagsModalFolderMode">
             <option value="caption" selected>按文案 #标签 + 日期（推荐）</option>
@@ -909,8 +915,9 @@
         </label>
       </div>
 
+      </div>
+
       <div class="confirm-actions tags-modal-actions">
-        <button type="button" class="ghost" id="btnTagsModalCancel">取消</button>
         <button type="button" class="primary" id="btnTagsModalSave">保存设置</button>
       </div>
     </div>
@@ -959,6 +966,9 @@
           <div class="tag-picker-col-head">
             <strong class="tag-picker-col-head-desk">索引标签</strong>
             <input id="tagPickerSearch" type="search" placeholder="搜索库内索引标签…" autocomplete="off" />
+            <button type="button" class="ghost tag-picker-multi-btn" id="btnTagPickerMulti" aria-pressed="false" title="勾选两组后可手工关联">
+              多选
+            </button>
           </div>
           <div id="tagPickerIndex" class="tag-picker-list tag-picker-index"></div>
           <div class="tag-picker-pager" id="tagPickerPager" hidden>
@@ -968,7 +978,8 @@
           </div>
         </section>
       </div>
-      <div class="confirm-actions tags-modal-actions">
+      <div class="confirm-actions tags-modal-actions tag-picker-actions">
+        <button type="button" class="primary" id="btnTagPickerLink" hidden disabled>关联这两组</button>
         <button type="button" class="primary" id="btnTagPickerDone">完成</button>
       </div>
     </div>
@@ -1018,6 +1029,6 @@
     </div>
   </div>
 
-  <script src="/static/app.min.js?v=20260803-no-loghint"></script>
+  <script src="/static/app.min.js?v=20260803-multi-fix"></script>
 </body>
 </html>

@@ -487,6 +487,109 @@ class Database:
             """
         )
 
+        # One-time: strip 「标签】日期索引」junk from stored index tags
+        if not await self.get_meta("tag_bracket_cleaned_v2"):
+            await self._cleanup_bracket_junk_tags()
+            await self.set_meta("tag_bracket_cleaned_v2", "1")
+            # keep v1 marker too so older checks stay quiet
+            await self.set_meta("tag_bracket_cleaned_v1", "1")
+
+    async def _cleanup_bracket_junk_tags(self) -> None:
+        """Normalize dirty tags in chat_tag_map / chat_media_index / tasks."""
+        from app.organizer import normalize_tag_list, normalize_tag_name
+
+        # --- chat_tag_map ---
+        async with self.conn.execute(
+            "SELECT chat_id, tag, message_id FROM chat_tag_map"
+        ) as cur:
+            rows = await cur.fetchall()
+        dirty_map: list[tuple[str, str, int]] = []
+        clean_inserts: list[tuple[str, str, int]] = []
+        for r in rows:
+            raw = str(r["tag"] or "")
+            clean = normalize_tag_name(raw)
+            if clean == raw:
+                continue
+            dirty_map.append((r["chat_id"], raw, int(r["message_id"])))
+            if clean:
+                clean_inserts.append((r["chat_id"], clean, int(r["message_id"])))
+        if clean_inserts:
+            await self.conn.executemany(
+                """
+                INSERT OR IGNORE INTO chat_tag_map(chat_id, tag, message_id)
+                VALUES (?, ?, ?)
+                """,
+                clean_inserts,
+            )
+        if dirty_map:
+            await self.conn.executemany(
+                "DELETE FROM chat_tag_map WHERE chat_id = ? AND tag = ? AND message_id = ?",
+                dirty_map,
+            )
+
+        # --- chat_media_index.tags JSON ---
+        async with self.conn.execute(
+            "SELECT chat_id, message_id, tags FROM chat_media_index"
+        ) as cur:
+            media_rows = await cur.fetchall()
+        media_updates: list[tuple[str, str, int]] = []
+        for r in media_rows:
+            raw_tags = r["tags"] or "[]"
+            try:
+                parsed = (
+                    json.loads(raw_tags) if isinstance(raw_tags, str) else (raw_tags or [])
+                )
+            except Exception:
+                parsed = []
+            if not isinstance(parsed, list):
+                parsed = []
+            cleaned = normalize_tag_list(parsed)
+            stripped = [str(x).strip().lstrip("#") for x in parsed if str(x).strip()]
+            dirty = cleaned != stripped or any(
+                normalize_tag_name(x) != x for x in stripped
+            )
+            if dirty:
+                media_updates.append(
+                    (
+                        json.dumps(cleaned, ensure_ascii=False),
+                        r["chat_id"],
+                        int(r["message_id"]),
+                    )
+                )
+        if media_updates:
+            await self.conn.executemany(
+                """
+                UPDATE chat_media_index SET tags = ?
+                WHERE chat_id = ? AND message_id = ?
+                """,
+                media_updates,
+            )
+
+        # --- tasks.include_tags ---
+        async with self.conn.execute("SELECT id, include_tags FROM tasks") as cur:
+            task_rows = await cur.fetchall()
+        for r in task_rows:
+            raw = r["include_tags"] or "[]"
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else (raw or [])
+            except Exception:
+                parsed = []
+            cleaned = normalize_tag_list(parsed)
+            new_json = json.dumps(cleaned, ensure_ascii=False)
+            old_json = (
+                raw if isinstance(raw, str) else json.dumps(parsed, ensure_ascii=False)
+            )
+            if new_json != old_json:
+                await self.conn.execute(
+                    "UPDATE tasks SET include_tags = ? WHERE id = ?",
+                    (new_json, int(r["id"])),
+                )
+
+        # Drop related-tag graph so it rebuilds from cleaned tags
+        await self.conn.execute("DELETE FROM chat_tag_graph_cache")
+        self.invalidate_tag_groups_cache()
+        await self.conn.commit()
+
 
     async def close(self) -> None:
         try:
@@ -569,6 +672,122 @@ class Database:
             sorted(DEFAULT_TAG_RELATION_BLACKLIST, key=lambda x: x.lower())
         )
 
+    @staticmethod
+    def _manual_tag_links_meta_key(chat_id: str | int) -> str:
+        return f"tag_manual_links:{chat_id}"
+
+    @staticmethod
+    def _normalize_manual_link_tags(tags: Any) -> list[str]:
+        from app.organizer import normalize_tag_list
+
+        cleaned = normalize_tag_list(tags or [])
+        # stable unique by lower key
+        seen: set[str] = set()
+        out: list[str] = []
+        for t in cleaned:
+            key = t.lower().lstrip("#")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(t)
+        return out
+
+    @staticmethod
+    def _manual_link_set_key(tags: list[str]) -> frozenset[str]:
+        return frozenset(t.lower().lstrip("#") for t in tags if t)
+
+    async def list_manual_tag_links(self, chat_id: str | int) -> list[list[str]]:
+        """User-defined co-occurrence groups for this chat (manual associations)."""
+        raw = await self.get_meta(self._manual_tag_links_meta_key(chat_id))
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return []
+        if not isinstance(data, list):
+            return []
+        out: list[list[str]] = []
+        for item in data:
+            tags = self._normalize_manual_link_tags(item)
+            if len(tags) >= 2:
+                out.append(tags)
+        return out
+
+    async def _save_manual_tag_links(
+        self, chat_id: str | int, links: list[list[str]]
+    ) -> list[list[str]]:
+        cleaned: list[list[str]] = []
+        seen_keys: set[frozenset[str]] = set()
+        for item in links:
+            tags = self._normalize_manual_link_tags(item)
+            if len(tags) < 2:
+                continue
+            key = self._manual_link_set_key(tags)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            cleaned.append(tags)
+        await self.set_meta(
+            self._manual_tag_links_meta_key(chat_id),
+            json.dumps(cleaned, ensure_ascii=False),
+        )
+        try:
+            await self.invalidate_tag_graph_cache(chat_id)
+        except Exception:
+            self.invalidate_tag_groups_cache(chat_id)
+        return cleaned
+
+    async def add_manual_tag_link(
+        self, chat_id: str | int, tags: Any
+    ) -> list[list[str]]:
+        """
+        Persist a manual association group (union of two picker rows).
+        Overlapping existing links are merged into one group.
+        """
+        new_tags = self._normalize_manual_link_tags(tags)
+        if len(new_tags) < 2:
+            raise ValueError("至少需要两个标签才能关联")
+        new_key = self._manual_link_set_key(new_tags)
+        current = await self.list_manual_tag_links(chat_id)
+        merged_tags = list(new_tags)
+        kept: list[list[str]] = []
+        for link in current:
+            link_key = self._manual_link_set_key(link)
+            if link_key & new_key:
+                # merge overlapping manual links
+                for t in link:
+                    lk = t.lower().lstrip("#")
+                    if lk and lk not in {x.lower().lstrip("#") for x in merged_tags}:
+                        merged_tags.append(t)
+            else:
+                kept.append(link)
+        merged_tags = self._normalize_manual_link_tags(merged_tags)
+        kept.append(merged_tags)
+        return await self._save_manual_tag_links(chat_id, kept)
+
+    async def remove_manual_tag_link(
+        self, chat_id: str | int, tags: Any
+    ) -> list[list[str]]:
+        """Remove the manual link whose tag set equals the given tags."""
+        target = self._normalize_manual_link_tags(tags)
+        if len(target) < 2:
+            raise ValueError("标签无效")
+        target_key = self._manual_link_set_key(target)
+        current = await self.list_manual_tag_links(chat_id)
+        kept = [
+            link
+            for link in current
+            if self._manual_link_set_key(link) != target_key
+        ]
+        return await self._save_manual_tag_links(chat_id, kept)
+
+    async def _relation_tag_groups(self, chat_id: str | int) -> list[list[str]]:
+        """Caption co-occurrence groups plus user manual links."""
+        groups = list(await self.list_index_tag_groups(chat_id))
+        groups.extend(await self.list_manual_tag_links(chat_id))
+        return groups
+
     def _row_to_task(self, row: aiosqlite.Row) -> dict[str, Any]:
         d = dict(row)
         d["media_types"] = json.loads(d["media_types"])
@@ -631,10 +850,9 @@ class Database:
         if folder_mode != "caption":
             use_text = False
         include_tags = data.get("include_tags") or []
-        if isinstance(include_tags, str):
-            include_tags = [x.strip().lstrip("#") for x in re.split(r"[,，\s]+", include_tags) if x.strip()]
-        else:
-            include_tags = [str(x).strip().lstrip("#") for x in include_tags if str(x).strip()]
+        from app.organizer import normalize_tag_list
+
+        include_tags = normalize_tag_list(include_tags)
         caption_keywords = data.get("caption_keywords") or []
         if isinstance(caption_keywords, str):
             caption_keywords = [x.strip() for x in re.split(r"[,，]+", caption_keywords) if x.strip()]
@@ -715,7 +933,14 @@ class Database:
             fields["file_formats"] = json.dumps(fields["file_formats"] or [])
         for key in ("include_tags", "caption_keywords"):
             if key in fields and not isinstance(fields[key], str):
-                fields[key] = json.dumps(fields[key] or [], ensure_ascii=False)
+                if key == "include_tags":
+                    from app.organizer import normalize_tag_list
+
+                    fields[key] = json.dumps(
+                        normalize_tag_list(fields[key] or []), ensure_ascii=False
+                    )
+                else:
+                    fields[key] = json.dumps(fields[key] or [], ensure_ascii=False)
         if "use_text_as_folder" in fields:
             fields["use_text_as_folder"] = 1 if fields["use_text_as_folder"] else 0
         if "test_mode" in fields:
@@ -1495,8 +1720,10 @@ class Database:
         media_type: Optional[str] = None,
         msg_date: Optional[str] = None,
     ) -> None:
+        from app.organizer import normalize_tag_list
+
         chat_id = str(chat_id)
-        tags = tags or []
+        tags = normalize_tag_list(tags or [])
         now = _utcnow()
         gid = str(grouped_id) if grouped_id is not None else None
         await self.conn.execute(
@@ -1529,7 +1756,6 @@ class Database:
         )
         tag_rows = []
         for tag in tags:
-            tag = str(tag).strip().lstrip("#")
             if tag:
                 tag_rows.append((chat_id, tag, int(message_id)))
         if tag_rows:
@@ -1540,6 +1766,77 @@ class Database:
                 """,
                 tag_rows,
             )
+
+    async def resolve_stored_tag_aliases(
+        self, chat_id: str | int, tags: list[str] | None
+    ) -> list[str]:
+        """Map clean tag names to all stored variants (incl. dirty bracket junk)."""
+        from app.organizer import normalize_tag_name, normalize_tag_list
+
+        clean = normalize_tag_list(tags or [])
+        wanted = {t.lower() for t in clean}
+        if not wanted:
+            return []
+        chat_id = str(chat_id)
+        async with self.conn.execute(
+            "SELECT DISTINCT tag FROM chat_tag_map WHERE chat_id = ?",
+            (chat_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        out: list[str] = []
+        seen: set[str] = set()
+        for r in rows:
+            raw = str(r["tag"] or "")
+            if normalize_tag_name(raw).lower() in wanted and raw not in seen:
+                seen.add(raw)
+                out.append(raw)
+        for t in clean:
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+
+    async def _tag_match_sql(
+        self,
+        chat_id: str,
+        tags: list[str] | None,
+        *,
+        tag_match_mode: str = "any",
+    ) -> tuple[str, list[Any]]:
+        """Build SQL fragment for tag filtering; expands dirty stored aliases."""
+        from app.organizer import normalize_tag_list
+
+        clean = normalize_tag_list(tags or [])
+        if not clean:
+            return "", []
+        mode = (tag_match_mode or "any").strip().lower()
+        if mode not in ("any", "all"):
+            mode = "any"
+
+        if mode == "all":
+            parts: list[str] = []
+            params: list[Any] = []
+            for t in clean:
+                aliases = await self.resolve_stored_tag_aliases(chat_id, [t])
+                ph = ",".join("?" for _ in aliases)
+                parts.append(
+                    f"""m.message_id IN (
+                        SELECT DISTINCT message_id FROM chat_tag_map
+                        WHERE chat_id = ? AND tag IN ({ph})
+                    )"""
+                )
+                params.extend([chat_id, *aliases])
+            return " AND ".join(parts), params
+
+        aliases = await self.resolve_stored_tag_aliases(chat_id, clean)
+        ph = ",".join("?" for _ in aliases)
+        return (
+            f"""m.message_id IN (
+                SELECT DISTINCT message_id FROM chat_tag_map
+                WHERE chat_id = ? AND tag IN ({ph})
+            )""",
+            [chat_id, *aliases],
+        )
 
     async def commit(self) -> None:
         await self.conn.commit()
@@ -1633,6 +1930,8 @@ class Database:
             return int(row["c"] if row else 0)
 
     async def list_index_tags(self, chat_id: str | int) -> list[dict[str, Any]]:
+        from app.organizer import normalize_tag_name
+
         async with self.conn.execute(
             """
             SELECT tag, COUNT(*) AS count
@@ -1644,7 +1943,25 @@ class Database:
             (str(chat_id),),
         ) as cur:
             rows = await cur.fetchall()
-            return [{"tag": r["tag"], "count": int(r["count"])} for r in rows]
+        # 合并「泡泡咕」与「泡泡咕】11-26…」等脏标签
+        by_lower: dict[str, tuple[str, int]] = {}
+        for r in rows:
+            name = normalize_tag_name(r["tag"])
+            if not name:
+                continue
+            key = name.lower()
+            count = int(r["count"])
+            if key in by_lower:
+                disp, prev = by_lower[key]
+                by_lower[key] = (disp, prev + count)
+            else:
+                by_lower[key] = (name, count)
+        return [
+            {"tag": name, "count": count}
+            for name, count in sorted(
+                by_lower.values(), key=lambda x: (-x[1], x[0])
+            )
+        ]
 
     # chat_id -> (monotonic_ts, groups) — expand_related scans whole index otherwise
     _tag_groups_cache: dict[str, tuple[float, list[list[str]]]] = {}
@@ -1679,6 +1996,8 @@ class Database:
             (key,),
         ) as cur:
             rows = await cur.fetchall()
+        from app.organizer import normalize_tag_list
+
         groups: list[list[str]] = []
         for r in rows:
             raw = r["tags"] or "[]"
@@ -1686,7 +2005,7 @@ class Database:
                 tags = json.loads(raw) if isinstance(raw, str) else (raw or [])
             except Exception:
                 tags = []
-            cleaned = [str(t).strip().lstrip("#") for t in tags if str(t).strip()]
+            cleaned = normalize_tag_list(tags)
             if cleaned:
                 groups.append(cleaned)
         return groups
@@ -1806,12 +2125,32 @@ class Database:
             if key not in display:
                 # stable display order: original caption order after normalize
                 display[key] = tags
+        # Manual associations count as co-occurrence bridges for the picker
+        manual_keys: set[tuple[str, ...]] = set()
+        for group in await self.list_manual_tag_links(chat_id):
+            tags = [
+                t
+                for t in normalize_tag_list(group)
+                if t and t.lower().lstrip("#") not in blacklist
+            ]
+            if len(tags) < 2:
+                continue
+            key = tuple(sorted(t.lower() for t in tags))
+            manual_keys.add(key)
+            ctr[key] += max(1, ctr.get(key, 0))  # at least appear once
+            if ctr[key] < 2:
+                ctr[key] = 2  # keep above min_count=1 solos visually as a bundle
+            if key not in display:
+                display[key] = tags
         out: list[dict[str, Any]] = []
         for key, count in ctr.most_common():
             if count < min_count:
                 break
             tags = display.get(key) or list(key)
-            out.append({"tags": tags, "count": int(count)})
+            item: dict[str, Any] = {"tags": tags, "count": int(count)}
+            if key in manual_keys:
+                item["manual"] = True
+            out.append(item)
             if len(out) >= limit:
                 break
         return out
@@ -1863,7 +2202,7 @@ class Database:
         seeds = normalize_tag_list(tags)
         if not seeds:
             return []
-        groups = await self.list_index_tag_groups(chat_id)
+        groups = await self._relation_tag_groups(chat_id)
         return expand_tags_via_cooccurrence(
             seeds,
             groups,
@@ -1878,7 +2217,7 @@ class Database:
         """tag → full related multi-tag folder name (blacklist hubs excluded)."""
         from app.organizer import build_tag_folder_map_from_groups
 
-        groups = await self.list_index_tag_groups(chat_id)
+        groups = await self._relation_tag_groups(chat_id)
         path = Path(group_dir) if group_dir else None
         return build_tag_folder_map_from_groups(
             groups,
@@ -1894,7 +2233,7 @@ class Database:
 
         bl = {x.lower() for x in await self.get_tag_relation_blacklist()}
         out: list[list[str]] = []
-        for group in await self.list_index_tag_groups(chat_id):
+        for group in await self._relation_tag_groups(chat_id):
             tags = [
                 t
                 for t in normalize_tag_list(group)
@@ -1955,7 +2294,6 @@ class Database:
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
         chat_id = str(chat_id)
-        tags = [str(t).strip().lstrip("#") for t in (tags or []) if str(t).strip()]
         mode = (tag_match_mode or "any").strip().lower()
         if mode not in ("any", "all"):
             mode = "any"
@@ -1966,26 +2304,12 @@ class Database:
         where = ["m.chat_id = ?"]
         params: list[Any] = [chat_id]
 
-        if tags:
-            placeholders = ",".join("?" for _ in tags)
-            if mode == "all":
-                where.append(
-                    f"""m.message_id IN (
-                        SELECT message_id FROM chat_tag_map
-                        WHERE chat_id = ? AND tag IN ({placeholders})
-                        GROUP BY message_id
-                        HAVING COUNT(DISTINCT tag) >= ?
-                    )"""
-                )
-                params.extend([chat_id, *tags, len(tags)])
-            else:
-                where.append(
-                    f"""m.message_id IN (
-                        SELECT DISTINCT message_id FROM chat_tag_map
-                        WHERE chat_id = ? AND tag IN ({placeholders})
-                    )"""
-                )
-                params.extend([chat_id, *tags])
+        tag_sql, tag_params = await self._tag_match_sql(
+            chat_id, tags, tag_match_mode=mode
+        )
+        if tag_sql:
+            where.append(tag_sql)
+            params.extend(tag_params)
         if q:
             where.append("m.caption LIKE ?")
             params.append(f"%{q}%")
@@ -2010,13 +2334,16 @@ class Database:
             rows = await cur.fetchall()
 
         items = []
+        from app.organizer import normalize_tag_list
+
         for r in rows:
             d = dict(r)
             raw_tags = d.get("tags") or "[]"
             try:
-                d["tags"] = json.loads(raw_tags) if isinstance(raw_tags, str) else (raw_tags or [])
+                parsed = json.loads(raw_tags) if isinstance(raw_tags, str) else (raw_tags or [])
             except Exception:
-                d["tags"] = []
+                parsed = []
+            d["tags"] = normalize_tag_list(parsed)
             items.append(d)
         return items, total
 
@@ -2036,7 +2363,6 @@ class Database:
           - message_id: by Telegram message id (newest_first controls ASC/DESC)
         """
         chat_id = str(chat_id)
-        tags = [str(t).strip().lstrip("#") for t in (tags or []) if str(t).strip()]
         keywords = [str(k).strip() for k in (keywords or []) if str(k).strip()]
         mode = (tag_match_mode or "any").strip().lower()
         if mode not in ("any", "all"):
@@ -2045,26 +2371,12 @@ class Database:
         where = ["m.chat_id = ?"]
         params: list[Any] = [chat_id]
 
-        if tags:
-            placeholders = ",".join("?" for _ in tags)
-            if mode == "all":
-                where.append(
-                    f"""m.message_id IN (
-                        SELECT message_id FROM chat_tag_map
-                        WHERE chat_id = ? AND tag IN ({placeholders})
-                        GROUP BY message_id
-                        HAVING COUNT(DISTINCT tag) >= ?
-                    )"""
-                )
-                params.extend([chat_id, *tags, len(tags)])
-            else:
-                where.append(
-                    f"""m.message_id IN (
-                        SELECT DISTINCT message_id FROM chat_tag_map
-                        WHERE chat_id = ? AND tag IN ({placeholders})
-                    )"""
-                )
-                params.extend([chat_id, *tags])
+        tag_sql, tag_params = await self._tag_match_sql(
+            chat_id, tags, tag_match_mode=mode
+        )
+        if tag_sql:
+            where.append(tag_sql)
+            params.extend(tag_params)
 
         if keywords:
             # any keyword match (same as matches_caption_keywords)
@@ -2109,7 +2421,7 @@ class Database:
                     out[int(row["message_id"])] = row["caption"] or ""
         return out
 
-    def _index_filter_sql(
+    async def _index_filter_sql(
         self,
         chat_id: str,
         *,
@@ -2118,7 +2430,6 @@ class Database:
         media_types: list[str] | None = None,
         keywords: list[str] | None = None,
     ) -> tuple[str, list[Any]]:
-        tags = [str(t).strip().lstrip("#") for t in (tags or []) if str(t).strip()]
         keywords = [str(k).strip() for k in (keywords or []) if str(k).strip()]
         media_types = [str(m).strip() for m in (media_types or []) if str(m).strip()]
         mode = (tag_match_mode or "any").strip().lower()
@@ -2128,26 +2439,12 @@ class Database:
         where = ["m.chat_id = ?"]
         params: list[Any] = [chat_id]
 
-        if tags:
-            placeholders = ",".join("?" for _ in tags)
-            if mode == "all":
-                where.append(
-                    f"""m.message_id IN (
-                        SELECT message_id FROM chat_tag_map
-                        WHERE chat_id = ? AND tag IN ({placeholders})
-                        GROUP BY message_id
-                        HAVING COUNT(DISTINCT tag) >= ?
-                    )"""
-                )
-                params.extend([chat_id, *tags, len(tags)])
-            else:
-                where.append(
-                    f"""m.message_id IN (
-                        SELECT DISTINCT message_id FROM chat_tag_map
-                        WHERE chat_id = ? AND tag IN ({placeholders})
-                    )"""
-                )
-                params.extend([chat_id, *tags])
+        tag_sql, tag_params = await self._tag_match_sql(
+            chat_id, tags, tag_match_mode=mode
+        )
+        if tag_sql:
+            where.append(tag_sql)
+            params.extend(tag_params)
 
         if media_types:
             # sticker is treated as document in the downloader
@@ -2176,7 +2473,7 @@ class Database:
     ) -> int:
         """How many indexed media rows match tags / types / keywords."""
         chat_id = str(chat_id)
-        where_sql, params = self._index_filter_sql(
+        where_sql, params = await self._index_filter_sql(
             chat_id,
             tags=tags,
             tag_match_mode=tag_match_mode,
@@ -2202,7 +2499,7 @@ class Database:
     ) -> int:
         """How many done downloads for this task fall inside the filtered index set."""
         chat_id = str(chat_id)
-        where_sql, params = self._index_filter_sql(
+        where_sql, params = await self._index_filter_sql(
             chat_id,
             tags=tags,
             tag_match_mode=tag_match_mode,
@@ -2251,7 +2548,7 @@ class Database:
         chat_id = str(chat_id)
         limit = max(1, min(200, int(limit or 50)))
         offset = max(0, int(offset or 0))
-        where_sql, params = self._index_filter_sql(
+        where_sql, params = await self._index_filter_sql(
             chat_id,
             tags=tags,
             tag_match_mode=tag_match_mode,
@@ -2294,7 +2591,7 @@ class Database:
         chat_id = str(chat_id)
         limit = max(1, min(200, int(limit or 50)))
         offset = max(0, int(offset or 0))
-        where_sql, params = self._index_filter_sql(
+        where_sql, params = await self._index_filter_sql(
             chat_id,
             tags=tags,
             tag_match_mode=tag_match_mode,
@@ -2344,7 +2641,7 @@ class Database:
     ) -> int:
         """Indexed matches already done (task record or chat/local completed)."""
         chat_id = str(chat_id)
-        where_sql, params = self._index_filter_sql(
+        where_sql, params = await self._index_filter_sql(
             chat_id,
             tags=tags,
             tag_match_mode=tag_match_mode,
@@ -2383,7 +2680,7 @@ class Database:
         chat_id = str(chat_id)
         limit = max(1, min(200, int(limit or 50)))
         offset = max(0, int(offset or 0))
-        where_sql, params = self._index_filter_sql(
+        where_sql, params = await self._index_filter_sql(
             chat_id,
             tags=tags,
             tag_match_mode=tag_match_mode,

@@ -103,4 +103,12 @@ if WEB_DIR.exists():
 @app.get("/")
 async def index():
     index_file = WEB_DIR / "index.html"
-    return FileResponse(index_file)
+    # iOS Safari aggressively caches HTML; without this phones keep old JS forever
+    return FileResponse(
+        index_file,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )

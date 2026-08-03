@@ -19,11 +19,29 @@ INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 WHITESPACE = re.compile(r"\s+")
 
 # #风流狗尾巴 或 #1#2（逐个匹配，# 始终在前）
-HASHTAG_RE = re.compile(r"#([^\s#@/\\<>:|?*]+)")
+# 在【】[]（）等括号处截断，避免把「#泡泡咕】11-26标题」整段当成标签
+HASHTAG_RE = re.compile(r"#([^\s#@/\\<>:|?*【】［］〖〗〔〕〈〉《》\[\]（）()『』「」]+)")
 # 7.18 / 07.18
 DATE_DOT_RE = re.compile(r"(?<!\d)(\d{1,2}\.\d{1,2})(?!\d)")
 # 7月18日
 DATE_CN_RE = re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]?")
+
+# 标签名清理：去掉误吸入的括号索引尾巴（含全角］等）
+_TAG_CUT_RE = re.compile(r"[】］〗〕〉》\]）)』」].*$")
+_TAG_OPEN_CUT_RE = re.compile(r"[【［〖〔〈《\[（(『「].*$")
+
+
+def normalize_tag_name(raw: Optional[str]) -> str:
+    """Strip # / brackets / trailing index junk → clean tag name."""
+    tag = str(raw or "").strip().lstrip("#").strip()
+    if not tag:
+        return ""
+    tag = _TAG_CUT_RE.sub("", tag)
+    tag = _TAG_OPEN_CUT_RE.sub("", tag)
+    # 再截一次「名字后紧跟日期索引」：泡泡咕11-26标题 / 泡泡咕12.01标题
+    tag = re.split(r"(?<=[\u4e00-\u9fff])\d{1,2}[-./月]\d{1,2}", tag, maxsplit=1)[0]
+    tag = tag.strip(" \t.-_·#，,")
+    return tag
 
 
 def sanitize_name(name: str, max_len: int = 120) -> str:
@@ -203,10 +221,14 @@ def extract_tags(text: str) -> list[str]:
     seen: set[str] = set()
 
     for m in HASHTAG_RE.finditer(text):
-        tag = m.group(1).strip()
-        if tag and tag not in seen:
-            seen.add(tag)
-            found.append(tag)
+        tag = normalize_tag_name(m.group(1))
+        if not tag:
+            continue
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(tag)
 
     return found
 
@@ -230,7 +252,7 @@ def normalize_tag_list(raw: Optional[Iterable[str] | str]) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for p in parts:
-        tag = p.strip().lstrip("#").strip()
+        tag = normalize_tag_name(p)
         if not tag:
             continue
         key = tag.lower()
@@ -273,7 +295,11 @@ def matches_include_tags(
     wanted = normalize_tag_list(include_tags)
     if not wanted:
         return True
-    have = {t.strip().lstrip("#").lower() for t in (message_tags or []) if str(t).strip()}
+    have = {
+        normalize_tag_name(t).lower()
+        for t in (message_tags or [])
+        if normalize_tag_name(t)
+    }
     need = {t.lower() for t in wanted}
     if mode == "all":
         return need.issubset(have)

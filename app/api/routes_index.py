@@ -2,7 +2,7 @@
 
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.api.deps import require_web_auth
@@ -24,6 +24,9 @@ class AutoScanBody(BaseModel):
     interval_min: int = Field(default=60, ge=5, le=1440)  # 5 min … 24 h
     chat_title: str = ""
 
+
+class TagLinkBody(BaseModel):
+    tags: List[str] = Field(default_factory=list)
 
 @router.patch("/{chat_id}/auto-scan")
 async def set_auto_scan(
@@ -58,7 +61,46 @@ async def get_index_tags_only(
     tags = await db.list_index_tags(chat_id)
     # Cap bundles so mobile open stays responsive
     bundles = await db.list_tag_cooccur_bundles(chat_id, min_count=1, limit=400)
-    return {"ok": True, "tags": tags, "bundles": bundles, "related": {}}
+    manual_links = await db.list_manual_tag_links(chat_id)
+    return {
+        "ok": True,
+        "tags": tags,
+        "bundles": bundles,
+        "related": {},
+        "manual_links": manual_links,
+    }
+
+
+@router.get("/{chat_id}/tag-links")
+async def get_tag_links(chat_id: int | str, _: None = Depends(require_web_auth)):
+    links = await db.list_manual_tag_links(chat_id)
+    return {"ok": True, "links": links}
+
+
+@router.post("/{chat_id}/tag-links")
+async def create_tag_link(
+    chat_id: int | str,
+    body: TagLinkBody,
+    _: None = Depends(require_web_auth),
+):
+    try:
+        links = await db.add_manual_tag_link(chat_id, body.tags or [])
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True, "links": links}
+
+
+@router.delete("/{chat_id}/tag-links")
+async def delete_tag_link(
+    chat_id: int | str,
+    body: TagLinkBody,
+    _: None = Depends(require_web_auth),
+):
+    try:
+        links = await db.remove_manual_tag_link(chat_id, body.tags or [])
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True, "links": links}
 
 
 @router.get("/{chat_id}/meta")

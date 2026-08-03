@@ -36,8 +36,11 @@ const state = {
   tasks: [],
   taskTagsDraft: null, // { taskId, chatId, tags, groups: string[][], ... }
   tagPickerIndex: [], // [{tag, count}]
-  tagPickerBundles: [], // [{tags: string[], count}] same-caption groups
+  tagPickerBundles: [], // [{tags: string[], count, manual?}] same-caption groups
   tagPickerRelated: {}, // tag -> [related...]
+  tagPickerManualLinks: [], // string[][] user associations
+  tagPickerMultiSelect: false,
+  tagPickerSelectedKeys: [], // groupKey[] — at most 2 in multi-select
   tagPickerPage: "index", // mobile tabs: applied | index
   tagPickerIndexPage: 1, // 1-based page in 库内索引
   tagPickerIndexPageSize: 50,
@@ -348,6 +351,105 @@ let _confirmKeyHandler = null;
 let _confirmTypeInputHandler = null;
 let _confirmRequiredPhrase = "";
 
+function syncConfirmOpenClass() {
+  const any =
+    ($("confirmModal") && !$("confirmModal").hidden) ||
+    ($("tagsModal") && !$("tagsModal").hidden) ||
+    ($("tagPickerModal") && !$("tagPickerModal").hidden);
+  document.body.classList.toggle("confirm-open", !!any);
+  syncBodyScrollLock();
+}
+
+let _overlayTouchGuard = null;
+
+function _scrollableOverflowY(el) {
+  if (!el || el === document.body || el === document.documentElement) return false;
+  try {
+    const st = window.getComputedStyle(el);
+    const oy = st.overflowY;
+    if (oy !== "auto" && oy !== "scroll" && oy !== "overlay") return false;
+    return el.scrollHeight > el.clientHeight + 1;
+  } catch (_) {
+    return false;
+  }
+}
+
+function _canScrollY(el, deltaY) {
+  // deltaY > 0 → content moving up (finger up) → need room below
+  if (deltaY > 0) return el.scrollTop + el.clientHeight < el.scrollHeight - 1;
+  if (deltaY < 0) return el.scrollTop > 0;
+  return true;
+}
+
+function enableOverlayTouchGuard() {
+  if (_overlayTouchGuard) return;
+  let lastY = 0;
+  const onStart = (e) => {
+    if (e.touches && e.touches[0]) lastY = e.touches[0].clientY;
+  };
+  const onMove = (e) => {
+    if (!e.touches || !e.touches[0]) return;
+    const y = e.touches[0].clientY;
+    const deltaY = lastY - y;
+    lastY = y;
+    let node = e.target;
+    if (node && node.nodeType === 3) node = node.parentElement;
+    while (node && node !== document.body && node !== document.documentElement) {
+      if (_scrollableOverflowY(node)) {
+        // Allow only while the scrollport can actually move; block edge chaining to page
+        if (_canScrollY(node, deltaY)) return;
+        break;
+      }
+      node = node.parentElement;
+    }
+    e.preventDefault();
+  };
+  document.addEventListener("touchstart", onStart, { capture: true, passive: true });
+  document.addEventListener("touchmove", onMove, { capture: true, passive: false });
+  _overlayTouchGuard = { onStart, onMove };
+}
+
+function disableOverlayTouchGuard() {
+  if (!_overlayTouchGuard) return;
+  document.removeEventListener("touchstart", _overlayTouchGuard.onStart, true);
+  document.removeEventListener("touchmove", _overlayTouchGuard.onMove, true);
+  _overlayTouchGuard = null;
+}
+
+function syncBodyScrollLock() {
+  const locked =
+    document.body.classList.contains("confirm-open") ||
+    document.body.classList.contains("modal-open") ||
+    document.body.classList.contains("drawer-open");
+  if (locked) {
+    if (document.body.dataset.scrollLocked == null) {
+      const y = window.scrollY || document.documentElement.scrollTop || 0;
+      document.body.dataset.scrollLocked = String(y);
+      document.body.style.top = `-${y}px`;
+      document.body.style.position = "fixed";
+      document.body.style.width = "100%";
+      document.body.style.left = "0";
+      document.body.style.right = "0";
+      document.documentElement.style.overflow = "hidden";
+      document.documentElement.style.overscrollBehavior = "none";
+    }
+    enableOverlayTouchGuard();
+    return;
+  }
+  disableOverlayTouchGuard();
+  if (document.body.dataset.scrollLocked == null) return;
+  const y = Number(document.body.dataset.scrollLocked) || 0;
+  delete document.body.dataset.scrollLocked;
+  document.body.style.position = "";
+  document.body.style.top = "";
+  document.body.style.width = "";
+  document.body.style.left = "";
+  document.body.style.right = "";
+  document.documentElement.style.overflow = "";
+  document.documentElement.style.overscrollBehavior = "";
+  window.scrollTo(0, y);
+}
+
 function closeConfirmDialog(result) {
   const modal = $("confirmModal");
   if (_confirmTypeInputHandler) {
@@ -365,7 +467,7 @@ function closeConfirmDialog(result) {
     return;
   }
   modal.hidden = true;
-  document.body.classList.remove("confirm-open");
+  syncConfirmOpenClass();
   if (_confirmKeyHandler) {
     document.removeEventListener("keydown", _confirmKeyHandler);
     _confirmKeyHandler = null;
@@ -454,7 +556,7 @@ function confirmDialog(opts = {}) {
   }
 
   modal.hidden = false;
-  document.body.classList.add("confirm-open");
+  syncConfirmOpenClass();
 
   return new Promise((resolve) => {
     _confirmResolver = resolve;
@@ -641,6 +743,7 @@ function syncBodyModalLock() {
     ($("queueModal") && !$("queueModal").hidden) ||
     ($("historyPreviewModal") && !$("historyPreviewModal").hidden);
   document.body.classList.toggle("modal-open", !!any);
+  syncBodyScrollLock();
 }
 
 function closeAllOverlays() {
@@ -671,6 +774,7 @@ function closeAllOverlays() {
     "drawer-open",
     "under-picker"
   );
+  syncBodyScrollLock();
   document.querySelectorAll(".is-loading").forEach((el) => {
     el.classList.remove("is-loading");
   });
@@ -974,11 +1078,9 @@ function bindUi() {
     });
   }
   const btnTagsClose = $("btnTagsClose");
-  const btnTagsModalCancel = $("btnTagsModalCancel");
   const btnTagsModalSave = $("btnTagsModalSave");
   const tagsBackdrop = $("tagsBackdrop");
   if (btnTagsClose) btnTagsClose.addEventListener("click", closeTaskTagsModal);
-  if (btnTagsModalCancel) btnTagsModalCancel.addEventListener("click", closeTaskTagsModal);
   if (btnTagsModalSave) btnTagsModalSave.addEventListener("click", () => saveTaskTagsModal());
   if (tagsBackdrop) tagsBackdrop.addEventListener("click", closeTaskTagsModal);
   document.querySelectorAll(".num-stepper").forEach((wrap) => {
@@ -1008,6 +1110,12 @@ function bindUi() {
   $("btnTagPickerClose")?.addEventListener("click", closeTagPicker);
   $("btnTagPickerDone")?.addEventListener("click", closeTagPicker);
   $("tagPickerBackdrop")?.addEventListener("click", closeTagPicker);
+  $("btnTagPickerMulti")?.addEventListener("click", () => {
+    setTagPickerMultiSelect(!state.tagPickerMultiSelect);
+  });
+  $("btnTagPickerLink")?.addEventListener("click", () => {
+    linkSelectedTagGroups();
+  });
   $("btnTagPickerAdd")?.addEventListener("click", () => addTagFromPickerInput());
   document.querySelectorAll(".tag-picker-tab[data-picker-page]").forEach((btn) => {
     btn.addEventListener("click", () => switchTagPickerPage(btn.dataset.pickerPage));
@@ -1631,16 +1739,23 @@ async function refreshIndexPanel(opts = {}) {
     metaEl.textContent = "加载索引状态…";
   }
 
-  // Settings modal only needs meta/auto-scan — skip related map + Telegram tip probe
-  const light =
-    !!opts.light ||
-    ($("tagsModal") && !$("tagsModal").hidden && (!$("tagPickerModal") || $("tagPickerModal").hidden));
+  // Task settings must always use the light /meta path — full /index rebuilds
+  // related graph over tens of thousands of captions and freezes iOS Safari.
+  const settingsOpen = $("tagsModal") && !$("tagsModal").hidden;
+  const light = opts.light === false ? false : !!opts.light || settingsOpen;
 
+  const ctrl =
+    typeof AbortController !== "undefined" && !opts.signal
+      ? new AbortController()
+      : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
   try {
     const path = light
       ? `/api/index/${encodeURIComponent(chat.id)}/meta`
       : `/api/index/${encodeURIComponent(chat.id)}`;
-    const r = await api(path);
+    const r = await api(path, {
+      signal: opts.signal || (ctrl ? ctrl.signal : undefined),
+    });
     // Ignore late responses if user switched chat/task
     const still = getIndexTargetChat();
     if (!still || String(still.id) !== String(chat.id)) return;
@@ -1672,10 +1787,20 @@ async function refreshIndexPanel(opts = {}) {
     else stopIndexPolling();
     if (!light) refreshIndexPreview();
   } catch (e) {
-    if (isSoftAuthError(e)) return;
-    if (metaEl && !paintIndexPanelFromCache(chat.id)) {
-      metaEl.textContent = e.message || "加载索引失败";
+    if (isSoftAuthError(e)) {
+      if (metaEl && !paintIndexPanelFromCache(chat.id)) {
+        metaEl.textContent = "登录状态异常，下拉刷新或重新打开设置";
+      }
+      return;
     }
+    const aborted = e?.name === "AbortError";
+    if (metaEl && !paintIndexPanelFromCache(chat.id)) {
+      metaEl.textContent = aborted
+        ? "索引状态超时，请点「手动增量」重试"
+        : e.message || "加载索引失败";
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -1931,10 +2056,33 @@ function initAutoIndexIntervalDropdown() {
 }
 
 function normalizeTagName(raw) {
-  return String(raw || "")
+  let s = String(raw || "")
     .trim()
     .replace(/^#+/, "")
     .replace(/\s+/g, " ");
+  // 去掉「泡泡咕】11-26标题」这类括号/全角括号索引尾巴
+  s = s.split(/[】］〗〕〉》\]）)』」]/)[0] || "";
+  s = s.split(/[【［〖〔〈《\[（(『「]/)[0] || "";
+  // 名字后紧跟日期索引（避免 lookbehind，兼容旧版 iOS Safari）
+  s = s.replace(/([\u4e00-\u9fff])\d{1,2}[-./月]\d{1,2}[\s\S]*$/, "$1");
+  return s.replace(/^[\s.\-_·#，,]+|[\s.\-_·#，,]+$/g, "").trim();
+}
+
+/** Merge tags that normalize to the same name (sum counts). */
+function mergeNormalizedTagItems(items) {
+  const map = new Map();
+  for (const t of items || []) {
+    const name = normalizeTagName(t && t.tag != null ? t.tag : t);
+    if (!name) continue;
+    const key = name.toLowerCase();
+    const count = Number((t && t.count) || 0) || 0;
+    const prev = map.get(key);
+    if (prev) prev.count += count;
+    else map.set(key, { tag: name, count });
+  }
+  return Array.from(map.values()).sort(
+    (a, b) => b.count - a.count || a.tag.localeCompare(b.tag, "zh")
+  );
 }
 
 function syncIncludeTagsHidden() {
@@ -2345,7 +2493,9 @@ function scheduleIndexPoll() {
   if (state.indexTimer) clearTimeout(state.indexTimer);
   state.indexTimer = setTimeout(async () => {
     if (!state.indexPolling) return;
-    await refreshIndexPanel();
+    // Always light while settings is open (avoids related-graph rebuild on iOS)
+    const settingsOpen = $("tagsModal") && !$("tagsModal").hidden;
+    await refreshIndexPanel(settingsOpen ? { light: true } : {});
   }, 1200);
 }
 
@@ -2695,6 +2845,7 @@ async function openSettings(focusTgLogin = false) {
   closeCreateModal();
   $("accountDrawer").hidden = false;
   document.body.classList.add("drawer-open");
+  syncBodyScrollLock();
   switchSettingsTab(focusTgLogin ? "telegram" : "telegram");
   setTgSub(state.tgAuthorized ? "api" : state.tgStep || "api");
   await refreshSettingsPanel(focusTgLogin);
@@ -2743,6 +2894,7 @@ function closeAccountDrawer() {
   if (!el) return;
   el.hidden = true;
   document.body.classList.remove("drawer-open");
+  syncBodyScrollLock();
 }
 
 function fillAccountPanel(r) {
@@ -3995,12 +4147,19 @@ function stepNumberInput(input, dir) {
 function closeTaskTagsModal() {
   closeTagPicker();
   const modal = $("tagsModal");
-  if (modal) modal.hidden = true;
-  document.body.classList.remove("confirm-open");
+  if (modal) {
+    modal.hidden = true;
+    modal.classList.remove("under-picker");
+    modal.querySelector(".tags-panel")?.classList.remove("is-loading");
+  }
+  syncConfirmOpenClass();
   state.taskTagsDraft = null;
   state.tagPickerIndex = [];
   state.tagPickerBundles = [];
+  state.tagPickerManualLinks = [];
   state.tagPickerRelated = {};
+  state.tagPickerSelectedKeys = [];
+  state.tagPickerMultiSelect = false;
   // Stop settings-driven index polling when leaving the modal
   if (!($("createModal") && !$("createModal").hidden)) {
     stopIndexPolling();
@@ -4013,6 +4172,186 @@ function groupKey(tags) {
     .filter(Boolean)
     .sort()
     .join("\0");
+}
+
+function findManualLinkForNames(names) {
+  const rowKeys = new Set(
+    (names || [])
+      .map((t) => String(t || "").toLowerCase().replace(/^#/, ""))
+      .filter(Boolean)
+  );
+  if (rowKeys.size < 2) return null;
+  for (const link of state.tagPickerManualLinks || []) {
+    const keys = (link || [])
+      .map((t) => String(t || "").toLowerCase().replace(/^#/, ""))
+      .filter(Boolean);
+    if (keys.length < 2) continue;
+    if (keys.every((k) => rowKeys.has(k))) return link;
+  }
+  return null;
+}
+
+function setTagPickerMultiSelect(on) {
+  state.tagPickerMultiSelect = !!on;
+  if (!state.tagPickerMultiSelect) {
+    state.tagPickerSelectedKeys = [];
+  }
+  const btn = $("btnTagPickerMulti");
+  if (btn) {
+    btn.classList.toggle("is-active", state.tagPickerMultiSelect);
+    btn.setAttribute("aria-pressed", state.tagPickerMultiSelect ? "true" : "false");
+    btn.textContent = state.tagPickerMultiSelect ? "取消多选" : "多选";
+  }
+  const modal = $("tagPickerModal");
+  modal?.classList.toggle("is-multi", state.tagPickerMultiSelect);
+  syncTagPickerLinkBar();
+  if ($("tagPickerModal") && !$("tagPickerModal").hidden) {
+    renderTagPickerIndex({ keepScroll: true });
+  }
+}
+
+function syncTagPickerLinkBar() {
+  const btn = $("btnTagPickerLink");
+  if (!btn) return;
+  const n = (state.tagPickerSelectedKeys || []).length;
+  const show = !!state.tagPickerMultiSelect;
+  btn.hidden = !show;
+  btn.disabled = n !== 2;
+  btn.textContent =
+    n === 2 ? "关联这两组" : n === 1 ? "再选一组" : "勾选两组后关联";
+}
+
+function toggleTagPickerRowSelect(names) {
+  const key = groupKey(names);
+  if (!key) return;
+  let keys = [...(state.tagPickerSelectedKeys || [])];
+  const idx = keys.indexOf(key);
+  if (idx >= 0) {
+    keys.splice(idx, 1);
+  } else if (keys.length >= 2) {
+    toast("最多勾选两组", "err");
+    return;
+  } else {
+    keys.push(key);
+  }
+  state.tagPickerSelectedKeys = keys;
+  syncTagPickerLinkBar();
+  renderTagPickerIndex({ keepScroll: true });
+}
+
+async function linkSelectedTagGroups() {
+  const draft = state.taskTagsDraft;
+  if (!draft?.chatId) return;
+  const keys = state.tagPickerSelectedKeys || [];
+  if (keys.length !== 2) {
+    toast("请先勾选两组标签", "err");
+    return;
+  }
+  const q = (($("tagPickerSearch") && $("tagPickerSearch").value) || "")
+    .trim()
+    .replace(/^#+/, "")
+    .toLowerCase();
+  const rows = getTagPickerIndexRows(q);
+  const picked = [];
+  for (const row of rows) {
+    const names = (row.tags || []).map((t) => t.tag);
+    const key = groupKey(names);
+    if (keys.includes(key)) picked.push(names);
+  }
+  if (picked.length !== 2) {
+    toast("选中的组已变化，请重新勾选", "err");
+    setTagPickerMultiSelect(false);
+    return;
+  }
+  const union = [];
+  const seen = new Set();
+  for (const names of picked) {
+    for (const raw of names) {
+      const tag = normalizeTagName(raw);
+      if (!tag) continue;
+      const k = tag.toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      union.push(tag);
+    }
+  }
+  if (union.length < 2) {
+    toast("无法关联", "err");
+    return;
+  }
+  const btn = $("btnTagPickerLink");
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api(`/api/index/${encodeURIComponent(draft.chatId)}/tag-links`, {
+      method: "POST",
+      body: JSON.stringify({ tags: union }),
+    });
+    state.tagPickerManualLinks = Array.isArray(r.links) ? r.links : [];
+    toast("已关联两组标签", "ok");
+    setTagPickerMultiSelect(false);
+    await reloadTagPickerIndexData();
+  } catch (e) {
+    toast(e.message || "关联失败", "err");
+    syncTagPickerLinkBar();
+  }
+}
+
+async function unlinkManualTagLink(linkTags) {
+  const draft = state.taskTagsDraft;
+  if (!draft?.chatId || !linkTags?.length) return;
+  const ok = await confirmDialog({
+    title: "取消手动关联",
+    message: `确定取消这组手动关联吗？\n#${(linkTags || []).slice(0, 8).join(" #")}${
+      linkTags.length > 8 ? " …" : ""
+    }`,
+    confirmText: "取消关联",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const r = await api(`/api/index/${encodeURIComponent(draft.chatId)}/tag-links`, {
+      method: "DELETE",
+      body: JSON.stringify({ tags: linkTags }),
+    });
+    state.tagPickerManualLinks = Array.isArray(r.links) ? r.links : [];
+    toast("已取消手动关联", "ok");
+    await reloadTagPickerIndexData();
+  } catch (e) {
+    toast(e.message || "取消失败", "err");
+  }
+}
+
+async function reloadTagPickerIndexData() {
+  const draft = state.taskTagsDraft;
+  if (!draft?.chatId) return;
+  try {
+    const r = await api(`/api/index/${encodeURIComponent(draft.chatId)}/tags`);
+    state.tagPickerIndex = mergeNormalizedTagItems(
+      Array.isArray(r.tags) ? r.tags : []
+    );
+    state.tagPickerBundles = (Array.isArray(r.bundles) ? r.bundles : [])
+      .map((b) => ({
+        tags: stripBlacklistedTags(b.tags || []),
+        count: Number(b.count) || 0,
+        manual: !!b.manual,
+      }))
+      .filter((b) => b.tags.length);
+    state.tagPickerManualLinks = Array.isArray(r.manual_links)
+      ? r.manual_links
+      : [];
+    state._tagPickerRowsCache = null;
+    if (draft.groups) {
+      draft.groups = rebuildDraftGroupsFromTags(
+        draft.tags || [],
+        state.tagPickerBundles
+      );
+      syncDraftTagsFromGroups();
+    }
+    renderTagPickerApplied();
+    renderTagPickerIndex({ keepScroll: true });
+  } catch (e) {
+    toast(e.message || "刷新索引失败", "err");
+  }
 }
 
 function syncDraftTagsFromGroups() {
@@ -4083,19 +4422,14 @@ function renderBlacklistPanel() {
 async function addBlacklistTag() {
   const input = $("blTagInput");
   const raw = (input && input.value) || "";
-  const name = String(raw).trim().replace(/^#/, "");
+  const name = normalizeTagName(raw);
   if (!name) {
     setMsg($("blTagMsg"), "请输入标签名", "err");
     return;
   }
   await withBusy($("btnBlAdd"), async () => {
     try {
-      const r = await api("/api/settings/tag-blacklist", {
-        method: "POST",
-        body: JSON.stringify({ tag: name }),
-      });
-      applyTagBlacklist(r.tags || []);
-      renderBlacklistPanel();
+      await addTagToRelationBlacklist(name, { toastOk: false });
       if (input) input.value = "";
       setMsg($("blTagMsg"), `已添加 #${name}`, "ok");
       toast(`已加入黑名单 #${name}`, "ok");
@@ -4103,6 +4437,66 @@ async function addBlacklistTag() {
       setMsg($("blTagMsg"), e.message || String(e), "err");
     }
   });
+}
+
+/** Add tag to relation blacklist; refreshes picker rows when open. */
+async function addTagToRelationBlacklist(tag, opts = {}) {
+  const name = normalizeTagName(tag);
+  if (!name) return null;
+  const r = await api("/api/settings/tag-blacklist", {
+    method: "POST",
+    body: JSON.stringify({ tag: name }),
+  });
+  applyTagBlacklist(r.tags || []);
+  renderBlacklistPanel();
+  // Drop from current index picker cache so it disappears immediately
+  const key = name.toLowerCase();
+  state.tagPickerIndex = (state.tagPickerIndex || []).filter(
+    (t) => normalizeTagName(t.tag).toLowerCase() !== key
+  );
+  state.tagPickerBundles = (state.tagPickerBundles || [])
+    .map((b) => ({
+      ...b,
+      tags: (b.tags || []).filter((t) => normalizeTagName(t).toLowerCase() !== key),
+    }))
+    .filter((b) => (b.tags || []).length >= 1);
+  state._tagPickerRowsCache = null;
+  // Also pull out of current draft selection
+  const draft = state.taskTagsDraft;
+  if (draft?.groups) {
+    draft.groups = draft.groups
+      .map((g) => g.filter((t) => normalizeTagName(t).toLowerCase() !== key))
+      .filter((g) => g.length);
+    syncDraftTagsFromGroups();
+  }
+  if ($("tagPickerModal") && !$("tagPickerModal").hidden) {
+    renderTagPickerApplied();
+    renderTagPickerIndex({ keepScroll: true });
+    renderTagsModalSummary();
+  }
+  if (opts.toastOk !== false) toast(`已移入黑名单 #${name}`, "ok");
+  return r;
+}
+
+async function blacklistIndexTag(tag) {
+  const name = normalizeTagName(tag);
+  if (!name) return;
+  if (isBlacklistedTag(name)) {
+    toast(`#${name} 已在黑名单`, "ok");
+    return;
+  }
+  const ok = await confirmDialog({
+    title: "移入关联黑名单",
+    message: `将 #${name} 移入黑名单？\n移入后不再参与关联分组，可在「设置 → 黑名单」里恢复。`,
+    confirmText: "移入黑名单",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await addTagToRelationBlacklist(name);
+  } catch (e) {
+    toast(e.message || "移入黑名单失败", "err");
+  }
 }
 
 async function removeBlacklistTag(tag) {
@@ -4682,6 +5076,7 @@ function buildTagPickerRows(items, bundles) {
   const solos = [];
   for (const item of countBy.values()) {
     if (inBundle.has(item.tag.toLowerCase())) continue;
+    if (isBlacklistedTag(item.tag)) continue;
     solos.push({ kind: "solo", tags: [item], count: item.count });
   }
   solos.sort(
@@ -4693,7 +5088,7 @@ function buildTagPickerRows(items, bundles) {
 function getTagPickerIndexRows(q) {
   const index = state.tagPickerIndex || [];
   const bundles = state.tagPickerBundles || [];
-  const key = `${index.length}|${bundles.length}|${q || ""}`;
+  const key = `${index.length}|${bundles.length}|${(state.tagPickerManualLinks || []).length}|${q || ""}`;
   const cache = state._tagPickerRowsCache;
   if (cache && cache.key === key) return cache.rows;
   const rows = buildTagPickerRows(index, bundles);
@@ -4754,6 +5149,8 @@ function renderTagPickerIndex(opts = {}) {
 
   const start = (page - 1) * pageSize;
   const shownRows = visible.slice(start, start + pageSize);
+  const multi = !!state.tagPickerMultiSelect;
+  const selected = new Set(state.tagPickerSelectedKeys || []);
   host.innerHTML = shownRows
     .map((row, i) => {
       const group = [...row.tags].sort(
@@ -4761,6 +5158,9 @@ function renderTagPickerIndex(opts = {}) {
       );
       const isBundle = row.kind === "bundle";
       const names = group.map((t) => t.tag);
+      const rowKey = groupKey(names);
+      const isChecked = selected.has(rowKey);
+      const manualLink = findManualLinkForNames(names);
       const exactApplied = isBundle
         ? isDraftGroupApplied(names)
         : isTagApplied(names[0]);
@@ -4771,9 +5171,15 @@ function renderTagPickerIndex(opts = {}) {
           const hit = q && String(t.tag).toLowerCase().includes(q);
           return `<span class="tag-chip is-applied-chip${
             idx === 0 && isBundle ? " is-primary" : ""
-          }${hit ? " is-hit" : ""}" title="#${escapeHtml(t.tag)}">#${escapeHtml(
+          }${hit ? " is-hit" : ""}" data-tag="${escapeHtml(t.tag)}" title="#${escapeHtml(
             t.tag
-          )}</span>`;
+          )}"><span class="tag-chip-text">#${escapeHtml(
+            t.tag
+          )}</span><button type="button" class="tag-chip-bl" data-bl-tag="${escapeHtml(
+            t.tag
+          )}" title="移入黑名单" aria-label="移入黑名单 #${escapeHtml(
+            t.tag
+          )}">×</button></span>`;
         })
         .join("");
       let meta;
@@ -4788,25 +5194,73 @@ function renderTagPickerIndex(opts = {}) {
           ? `<span class="tag-meta-ok">已选</span>`
           : `<span class="tag-meta-c">${row.count}</span>`;
       }
-      return `<button type="button" class="tag-picker-row${
+      if (manualLink) {
+        meta += `<span class="tag-meta-manual">手动</span><button type="button" class="tag-manual-unlink" data-unlink="1" title="取消手动关联">取消关联</button>`;
+      }
+      const check = multi
+        ? `<span class="tag-picker-check" aria-hidden="true">${isChecked ? "✓" : ""}</span>`
+        : "";
+      return `<div role="button" tabindex="0" class="tag-picker-row${
         isBundle ? " tag-picker-bundle" : " tag-picker-solo"
-      }${exactApplied || allApplied ? " is-applied" : anyApplied ? " is-partial" : ""}" data-gidx="${i}">
+      }${exactApplied || allApplied ? " is-applied" : anyApplied ? " is-partial" : ""}${
+        multi ? " is-multi" : ""
+      }${isChecked ? " is-checked" : ""}${manualLink ? " is-manual" : ""}" data-gidx="${i}">
+        ${check}
         <span class="tag-bundle-mark${isBundle ? "" : " tag-bundle-mark-solo"}">${
           isBundle ? `${group.length} 关联` : "单标签"
         }</span>
         <div class="tag-chip-row">${chips}</div>
         <span class="tag-meta">${meta}</span>
-      </button>`;
+      </div>`;
     })
     .join("");
   syncTagPickerPager(visible.length, page, pageCount);
   syncTagPickerTabCounts();
+  syncTagPickerLinkBar();
   if (opts.keepScroll === false) host.scrollTop = 0;
-  host.querySelectorAll(".tag-picker-row[data-gidx]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const row = shownRows[Number(btn.dataset.gidx)];
+  // Delegate: avoid row toggle stealing the blacklist click
+  if (!host._blClickBound) {
+    host._blClickBound = true;
+    host.addEventListener(
+      "click",
+      (e) => {
+        const btn = e.target?.closest?.(".tag-chip-bl");
+        if (!btn || !host.contains(btn)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation?.();
+        blacklistIndexTag(btn.getAttribute("data-bl-tag") || "");
+      },
+      true
+    );
+  }
+  host.querySelectorAll(".tag-picker-row[data-gidx]").forEach((el) => {
+    const activate = (e) => {
+      if (e?.target?.closest?.(".tag-chip-bl")) return;
+      if (e?.target?.closest?.(".tag-manual-unlink")) {
+        e.preventDefault();
+        e.stopPropagation();
+        const row = shownRows[Number(el.dataset.gidx)];
+        if (!row?.tags?.length) return;
+        const link = findManualLinkForNames(row.tags.map((t) => t.tag));
+        if (link) unlinkManualTagLink(link);
+        return;
+      }
+      const row = shownRows[Number(el.dataset.gidx)];
       if (!row?.tags?.length) return;
-      toggleDraftTagGroup(row.tags.map((t) => t.tag));
+      const names = row.tags.map((t) => t.tag);
+      if (state.tagPickerMultiSelect) {
+        toggleTagPickerRowSelect(names);
+      } else {
+        toggleDraftTagGroup(names);
+      }
+    };
+    el.addEventListener("click", activate);
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        activate(e);
+      }
     });
   });
 }
@@ -4907,12 +5361,13 @@ async function openTagPicker() {
   tagsModal?.querySelector(".tags-panel")?.classList.remove("is-loading");
 
   modal.hidden = false;
-  document.body.classList.add("confirm-open");
+  syncConfirmOpenClass();
   if ($("tagPickerSearch")) $("tagPickerSearch").value = "";
   if ($("tagPickerInput")) $("tagPickerInput").value = "";
   closeTagPickerSuggest();
   state.tagPickerIndexPage = 1;
   state._tagPickerRowsCache = null;
+  setTagPickerMultiSelect(false);
   // Default to index page (mobile tabs); desktop still shows both columns
   switchTagPickerPage("index");
   renderTagPickerApplied();
@@ -4930,14 +5385,26 @@ async function openTagPicker() {
     const r = await api(`/api/index/${encodeURIComponent(draft.chatId)}/tags`, {
       signal: ctrl ? ctrl.signal : undefined,
     });
-    state.tagPickerIndex = Array.isArray(r.tags) ? r.tags : [];
-    state.tagPickerBundles = Array.isArray(r.bundles) ? r.bundles : [];
+    state.tagPickerIndex = mergeNormalizedTagItems(
+      Array.isArray(r.tags) ? r.tags : []
+    );
+    state.tagPickerBundles = (Array.isArray(r.bundles) ? r.bundles : [])
+      .map((b) => ({
+        tags: stripBlacklistedTags(b.tags || []),
+        count: Number(b.count) || 0,
+        manual: !!b.manual,
+      }))
+      .filter((b) => b.tags.length);
+    state.tagPickerManualLinks = Array.isArray(r.manual_links)
+      ? r.manual_links
+      : [];
     state.tagPickerRelated = {};
     state._tagPickerRowsCache = null;
   } catch (e) {
     loadOk = false;
     state.tagPickerIndex = [];
     state.tagPickerBundles = [];
+    state.tagPickerManualLinks = [];
     state.tagPickerRelated = {};
     state._tagPickerRowsCache = null;
     const msg =
@@ -4979,11 +5446,11 @@ async function openTagPicker() {
 function closeTagPicker() {
   const modal = $("tagPickerModal");
   if (modal) modal.hidden = true;
-  $("tagsModal")?.classList.remove("under-picker");
-  // Keep body lock if task-settings modal is still open underneath
-  if ($("tagsModal")?.hidden !== false) {
-    document.body.classList.remove("confirm-open");
-  }
+  const tagsModal = $("tagsModal");
+  tagsModal?.classList.remove("under-picker");
+  tagsModal?.querySelector(".tags-panel")?.classList.remove("is-loading");
+  setTagPickerMultiSelect(false);
+  syncConfirmOpenClass();
   closeTagPickerSuggest();
   renderTagsModalSummary();
 }
@@ -5085,12 +5552,20 @@ async function openTaskTagsModal(taskId, opts = {}) {
   const panel = modal.querySelector(".tags-panel");
   const id = String(taskId);
 
+  // Clear stuck iOS overlays from a previous picker / failed load
+  modal.classList.remove("under-picker");
+  panel?.classList.remove("is-loading");
+  const picker = $("tagPickerModal");
+  if (picker && !picker.hidden) {
+    picker.hidden = true;
+  }
+
   // Instant paint from the already-loaded task list — do not wait on GET /tasks/{id}
   let task = (state.tasks || []).find((t) => String(t.id) === id) || null;
 
   if (!opts.keepOpen || modal.hidden) {
     modal.hidden = false;
-    document.body.classList.add("confirm-open");
+    syncConfirmOpenClass();
   }
 
   if (task) {
@@ -5114,6 +5589,7 @@ async function openTaskTagsModal(taskId, opts = {}) {
     task = null;
   } finally {
     panel?.classList.remove("is-loading");
+    modal.classList.remove("under-picker");
   }
   if (!task) {
     toast("加载任务失败", "err");

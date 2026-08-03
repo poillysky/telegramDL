@@ -386,6 +386,25 @@ html.touch-ui.boot-app body {
   overflow-y: auto !important;
   -webkit-overflow-scrolling: touch;
 }
+/* Must beat overflow-y:auto !important above — otherwise 任务设置 scrolls the page under */
+html.touch-ui.boot-app:has(body.confirm-open),
+html.touch-ui.boot-app:has(body.modal-open),
+html.touch-ui.boot-app:has(body.drawer-open),
+html.touch-ui.boot-app body.confirm-open,
+html.touch-ui.boot-app body.modal-open,
+html.touch-ui.boot-app body.drawer-open {
+  overflow: hidden !important;
+  overscroll-behavior: none !important;
+  height: 100dvh !important;
+  max-height: 100dvh !important;
+  touch-action: none;
+}
+html.touch-ui.boot-app body.confirm-open #app,
+html.touch-ui.boot-app body.modal-open #app,
+html.touch-ui.boot-app body.drawer-open #app {
+  pointer-events: none !important;
+  touch-action: none !important;
+}
 html.touch-ui.boot-app #app.shell {
   height: auto !important;
   min-height: 100dvh;
@@ -936,8 +955,11 @@ button {
   touch-action: manipulation;
 }
 
-button:hover { transform: translateY(-1px); }
-button:active { transform: translateY(0); }
+/* Hover lift only on fine pointers — touch sticky-hover caused 1px button drift */
+@media (hover: hover) and (pointer: fine) {
+  button:hover { transform: translateY(-1px); }
+}
+button:active { transform: none; }
 button.primary {
   background: linear-gradient(180deg, #4b8ff5 0%, var(--accent) 100%);
   color: #ffffff;
@@ -1088,6 +1110,7 @@ button:disabled {
 }
 /* Status text on row 1, action buttons on row 2 */
 .index-panel-row {
+  display: flex;
   flex-direction: column;
   flex-wrap: nowrap;
   align-items: stretch;
@@ -1099,6 +1122,13 @@ button:disabled {
   border: 1px solid rgba(59, 130, 246, 0.28);
   background: rgba(243, 246, 250, 0.95);
   transition: border-color 0.15s ease, background 0.15s ease;
+}
+/* Nested index card: flatten when already inside a section card */
+.tags-modal-section .index-panel-row {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  border-radius: 0;
 }
 .index-panel-row:has(#tagsModalAutoIndex:checked) {
   border-color: rgba(59, 130, 246, 0.28);
@@ -1650,18 +1680,36 @@ button:disabled {
 }
 
 .tags-modal .tags-panel {
+  /* Unified spacing — children use these, avoid one-off patches */
+  --tags-gutter: clamp(18px, 3.2vw, 28px);
+  --tags-stack: 14px;
+  --tags-card-pad: 14px;
+  --tags-soft-radius: 14px;
   position: relative;
+  display: flex;
+  flex-direction: column;
   width: min(760px, 96vw);
-  max-height: min(98vh, 946px);
-  overflow: auto;
-  padding: 22px 24px 18px;
+  max-height: min(100vh, 1041px);
+  overflow: hidden;
+  padding: 0;
 }
 .tags-modal-head {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
   gap: 12px;
-  margin-bottom: 14px;
+  flex-shrink: 0;
+  margin: 0;
+  padding: 20px var(--tags-gutter) 12px;
+}
+.tags-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding: 4px var(--tags-gutter) 8px;
+  box-sizing: border-box;
 }
 .tags-modal-head-text {
   flex: 1 1 auto;
@@ -1728,9 +1776,9 @@ button:disabled {
   display: none !important;
 }
 .tags-modal-more {
-  margin: 0 0 12px;
+  margin: 0 0 var(--tags-stack, 14px);
   padding: 0;
-  border-radius: 12px;
+  border-radius: var(--tags-soft-radius, 14px);
   border: 1px solid rgba(47, 127, 240, 0.22);
   background: linear-gradient(180deg, #ffffff 0%, #f5f9ff 100%);
   overflow: hidden;
@@ -1824,7 +1872,7 @@ button:disabled {
   border-radius: 10px;
   border: 1px solid rgba(148, 163, 184, 0.28);
   background: #ffffff;
-  font-size: 0.88rem;
+  font-size: 16px;
   font-weight: 600;
   color: var(--ink);
 }
@@ -1901,7 +1949,7 @@ button:disabled {
   border: 0;
   border-radius: 6px;
   background: transparent;
-  font-size: 0.86rem;
+  font-size: 16px;
   font-weight: 600;
   color: var(--ink);
   box-shadow: none;
@@ -1958,16 +2006,24 @@ button:disabled {
   margin-top: 6px;
 }
 .tags-modal-section {
-  margin-bottom: 14px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--line);
+  margin: 0 0 var(--tags-stack, 14px);
+  padding: var(--tags-card-pad, 14px);
+  border-radius: var(--tags-soft-radius, 14px);
+  border: 1px solid rgba(35, 50, 70, 0.08);
+  background:
+    linear-gradient(160deg, rgba(35, 50, 70, 0.03), transparent 48%),
+    rgba(255, 255, 255, 0.92);
+  box-shadow: 0 4px 14px rgba(30, 58, 95, 0.04);
+}
+.tags-modal-section:last-child {
+  margin-bottom: 4px;
 }
 .tags-modal-section-title {
   font-size: 0.72rem;
   font-weight: 650;
   letter-spacing: 0.04em;
   color: var(--muted);
-  margin-bottom: 8px;
+  margin: 0 0 10px;
 }
 .tags-modal-empty-hint {
   margin: 0 0 10px;
@@ -1988,7 +2044,7 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin: 0 0 12px;
+  margin: 0;
   padding: 12px 14px;
   border-radius: 12px;
   border: 1px solid rgba(59, 130, 246, 0.28);
@@ -2046,13 +2102,19 @@ button:disabled {
 }
 
 /* —— Tag picker dual table —— */
-.tag-picker-modal {
-  z-index: 140;
+/* Above 任务设置(.confirm-modal 400)，below 确认框(#confirmModal 520) */
+.tag-picker-modal,
+#tagPickerModal.confirm-modal {
+  z-index: 460 !important;
+  padding-left: max(28px, 3.5vw);
+  padding-right: max(28px, 3.5vw);
+  box-sizing: border-box;
 }
-/* 打开标签选择时，下层任务设置不再拦截点击 */
-.tags-modal.under-picker {
-  pointer-events: none !important;
+#tagPickerModal[hidden],
+.tag-picker-modal[hidden] {
+  display: none !important;
 }
+/* Do NOT use pointer-events:none on 任务设置 — iOS often leaves it stuck unclickable */
 /* Desktop: tabs hidden (two columns shown) */
 .tag-picker-tabs {
   display: none;
@@ -2067,20 +2129,147 @@ button:disabled {
 }
 /* Beat .confirm-panel { width: 420px } — was capping the picker */
 .tag-picker-modal .tag-picker-panel {
-  width: min(920px, 96vw);
+  --picker-gutter: clamp(24px, 3vw, 36px);
+  --tags-gutter: var(--picker-gutter); /* head / actions reuse this */
+  width: min(1100px, 100%);
+  max-width: 100%;
   max-height: min(88vh, 720px);
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  padding: 18px 18px 14px;
+  padding: 18px var(--picker-gutter) 14px;
+  box-sizing: border-box;
+}
+.tag-picker-modal .tags-modal-head {
+  margin-inline: 0;
+  padding-inline: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+.tag-picker-modal .tags-modal-head-text {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.tag-picker-modal .section-kicker,
+.tag-picker-modal .tags-modal-sub {
+  max-width: 100%;
+  box-sizing: border-box;
 }
 .tag-picker-grid {
   display: grid;
-  grid-template-columns: minmax(220px, 0.9fr) minmax(360px, 1.55fr);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px;
   min-height: 0;
   flex: 1;
-  margin-bottom: 12px;
+  margin: 0 0 12px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.tag-picker-modal .tag-picker-tabs {
+  margin-inline: 0;
+  padding-inline: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+.tag-picker-modal .tags-modal-actions {
+  margin-inline: calc(-1 * var(--picker-gutter, 24px));
+  margin-bottom: -14px;
+  padding: 12px var(--picker-gutter, 24px) 14px;
+  width: auto;
+  box-sizing: border-box;
+  border-top: 1px solid var(--line);
+}
+.tag-picker-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+  align-items: center;
+}
+.tag-picker-actions #btnTagPickerLink:not([hidden]) {
+  margin-right: auto;
+}
+.tag-picker-col-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tag-picker-col-head #tagPickerSearch {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+.tag-picker-multi-btn {
+  flex: 0 0 auto;
+  min-height: 36px !important;
+  padding: 0 12px !important;
+  font-size: 0.82rem !important;
+}
+.tag-picker-multi-btn.is-active {
+  background: var(--accent-soft) !important;
+  color: var(--accent-hover) !important;
+  border-color: rgba(47, 127, 240, 0.35) !important;
+}
+.tag-picker-row.is-multi,
+#tagPickerIndex .tag-picker-row.is-multi,
+#tagPickerApplied .tag-picker-row.is-multi {
+  grid-template-columns: 22px auto minmax(0, 1fr) auto;
+  padding-left: 8px;
+}
+.tag-picker-check {
+  flex: 0 0 22px;
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  max-width: 22px;
+  align-self: start;
+  justify-self: start;
+  border-radius: 6px;
+  border: 1.5px solid rgba(47, 127, 240, 0.45);
+  background: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: #fff;
+  margin-top: 2px;
+  box-sizing: border-box;
+}
+.tag-picker-row.is-checked .tag-picker-check {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.tag-picker-row.is-checked {
+  border-color: rgba(47, 127, 240, 0.45);
+  background: rgba(47, 127, 240, 0.06);
+}
+.tag-meta-manual {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(217, 119, 6, 0.14);
+  color: #b45309;
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+.tag-manual-unlink {
+  border: 0;
+  background: transparent;
+  color: #b42334;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 2px 4px;
+  cursor: pointer;
+  min-height: 0 !important;
+  transform: none !important;
+}
+.tag-manual-unlink:hover {
+  text-decoration: underline;
+  transform: none !important;
 }
 .tag-picker-col {
   display: flex;
@@ -2122,6 +2311,13 @@ button:disabled {
   flex-direction: column;
   gap: 6px;
 }
+.tag-picker-list > .tag-picker-row {
+  /* Avoid flex-column min-height:auto collapsing wrapped chips */
+  flex: 0 0 auto;
+  align-self: stretch;
+  min-height: min-content;
+  height: auto;
+}
 .tag-picker-list.tag-picker-index {
   min-height: 160px;
 }
@@ -2155,11 +2351,14 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 .tag-picker-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+  /* Grid — not flex: <button> + flex-wrap fails to grow height in Chromium */
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 10px;
+  row-gap: 0;
   width: 100%;
+  height: auto;
   min-height: 40px;
   padding: 8px 10px;
   border-radius: 10px;
@@ -2169,6 +2368,9 @@ button:disabled {
   font-size: 0.84rem;
   text-align: left;
   cursor: pointer;
+  box-sizing: border-box;
+  -webkit-appearance: none;
+  appearance: none;
 }
 .tag-picker-row:hover {
   background: rgba(59, 130, 246, 0.08);
@@ -2184,7 +2386,7 @@ button:disabled {
   background: rgba(59, 130, 246, 0.06);
 }
 .tag-picker-bundle {
-  align-items: flex-start;
+  align-items: start;
   padding: 9px 10px;
   border-color: rgba(20, 184, 166, 0.22);
   background: linear-gradient(180deg, #ffffff 0%, #f2faf8 100%);
@@ -2213,9 +2415,11 @@ button:disabled {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  align-content: flex-start;
   gap: 5px 6px;
   min-width: 0;
-  flex: 1;
+  width: 100%;
+  height: auto;
   overflow: visible;
 }
 .tag-picker-solo .tag-chip-row {
@@ -2224,7 +2428,12 @@ button:disabled {
 }
 .tag-bundle-mark {
   flex: 0 0 auto;
-  align-self: flex-start;
+  align-self: start;
+  justify-self: start;
+  width: max-content;
+  max-width: max-content;
+  min-width: max-content;
+  height: auto;
   margin-top: 2px;
   padding: 3px 7px;
   border-radius: 6px;
@@ -2235,6 +2444,7 @@ button:disabled {
   letter-spacing: 0.04em;
   line-height: 1.2;
   white-space: nowrap;
+  box-sizing: border-box;
 }
 .tag-chip-link {
   flex: 0 0 auto;
@@ -2289,13 +2499,18 @@ button:disabled {
 #tagPickerIndex .tag-picker-row,
 #tagPickerApplied .tag-picker-row {
   position: relative;
-  align-items: flex-start;
-  gap: 10px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 10px;
+  height: auto;
+  max-height: none;
   padding: 8px 12px;
   border-radius: 12px;
   border-color: rgba(148, 163, 184, 0.28);
   background: #ffffff;
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+  overflow: visible;
 }
 #tagPickerIndex .tag-picker-solo,
 #tagPickerApplied .tag-picker-solo {
@@ -2305,6 +2520,7 @@ button:disabled {
 }
 #tagPickerIndex .tag-picker-bundle,
 #tagPickerApplied .tag-picker-bundle {
+  align-items: flex-start;
   border-color: rgba(20, 184, 166, 0.24);
   background: linear-gradient(180deg, #ffffff 0%, #f1faf7 100%);
 }
@@ -2326,23 +2542,26 @@ button:disabled {
   padding: 8px 10px;
   border-color: rgba(148, 163, 184, 0.28);
   background: #ffffff;
-  align-items: center;
+  align-items: flex-start;
 }
 #tagPickerApplied .tag-picker-bundle,
 #tagPickerApplied .tag-picker-bundle.is-applied {
   border-color: rgba(20, 184, 166, 0.24);
   background: linear-gradient(180deg, #ffffff 0%, #f1faf7 100%);
-  align-items: center;
+  align-items: flex-start;
 }
 #tagPickerIndex .tag-bundle-mark,
 #tagPickerApplied .tag-bundle-mark {
   flex: 0 0 auto;
-  align-self: flex-start;
+  align-self: start;
+  justify-self: start;
+  width: max-content;
+  min-width: max-content;
   margin-top: 3px;
 }
 #tagPickerApplied .tag-bundle-mark {
-  align-self: center;
-  margin-top: 0;
+  align-self: flex-start;
+  margin-top: 3px;
 }
 #tagPickerIndex .tag-chip-row,
 #tagPickerApplied .tag-chip-row,
@@ -2352,9 +2571,13 @@ button:disabled {
   flex-direction: row;
   flex-wrap: wrap;
   align-items: center;
+  align-content: flex-start;
   gap: 5px 6px;
   min-width: 0;
-  flex: 1 1 auto;
+  width: 100%;
+  flex: unset;
+  height: auto;
+  max-height: none;
   overflow: visible;
 }
 #tagPickerIndex .tag-chip,
@@ -2366,20 +2589,78 @@ button:disabled {
 #tagPickerApplied .tag-chip.is-in-bundle {
   display: inline-flex;
   align-items: center;
+  gap: 2px;
   flex: 0 1 auto;
-  max-width: min(100%, 220px);
+  max-width: min(100%, 240px);
+  height: 26px;
+  min-height: 26px;
+  max-height: 26px;
   margin: 0;
-  padding: 4px 9px;
+  padding: 0 3px 0 8px;
   border-radius: 999px;
   border: 1px solid rgba(47, 127, 240, 0.22);
   background: rgba(47, 127, 240, 0.08);
   color: #2563eb;
-  font-size: 0.8rem;
+  font-size: 0.76rem;
   font-weight: 600;
-  line-height: 1.25;
+  line-height: 1;
   white-space: nowrap;
   overflow: hidden;
+  box-sizing: border-box;
+}
+#tagPickerIndex .tag-chip-text,
+#tagPickerApplied .tag-chip-text {
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 26px;
+}
+#tagPickerIndex .tag-chip-bl {
+  flex: 0 0 auto;
+  align-self: center !important;
+  position: relative;
+  z-index: 2;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 18px !important;
+  height: 18px !important;
+  min-width: 18px !important;
+  min-height: 18px !important;
+  max-width: 18px !important;
+  max-height: 18px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: none !important;
+  border-radius: 999px !important;
+  background: transparent !important;
+  color: #94a3b8 !important;
+  font: 500 13px/18px system-ui, "Segoe UI", sans-serif !important;
+  letter-spacing: 0 !important;
+  text-align: center !important;
+  box-shadow: none !important;
+  transform: none !important;
+  cursor: pointer;
+  opacity: 0.7;
+  touch-action: manipulation;
+  pointer-events: auto !important;
+}
+#tagPickerIndex .tag-chip-bl:hover,
+#tagPickerIndex .tag-chip-bl:active,
+#tagPickerIndex .tag-chip-bl:focus-visible {
+  transform: none !important;
+}
+#tagPickerIndex .tag-chip:hover .tag-chip-bl,
+#tagPickerIndex .tag-chip-bl:focus-visible {
+  opacity: 1;
+  color: #b42334;
+  background: rgba(255, 107, 122, 0.12);
+}
+#tagPickerIndex .tag-chip-bl:hover {
+  opacity: 1;
+  color: #b42334;
+  background: rgba(255, 107, 122, 0.18);
 }
 #tagPickerIndex .tag-chip.is-primary,
 #tagPickerApplied .tag-chip.is-primary {
@@ -2389,7 +2670,8 @@ button:disabled {
 #tagPickerApplied .tag-remove {
   position: static;
   flex: 0 0 34px;
-  align-self: center;
+  align-self: flex-start;
+  margin-top: 2px;
   display: inline-flex !important;
   align-items: center;
   justify-content: center;
@@ -2554,29 +2836,38 @@ button:disabled {
 
 /* —— Tag picker: phone = two pages (已应用 / 库内索引) —— */
 @media (max-width: 820px) {
-  .tag-picker-modal {
-    padding: 0;
-    align-items: stretch;
-    justify-content: stretch;
+  /* 外框贴边：盖过 .confirm-modal 的左右 padding */
+  .tag-picker-modal,
+  #tagPickerModal.confirm-modal {
+    padding: 0 !important;
+    align-items: stretch !important;
+    justify-content: stretch !important;
   }
   .tag-picker-modal .tag-picker-panel {
+    --picker-gutter: 16px;
+    --tags-gutter: 16px;
     width: 100% !important;
     max-width: 100% !important;
     height: 100%;
     height: 100dvh;
     max-height: 100dvh;
-    border-radius: 0;
-    border: 0;
-    padding: calc(10px + var(--safe-top)) 12px 0;
+    margin: 0 !important;
+    border-radius: 0 !important;
+    border: 0 !important;
+    /* 外框贴边，内边距只留安全区上下；左右间隙交给内部元素 */
+    padding: calc(10px + var(--safe-top)) 0 0 !important;
     overflow: hidden;
     display: flex;
     flex-direction: column;
-    box-shadow: none;
+    box-shadow: none !important;
   }
   .tag-picker-modal .tags-modal-head {
     flex-shrink: 0;
-    margin-bottom: 8px;
+    margin: 0 var(--picker-gutter) 8px;
     padding-top: 12px;
+    padding-inline: 0;
+    width: auto;
+    box-sizing: border-box;
   }
   .tag-picker-modal .tags-modal-title-row {
     margin-top: 4px;
@@ -2598,14 +2889,16 @@ button:disabled {
     box-shadow: var(--shadow-soft);
   }
 
-  /* Tab bar */
+  /* Tab bar — 内边框留间隙 */
   .tag-picker-tabs {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 6px;
     flex-shrink: 0;
-    margin: 0 0 10px;
+    margin: 0 var(--picker-gutter) 10px;
     padding: 4px;
+    width: auto;
+    box-sizing: border-box;
     border-radius: 12px;
     border: 1px solid var(--line);
     background: var(--surface-2);
@@ -2652,13 +2945,15 @@ button:disabled {
     color: #ffffff;
   }
 
-  /* Only one page visible at a time */
+  /* Only one page visible at a time — 内边框留间隙 */
   .tag-picker-grid {
     display: block;
     position: relative;
     flex: 1 1 auto;
     min-height: 0;
-    margin-bottom: 0;
+    margin: 0 var(--picker-gutter, 16px) 0;
+    width: auto;
+    box-sizing: border-box;
     overflow: hidden;
   }
   .tag-picker-page {
@@ -2722,12 +3017,15 @@ button:disabled {
   #tagPickerIndex .tag-picker-row,
   #tagPickerApplied .tag-picker-row {
     position: relative !important;
-    display: flex !important;
-    flex-direction: row !important;
-    align-items: flex-start !important;
-    justify-content: space-between !important;
-    gap: 10px !important;
+    display: grid !important;
+    grid-template-columns: auto minmax(0, 1fr) auto !important;
+    align-items: start !important;
+    justify-content: unset !important;
+    column-gap: 10px !important;
+    row-gap: 0 !important;
     width: 100% !important;
+    height: auto !important;
+    max-height: none !important;
     min-height: 44px !important;
     margin: 0 0 8px !important;
     padding: 8px 12px !important;
@@ -2736,15 +3034,38 @@ button:disabled {
     background: #ffffff !important;
     box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04) !important;
     box-sizing: border-box;
-    overflow: hidden !important;
+    overflow: visible !important;
     transform: none !important;
     flex: none !important;
+  }
+  #tagPickerIndex .tag-picker-row.is-multi,
+  #tagPickerApplied .tag-picker-row.is-multi {
+    grid-template-columns: 22px auto minmax(0, 1fr) auto !important;
+    padding-left: 8px !important;
+  }
+  #tagPickerIndex .tag-picker-row.is-multi .tag-bundle-mark,
+  #tagPickerApplied .tag-picker-row.is-multi .tag-bundle-mark {
+    align-self: start !important;
+    justify-self: start !important;
+    width: max-content !important;
+    min-width: max-content !important;
+    max-width: none !important;
+    height: auto !important;
+  }
+  #tagPickerIndex .tag-picker-row.is-multi .tag-picker-check,
+  #tagPickerApplied .tag-picker-row.is-multi .tag-picker-check {
+    align-self: start !important;
+    justify-self: start !important;
+    width: 22px !important;
+    min-width: 22px !important;
+    max-width: 22px !important;
+    height: 22px !important;
   }
   #tagPickerApplied .tag-picker-row,
   #tagPickerApplied .tag-picker-solo,
   #tagPickerApplied .tag-picker-bundle,
   #tagPickerApplied .tag-picker-row.is-applied {
-    align-items: center !important;
+    align-items: start !important;
   }
   #tagPickerIndex .tag-picker-solo,
   #tagPickerApplied .tag-picker-solo,
@@ -2785,8 +3106,8 @@ button:disabled {
     margin-top: 3px !important;
   }
   #tagPickerApplied .tag-bundle-mark {
-    align-self: center !important;
-    margin-top: 0 !important;
+    align-self: flex-start !important;
+    margin-top: 3px !important;
   }
   #tagPickerIndex .tag-chip-row,
   #tagPickerApplied .tag-chip-row,
@@ -2796,9 +3117,13 @@ button:disabled {
     flex-direction: row !important;
     flex-wrap: wrap !important;
     align-items: center !important;
+    align-content: flex-start !important;
     gap: 5px 6px !important;
     min-width: 0 !important;
-    flex: 1 1 auto !important;
+    width: 100% !important;
+    flex: unset !important;
+    height: auto !important;
+    max-height: none !important;
     margin: 0;
     padding: 0;
     overflow: visible !important;
@@ -2884,10 +3209,12 @@ button:disabled {
   .tag-picker-modal .tags-modal-actions {
     flex-shrink: 0;
     flex-direction: column;
-    margin: 0;
-    padding: 10px 0 calc(12px + var(--safe-bottom));
+    margin: 0 !important;
+    padding: 10px var(--picker-gutter, 16px) calc(12px + var(--safe-bottom)) !important;
     border-top: 1px solid var(--line);
     background: #ffffff;
+    box-sizing: border-box;
+    width: 100%;
   }
   .tag-picker-modal .tags-modal-actions button {
     width: 100%;
@@ -2923,8 +3250,55 @@ button:disabled {
   margin-bottom: 10px;
 }
 .tags-modal-actions {
-  margin-top: 4px;
-  padding-top: 12px;
+  flex-shrink: 0;
+  margin: 0;
+  padding: 12px var(--tags-gutter, 22px) calc(16px + var(--safe-bottom));
+  border-top: 1px solid rgba(35, 50, 70, 0.08);
+  background: linear-gradient(180deg, rgba(247, 249, 252, 0.92), #ffffff 40%);
+  gap: 10px;
+  box-sizing: border-box;
+  width: 100%;
+}
+/* Task settings footer: in-flow flex (absolute jumped to top on iOS) */
+#tagsModal .tags-panel {
+  --tags-actions-h: 0px;
+}
+#tagsModal .tags-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding: 4px var(--tags-gutter) 8px;
+  box-sizing: border-box;
+}
+#tagsModal .tags-modal-body > .tags-modal-section:last-child {
+  margin-bottom: 8px;
+}
+#tagsModal .confirm-actions.tags-modal-actions {
+  position: relative;
+  left: auto;
+  right: auto;
+  bottom: auto;
+  top: auto;
+  flex-shrink: 0;
+  z-index: 6;
+  margin: 0;
+  width: 100%;
+  box-sizing: border-box;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 12px var(--tags-gutter, 22px) 24px;
+  border-top: 1px solid rgba(35, 50, 70, 0.08);
+  background: #ffffff;
+  pointer-events: auto;
+}
+#tagsModal #btnTagsModalSave {
+  width: 80%;
+  max-width: 80%;
+  margin: 0;
+  flex: 0 0 auto;
 }
 
 .tag-cloud-toolbar {
@@ -2972,7 +3346,9 @@ button:disabled {
   color: var(--muted);
   margin-left: 2px;
 }
-.tag-pill:hover { transform: translateY(-1px); }
+@media (hover: hover) and (pointer: fine) {
+  .tag-pill:hover { transform: translateY(-1px); }
+}
 .tag-pill.is-active {
   border-color: rgba(59, 130, 246, 0.55);
   background: var(--accent-dim);
@@ -3050,7 +3426,9 @@ button:disabled {
   border-color: rgba(59, 130, 246, 0.5);
   background: var(--accent-dim);
 }
-.chip:hover { transform: translateY(-1px); }
+@media (hover: hover) and (pointer: fine) {
+  .chip:hover { transform: translateY(-1px); }
+}
 .chip input { accent-color: var(--accent); width: 16px; height: 16px; }
 
 .check {
@@ -3147,6 +3525,23 @@ button:disabled {
   box-shadow: none !important;
   outline: none;
   padding: 0 2px 18px;
+}
+@media (max-width: 820px), (hover: none) and (pointer: coarse) {
+  /* 任务卡片与手机边框左右留一点间隙 */
+  .page-tasks .tasks {
+    padding-inline: 10px;
+    padding-bottom: 20px;
+    box-sizing: border-box;
+  }
+  .page-tasks .tasks-toolbar {
+    padding-inline: 10px;
+    box-sizing: border-box;
+  }
+  .page-tasks .tasks > .task {
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
 }
 .page-tasks .tasks::before,
 .page-tasks .tasks::after {
@@ -3420,12 +3815,14 @@ button:disabled {
 .task[data-status="completed"] { --task-accent: #16a34a; }
 .task[data-status="failed"] { --task-accent: #ef4444; }
 
-.task:hover {
-  border-color: color-mix(in srgb, var(--task-accent) 45%, rgba(148, 163, 184, 0.35));
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.85) inset,
-    0 12px 32px rgba(15, 23, 42, 0.08);
-  transform: translateY(-1px);
+@media (hover: hover) and (pointer: fine) {
+  .task:hover {
+    border-color: color-mix(in srgb, var(--task-accent) 45%, rgba(148, 163, 184, 0.35));
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.85) inset,
+      0 12px 32px rgba(15, 23, 42, 0.08);
+    transform: translateY(-1px);
+  }
 }
 
 .task-head {
@@ -3771,6 +4168,11 @@ button:disabled {
   justify-content: center;
   gap: 6px;
   font-size: 0.88rem;
+  transform: none;
+}
+.task-actions button:hover,
+.task-actions button:active {
+  transform: none;
 }
 .task-actions button[hidden] {
   display: none !important;
@@ -5360,7 +5762,8 @@ img.history-preview-media {
   filter: brightness(1.05);
 }
 .history-preview-done:active {
-  transform: translateY(1px);
+  transform: none;
+  filter: brightness(0.97);
 }
 
 @media (hover: none) and (pointer: coarse) {
@@ -5687,15 +6090,21 @@ body:has(#stageLogin:not([hidden])) .login-card {
   transition: border-color 0.18s ease, background 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
 }
 
-.account-chip:hover {
-  border-color: rgba(59, 130, 246, 0.35);
-  background: var(--accent-soft);
-  box-shadow: var(--shadow);
-  transform: translateY(-1px);
+@media (hover: hover) and (pointer: fine) {
+  .account-chip:hover {
+    border-color: rgba(59, 130, 246, 0.35);
+    background: var(--accent-soft);
+    box-shadow: var(--shadow);
+    transform: translateY(-1px);
+  }
+  .account-chip:hover .account-chip-chevron {
+    opacity: 0.85;
+    transform: translateX(1px);
+  }
 }
 
 .account-chip:active {
-  transform: translateY(0);
+  transform: none;
 }
 
 .account-chip.is-online {
@@ -5828,11 +6237,6 @@ body:has(#stageLogin:not([hidden])) .login-card {
     no-repeat center / 10px 10px
     url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%238b9cb0' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.5 2.5 8 6l-3.5 3.5'/%3E%3C/svg%3E");
   transition: opacity 0.18s ease, transform 0.18s ease;
-}
-
-.account-chip:hover .account-chip-chevron {
-  opacity: 0.85;
-  transform: translateX(1px);
 }
 
 /* —— Account drawer ——
@@ -6325,6 +6729,13 @@ body:has(#stageLogin:not([hidden])) .login-card {
   align-items: center;
   justify-content: center;
   gap: 6px;
+  transform: none;
+}
+.drawer-panel .settings-inline-actions .ghost:hover,
+.drawer-panel .settings-inline-actions .primary:hover,
+.drawer-panel .settings-inline-actions .ghost:active,
+.drawer-panel .settings-inline-actions .primary:active {
+  transform: none;
 }
 .drawer-panel .settings-inline-actions .ui-ico {
   width: 14px;
@@ -6426,15 +6837,55 @@ body:has(#stageLogin:not([hidden])) .login-card {
 .account-actions {
   display: flex;
   flex-direction: column;
+  flex-shrink: 0;
   gap: 10px;
   margin-top: var(--drawer-stack, 14px);
   padding-top: var(--drawer-stack, 14px);
   border-top: 1px solid var(--line);
 }
+.account-actions button.wide {
+  width: 100%;
+  box-sizing: border-box;
+}
+.drawer-panel .account-actions button:hover,
+.drawer-panel .account-actions button:active {
+  transform: none;
+}
 
 body.drawer-open,
 body.modal-open,
-body.confirm-open { overflow: hidden; }
+body.confirm-open {
+  overflow: hidden !important;
+  overscroll-behavior: none;
+}
+
+/* Block underlying UI while overlays are open (clicks were still hitting #app on iOS) */
+body.drawer-open #app,
+body.modal-open #app,
+body.confirm-open #app {
+  pointer-events: none !important;
+}
+body.drawer-open .drawer,
+body.modal-open .modal,
+body.modal-open .confirm-modal,
+body.confirm-open .confirm-modal,
+body.confirm-open .drawer {
+  pointer-events: auto !important;
+}
+
+.confirm-modal:not([hidden]) {
+  touch-action: none;
+  overscroll-behavior: none;
+  -webkit-overflow-scrolling: auto;
+}
+.confirm-modal .tags-modal-body,
+.confirm-modal .tag-picker-cols,
+.confirm-modal .tag-picker-col,
+.confirm-modal .queue-modal-body,
+#tagsModal .tags-modal-body {
+  touch-action: pan-y !important;
+  overscroll-behavior: contain !important;
+}
 
 /* —— App confirm / alert —— */
 .confirm-modal {
@@ -6445,6 +6896,12 @@ body.confirm-open { overflow: hidden; }
   align-items: center;
   justify-content: center;
   padding: calc(16px + var(--safe-top)) 16px calc(16px + var(--safe-bottom));
+}
+/* Must beat .tag-picker-modal / .tags-modal (same .confirm-modal base class) */
+#confirmModal {
+  z-index: 520;
+  align-items: center;
+  justify-content: center;
 }
 .confirm-modal[hidden] { display: none !important; }
 
@@ -7250,7 +7707,7 @@ body.confirm-open { overflow: hidden; }
   .account-chip-chevron { display: none; }
 }
 
-/* iPad / 大屏手机：设置抽屉铺满但仍用统一 gutter */
+/* iPad / 大屏手机：设置抽屉铺满但仍用统一 gutter；任务设置弹窗四周留白并垂直居中 */
 @media (max-width: 920px) {
   .drawer {
     --drawer-inset: 10px;
@@ -7262,6 +7719,47 @@ body.confirm-open { overflow: hidden; }
     max-width: 100% !important;
     border-radius: 16px;
     box-shadow: 0 12px 36px rgba(40, 60, 90, 0.12);
+  }
+
+  #tagsModal.confirm-modal.tags-modal {
+    padding:
+      max(14px, env(safe-area-inset-top, 0px))
+      max(14px, env(safe-area-inset-right, 0px))
+      max(14px, env(safe-area-inset-bottom, 0px))
+      max(14px, env(safe-area-inset-left, 0px)) !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    justify-content: center !important;
+    box-sizing: border-box !important;
+  }
+  /* Must beat display:flex !important above — otherwise iOS cannot close 任务设置 */
+  #tagsModal.confirm-modal.tags-modal[hidden],
+  #tagsModal[hidden] {
+    display: none !important;
+  }
+  #tagsModal .confirm-panel.tags-panel {
+    --tags-gutter: 20px;
+    --tags-stack: 12px;
+    --tags-card-pad: 14px;
+    width: 100% !important;
+    max-width: 100% !important;
+    flex: 0 1 auto !important;
+    height: auto !important;
+    /* Fit inside overlay padding — 100dvh overflowed and pinned the sheet to the bottom */
+    max-height: calc(
+      100dvh
+      - max(14px, env(safe-area-inset-top, 0px))
+      - max(14px, env(safe-area-inset-bottom, 0px))
+    ) !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    border-radius: 16px !important;
+    border: 1px solid var(--line) !important;
+    padding: 0 !important;
+    box-shadow: 0 12px 36px rgba(40, 60, 90, 0.14) !important;
+    box-sizing: border-box !important;
+    overflow: hidden !important;
   }
 }
 
@@ -7451,16 +7949,23 @@ body.confirm-open { overflow: hidden; }
   .drawer-panel .actions-bar {
     flex-direction: row;
     flex-wrap: nowrap;
+    flex-shrink: 0;
     gap: 8px;
   }
   .drawer-panel .actions-bar button {
     width: auto;
     flex: 1 1 0;
-    min-height: 36px;
-    height: 36px;
+    min-width: 0;
+    min-height: var(--tap);
+    height: auto;
     padding: 0 12px;
     font-size: 0.84rem;
     border-radius: 10px;
+    transform: none;
+  }
+  .drawer-panel .actions-bar button:hover,
+  .drawer-panel .actions-bar button:active {
+    transform: none;
   }
   .drawer-panel .actions-bar .primary {
     flex: 1.05 1 0;
@@ -7697,9 +8202,6 @@ body.confirm-open { overflow: hidden; }
   }
   .settings-tabs {
     margin-bottom: 10px;
-    position: sticky;
-    top: 0;
-    z-index: 3;
     gap: 4px;
     padding: 4px;
   }
@@ -7713,9 +8215,6 @@ body.confirm-open { overflow: hidden; }
   .settings-tab .ui-ico {
     width: 16px;
     height: 16px;
-  }
-  .drawer-panel .actions-bar button {
-    min-height: var(--tap);
   }
   .bl-add-row {
     flex-direction: column;
@@ -7798,18 +8297,20 @@ body.confirm-open { overflow: hidden; }
     min-height: 36px;
   }
 
+  /* Keep logout in normal flow — sticky bottom caused visual slip while scrolling */
   .drawer-panel .account-actions {
-    position: sticky;
-    bottom: 0;
+    position: static;
     margin-top: 16px;
-    padding: 12px 0 calc(10px + var(--safe-bottom));
-    background: linear-gradient(180deg, rgba(245, 247, 250, 0), #f5f7fa 36%);
-    border-top: 0;
-    z-index: 2;
+    padding: 12px 0 0;
+    background: none;
+    border-top: 1px solid rgba(35, 50, 70, 0.08);
+    z-index: auto;
   }
   .drawer-panel .account-actions button {
+    width: 100%;
     min-height: 42px;
     font-size: 0.9rem;
+    transform: none;
   }
 
   .tg-progress { gap: 6px; }
@@ -7839,10 +8340,7 @@ body.confirm-open { overflow: hidden; }
   }
   .modal-head {
     padding: 12px 14px 10px;
-    position: sticky;
-    top: 0;
-    z-index: 2;
-    background: linear-gradient(180deg, #ffffff, #f7f9fc);
+    /* Already flex-shrink:0 outside scroll body — sticky was redundant */
   }
   .modal-head h2 { font-size: 1.12rem; }
   .modal-body {
@@ -7853,11 +8351,9 @@ body.confirm-open { overflow: hidden; }
     flex-direction: column-reverse;
     gap: 8px;
     padding: 10px 14px calc(12px + var(--safe-bottom));
-    position: sticky;
-    bottom: 0;
-    z-index: 2;
+    /* Already flex-shrink:0 outside scroll body — sticky caused foot to float over content */
   }
-  .modal-foot button { width: 100%; min-height: 46px; }
+  .modal-foot button { width: 100%; min-height: 46px; transform: none; }
   .modal-col-chats .list {
     max-height: min(36vh, 280px);
     overflow-x: hidden;
@@ -7872,48 +8368,81 @@ body.confirm-open { overflow: hidden; }
   }
   .dropdown-toggle { min-height: 52px; }
 
-  /* —— Confirm / alert —— */
-  .confirm-modal {
+  /* —— Confirm / alert：仅确认框贴底，勿带动任务设置/标签选择 —— */
+  #confirmModal.confirm-modal {
     padding: calc(12px + var(--safe-top)) 12px calc(12px + var(--safe-bottom));
     align-items: flex-end;
+    justify-content: center;
   }
-  .confirm-panel {
+  #confirmModal .confirm-panel {
     width: 100%;
     max-width: 100%;
     padding: 18px 16px calc(14px + var(--safe-bottom));
     border-radius: 18px 18px 14px 14px;
     margin: 0;
   }
-  .confirm-title { font-size: 1.08rem; }
-  .confirm-message { font-size: 0.9rem; margin-bottom: 16px; }
-  .confirm-actions {
+  #confirmModal .confirm-title { font-size: 1.08rem; }
+  #confirmModal .confirm-message { font-size: 0.9rem; margin-bottom: 16px; }
+  #confirmModal .confirm-actions {
     flex-direction: column-reverse;
     gap: 8px;
   }
-  .confirm-actions button {
+  #confirmModal .confirm-actions button {
     width: 100%;
     min-height: 46px;
     flex: none;
+    transform: none;
   }
 
   /* —— Task settings modal —— */
   .tags-modal {
-    padding: 0;
-    align-items: stretch;
+    padding:
+      max(14px, env(safe-area-inset-top, 0px))
+      max(14px, env(safe-area-inset-right, 0px))
+      max(14px, env(safe-area-inset-bottom, 0px))
+      max(14px, env(safe-area-inset-left, 0px)) !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    justify-content: center !important;
+    box-sizing: border-box !important;
   }
-  .tags-modal .tags-panel {
-    width: 100%;
-    max-width: 100%;
-    height: 100%;
-    height: 100dvh;
-    max-height: 100dvh;
-    border-radius: 0;
-    border: 0;
-    padding: calc(12px + var(--safe-top)) 14px calc(14px + var(--safe-bottom));
+  .tags-modal[hidden],
+  #tagsModal[hidden] {
+    display: none !important;
+  }
+  .tags-modal .tags-panel,
+  #tagsModal .confirm-panel.tags-panel {
+    --tags-gutter: 18px;
+    --tags-stack: 12px;
+    --tags-card-pad: 12px;
+    width: 100% !important;
+    max-width: 100% !important;
+    flex: 0 1 auto !important;
+    height: auto !important;
+    max-height: calc(
+      100dvh
+      - max(14px, env(safe-area-inset-top, 0px))
+      - max(14px, env(safe-area-inset-bottom, 0px))
+    ) !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    border-radius: 16px !important;
+    border: 1px solid var(--line) !important;
+    padding: 0 !important;
+    box-shadow: 0 12px 36px rgba(40, 60, 90, 0.14) !important;
+    box-sizing: border-box !important;
+    overflow: hidden !important;
   }
   .tags-modal-head {
-    margin-bottom: 12px;
-    padding-top: 8px;
+    margin-bottom: 0;
+    padding: 16px var(--tags-gutter) 10px;
+  }
+  .tags-modal-body {
+    padding: 2px var(--tags-gutter) 10px;
+  }
+  #tagsModal .tags-modal-body {
+    padding: 2px var(--tags-gutter) 10px !important;
   }
   .tags-modal-head-text {
     width: 100%;
@@ -7949,21 +8478,58 @@ body.confirm-open { overflow: hidden; }
   }
   .tags-modal-actions {
     flex-direction: column-reverse;
-    position: sticky;
-    bottom: 0;
-    background: linear-gradient(180deg, transparent, #f5f7fa 28%);
-    padding-top: 16px;
-    margin-top: 8px;
-  }
-  .tags-modal-actions button {
+    position: relative;
+    bottom: auto;
+    padding: 12px 20px calc(16px + var(--safe-bottom)) !important;
+    margin: 0;
+    background: #ffffff;
+    box-sizing: border-box !important;
     width: 100%;
+  }
+  #tagsModal .tags-panel {
+    --tags-actions-h: 0px;
+  }
+  #tagsModal .confirm-actions.tags-modal-actions {
+    position: relative !important;
+    left: auto !important;
+    right: auto !important;
+    top: auto !important;
+    bottom: auto !important;
+    flex-shrink: 0 !important;
+    flex-direction: row !important;
+    justify-content: center !important;
+    align-items: center !important;
+    padding: 14px var(--tags-gutter, 18px) calc(28px + env(safe-area-inset-bottom, 0px)) !important;
+    border-top: 1px solid rgba(35, 50, 70, 0.08) !important;
+    background: #ffffff !important;
+    width: 100% !important;
+    z-index: 6;
+    box-shadow: none !important;
+  }
+  #tagsModal #btnTagsModalSave {
+    width: 80% !important;
+    max-width: 80% !important;
+    margin: 0 !important;
+    flex: 0 0 auto !important;
+  }
+  .tags-modal-actions button,
+  #tagsModal .tags-modal-actions .primary,
+  #tagsModal .tags-modal-actions .ghost {
+    width: 100% !important;
+    max-width: 100% !important;
     min-height: 46px;
+    box-sizing: border-box !important;
+    margin-inline: 0 !important;
+    transform: none !important;
   }
   .index-panel-row {
     flex-direction: column;
     align-items: stretch;
     gap: 12px;
-    padding: 12px;
+    padding: 0;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
   }
   .index-toolbar {
     width: 100%;
@@ -8420,7 +8986,12 @@ textarea::placeholder {
   opacity: 1;
 }
 
-/* iOS (any width, incl. iPad): keep form fields ≥16px so focus never zooms the page */
+/* iOS / touch: form fields ≥16px so focus never auto-zooms (overrides rem sizes) */
+html.touch-ui input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="image"]):not([type="hidden"]):not([type="color"]),
+html.touch-ui textarea,
+html.touch-ui select {
+  font-size: 16px !important;
+}
 @supports (-webkit-touch-callout: none) {
   input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="image"]):not([type="hidden"]):not([type="color"]),
   textarea,
