@@ -27,11 +27,19 @@ DATE_DOT_RE = re.compile(r"(?<!\d)(\d{1,2}\.\d{1,2})(?!\d)")
 DATE_DOT_RANGE_RE = re.compile(
     r"(?<!\d)(\d{1,2}\.\d{1,2})\s*[-~～—–至到]\s*(\d{1,2}\.\d{1,2})(?!\d)"
 )
+# 7.11-14 → same month as 7.11-7.14 (end day only; not 7.11-8.25)
+DATE_DOT_SAME_MONTH_RANGE_RE = re.compile(
+    r"(?<!\d)(\d{1,2})\.(\d{1,2})\s*[-~～—–至到]\s*(\d{1,2})(?!\d|\.\d)"
+)
 # 7月18日
 DATE_CN_RE = re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]?")
 # 7月24日-8月25日
 DATE_CN_RANGE_RE = re.compile(
     r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]?\s*[-~～—–至到]\s*(\d{1,2})月(\d{1,2})[日号]?"
+)
+# 7月11日-14日 / 7月11-14
+DATE_CN_SAME_MONTH_RANGE_RE = re.compile(
+    r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]?\s*[-~～—–至到]\s*(\d{1,2})[日号]?(?![\d月])"
 )
 
 # 标签名清理：去掉误吸入的括号索引尾巴（含全角］等）
@@ -206,6 +214,10 @@ def matches_file_size(
     return True
 
 
+def _valid_month_day(month: int, day: int) -> bool:
+    return 1 <= int(month) <= 12 and 1 <= int(day) <= 31
+
+
 def extract_date_token(text: str) -> Optional[str]:
     if not text:
         return None
@@ -213,12 +225,23 @@ def extract_date_token(text: str) -> Optional[str]:
     m = DATE_DOT_RANGE_RE.search(text)
     if m:
         return f"{m.group(1)}-{m.group(2)}"
+    # Same-month shorthand「7.11-14」→「7.11-7.14」
+    m = DATE_DOT_SAME_MONTH_RANGE_RE.search(text)
+    if m:
+        month, d1, d2 = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if _valid_month_day(month, d1) and 1 <= d2 <= 31:
+            return f"{month}.{d1}-{month}.{d2}"
     m = DATE_CN_RANGE_RE.search(text)
     if m:
         return (
             f"{int(m.group(1))}.{int(m.group(2))}"
             f"-{int(m.group(3))}.{int(m.group(4))}"
         )
+    m = DATE_CN_SAME_MONTH_RANGE_RE.search(text)
+    if m:
+        month, d1, d2 = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if _valid_month_day(month, d1) and 1 <= d2 <= 31:
+            return f"{month}.{d1}-{month}.{d2}"
     m = DATE_DOT_RE.search(text)
     if m:
         return m.group(1)
@@ -762,6 +785,91 @@ def merge_related_tag_folders(
     return logs
 
 
+def build_date_folder_repairs(captions: Iterable[str]) -> dict[str, str]:
+    """
+    Map legacy date folder names → canonical range names from captions.
+
+    Old parser only kept the start (7.11 / 7.24). New parser expands
+    「7.11-14」→「7.11-7.14」and keeps「7.24-8.25」.
+    """
+    from collections import Counter
+
+    votes: dict[str, Counter[str]] = {}
+    for raw in captions:
+        token = extract_date_token(str(raw or ""))
+        if not token or "-" not in token:
+            continue
+        left, right = token.split("-", 1)
+        if not left or not right:
+            continue
+        votes.setdefault(left, Counter())[token] += 1
+        # Same-month shorthand on disk: 7.11-14
+        if "." in left and "." in right:
+            lm, ld = left.split(".", 1)
+            rm, rd = right.split(".", 1)
+            if lm == rm:
+                abbrev = f"{lm}.{ld}-{rd}"
+                if abbrev != token:
+                    votes.setdefault(abbrev, Counter())[token] += 1
+    repair: dict[str, str] = {}
+    for legacy, counter in votes.items():
+        best, n = counter.most_common(1)[0]
+        if best == legacy:
+            continue
+        # Unique target, or clear majority if several ranges share a start
+        rest = sum(counter.values()) - n
+        if len(counter) == 1 or n > rest:
+            repair[legacy] = best
+    return repair
+
+
+def repair_date_folders(
+    group_dir: Path, captions: Iterable[str]
+) -> list[tuple[str, Path, Path]]:
+    """
+    Rename/merge date subfolders under tag dirs (and group root) using captions.
+
+    Returns list of (log_line, src_dir, dst_dir) for path rewrites.
+    """
+    if not group_dir.is_dir():
+        return []
+    mapping = build_date_folder_repairs(captions)
+    if not mapping:
+        return []
+
+    parents = [group_dir]
+    try:
+        parents.extend(p for p in group_dir.iterdir() if p.is_dir())
+    except OSError:
+        pass
+
+    moves: list[tuple[str, Path, Path]] = []
+    for parent in parents:
+        try:
+            children = [p for p in parent.iterdir() if p.is_dir()]
+        except OSError:
+            continue
+        for child in children:
+            target_name = mapping.get(child.name)
+            if not target_name or target_name == child.name:
+                continue
+            dst = parent / sanitize_name(target_name, max_len=32)
+            try:
+                if child.resolve() == dst.resolve():
+                    continue
+            except OSError:
+                pass
+            src_snap = Path(child)
+            dst.mkdir(parents=True, exist_ok=True)
+            _merge_tree_into(child, dst)
+            if parent == group_dir:
+                line = f"日期目录: {src_snap.name} → {dst.name}"
+            else:
+                line = f"日期目录: {parent.name}/{src_snap.name} → {dst.name}"
+            moves.append((line, src_snap, dst))
+    return moves
+
+
 MENTION_RE = re.compile(r"@\S+")
 
 
@@ -805,9 +913,11 @@ def caption_filename_stem(caption: str) -> str:
         return ""
     text = caption
     text = HASHTAG_RE.sub(" ", text)
-    # Strip ranges before singles so「7.24-8.25」does not leave「-8.25」
+    # Strip ranges before singles so「7.24-8.25」/「7.11-14」do not leave tails
     text = DATE_DOT_RANGE_RE.sub(" ", text)
+    text = DATE_DOT_SAME_MONTH_RANGE_RE.sub(" ", text)
     text = DATE_CN_RANGE_RE.sub(" ", text)
+    text = DATE_CN_SAME_MONTH_RANGE_RE.sub(" ", text)
     text = DATE_CN_RE.sub(" ", text)
     text = DATE_DOT_RE.sub(" ", text)
     text = MENTION_RE.sub(" ", text)

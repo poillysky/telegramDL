@@ -2421,6 +2421,62 @@ class Database:
                     out[int(row["message_id"])] = row["caption"] or ""
         return out
 
+    async def list_index_captions(self, chat_id: str | int) -> list[str]:
+        """Captions that may contain date tokens (for folder repair)."""
+        chat_id = str(chat_id)
+        async with self.conn.execute(
+            """
+            SELECT caption FROM chat_media_index
+            WHERE chat_id = ?
+              AND caption IS NOT NULL AND caption != ''
+              AND (caption LIKE '%.%' OR caption LIKE '%月%')
+            """,
+            (chat_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [str(r["caption"] or "") for r in rows if r["caption"]]
+
+    async def rewrite_file_paths_dir_move(
+        self, src_dir: Path | str, dst_dir: Path | str
+    ) -> int:
+        """Rewrite stored file_path prefixes after a local directory rename/merge."""
+        src = str(Path(src_dir))
+        dst = str(Path(dst_dir))
+        if not src or src == dst:
+            return 0
+        variants = [
+            (src, dst),
+            (src.replace("\\", "/"), dst.replace("\\", "/")),
+            (src.replace("/", "\\"), dst.replace("/", "\\")),
+        ]
+        # Dedupe while preserving order
+        seen: set[tuple[str, str]] = set()
+        pairs: list[tuple[str, str]] = []
+        for a, b in variants:
+            key = (a, b)
+            if a and a != b and key not in seen:
+                seen.add(key)
+                pairs.append(key)
+
+        changed = 0
+        for old, new in pairs:
+            like = old.replace("\\", "/") + "%"
+            like_win = old.replace("/", "\\") + "%"
+            for table in ("chat_completed", "downloaded"):
+                cur = await self.conn.execute(
+                    f"""
+                    UPDATE {table}
+                    SET file_path = REPLACE(file_path, ?, ?)
+                    WHERE file_path IS NOT NULL
+                      AND (file_path LIKE ? OR file_path LIKE ?)
+                    """,
+                    (old, new, like, like_win),
+                )
+                changed += int(cur.rowcount or 0)
+        if changed:
+            await self.conn.commit()
+        return changed
+
     async def _index_filter_sql(
         self,
         chat_id: str,

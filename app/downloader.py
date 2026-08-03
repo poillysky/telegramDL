@@ -34,6 +34,7 @@ from app.organizer import (
     next_folder_state,
     normalize_keyword_list,
     normalize_tag_list,
+    repair_date_folders,
     resolve_caption_text,
     resolve_download_path,
     resolve_media_subdir,
@@ -1597,6 +1598,13 @@ class DownloadScheduler:
         # settings auto/manual incremental scans — do not scan Telegram here.
         media_count = await self.db.count_media_index(chat_id)
         await self.db.append_log(task_id, f"本地索引 {media_count} 条")
+        if use_text_as_folder:
+            await self._merge_tag_folders_after(
+                task_id,
+                group_dir,
+                chat_id=chat_id,
+                tag_blacklist=tag_blacklist,
+            )
 
         # Reload filters/settings (hot switch — no worker restart)
         fresh = await self.db.get_task(task_id) or {}
@@ -2524,7 +2532,7 @@ class DownloadScheduler:
         quiet: bool = False,
         tag_blacklist: frozenset | set | None = None,
     ) -> None:
-        """Merge related #tag folders into full multi-tag names."""
+        """Merge related #tag folders; repair legacy date folders from captions."""
         groups: list[list[str]] = list(extra_tag_groups or [])
         if chat_id is not None:
             try:
@@ -2545,13 +2553,40 @@ class DownloadScheduler:
         except Exception as e:
             logger.exception("merge tag folders failed")
             await self.db.append_log(task_id, f"同类目录合并失败: {e}")
+            logs = []
+        if logs:
+            if not quiet:
+                await self.db.append_log(task_id, "同类标签目录已合并")
+            for line in logs:
+                await self.db.append_log(task_id, line)
+
+        if chat_id is None:
             return
-        if not logs:
+        try:
+            captions = await self.db.list_index_captions(chat_id)
+        except Exception:
+            logger.debug("list_index_captions failed", exc_info=True)
+            return
+        if not captions:
+            return
+        try:
+            moves = await asyncio.to_thread(
+                repair_date_folders, group_dir, captions
+            )
+        except Exception as e:
+            logger.exception("repair date folders failed")
+            await self.db.append_log(task_id, f"日期目录修复失败: {e}")
+            return
+        if not moves:
             return
         if not quiet:
-            await self.db.append_log(task_id, "同类标签目录已合并")
-        for line in logs:
+            await self.db.append_log(task_id, "日期目录已按文案区间修复")
+        for line, src, dst in moves:
             await self.db.append_log(task_id, line)
+            try:
+                await self.db.rewrite_file_paths_dir_move(src, dst)
+            except Exception:
+                logger.debug("rewrite paths after date repair failed", exc_info=True)
 
     async def _download_loop_body(
         self,
@@ -2619,6 +2654,13 @@ class DownloadScheduler:
                 )
         except Exception:
             logger.debug("sync_local_completed_from_dir failed", exc_info=True)
+        if use_text_as_folder:
+            await self._merge_tag_folders_after(
+                task_id,
+                group_dir,
+                chat_id=chat_id,
+                tag_blacklist=tag_blacklist,
+            )
         await self._log_queue_skip_stats(
             task_id,
             chat_id,
