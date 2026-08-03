@@ -199,10 +199,8 @@ body {
 
 /* Mobile WebKit/Blink: blur + sticky + 1px grid leave stray hairlines until reflow */
 @media (max-width: 860px), (hover: none) and (pointer: coarse) {
-  .bg-grid {
-    display: none !important;
-  }
-  /* Animated orbs + filters often leave 1px black streaks on iOS Safari */
+  .bg,
+  .bg-grid,
   .bg-orb {
     display: none !important;
   }
@@ -213,13 +211,16 @@ body {
     -webkit-backdrop-filter: none !important;
     background: #f2f7fd;
     box-shadow: none;
-    -webkit-backface-visibility: hidden;
-    backface-visibility: hidden;
   }
   .app-nav {
     box-shadow: none;
   }
-  /* translateZ layers were meant to help scroll, but paint black hairlines on iOS */
+  .top,
+  .card,
+  .task,
+  .page-tasks .tasks > .task {
+    animation: none !important;
+  }
   .page-tasks .tasks-page-shell,
   .page-tasks .tasks,
   .page-tasks .tasks-toolbar,
@@ -231,10 +232,7 @@ body {
   .dl-panel {
     -webkit-transform: none !important;
     transform: none !important;
-    -webkit-backface-visibility: hidden;
-    backface-visibility: hidden;
   }
-  /* Kill scrollport seam under tasks toolbar (the stubborn grey hairline) */
   .page-tasks .tasks {
     overflow: visible !important;
     border: 0 !important;
@@ -249,7 +247,9 @@ body {
     transform: none !important;
   }
   .task {
-    box-shadow: 0 4px 14px rgba(15, 23, 42, 0.05);
+    /* Soft edge — hard 1px + inset highlight aliases to black hairlines on retina */
+    border-color: rgba(148, 163, 184, 0.18) !important;
+    box-shadow: 0 6px 18px rgba(15, 23, 42, 0.05) !important;
   }
   .task-body > .live-progress {
     box-shadow: none;
@@ -276,13 +276,38 @@ body {
       opacity: 0.85;
     }
   }
-  /* Soften separators that alias to black on retina */
   .task-stats,
   .task-actions,
   .task-log-head,
   .task-filter-line {
-    border-color: rgba(148, 163, 184, 0.16) !important;
+    border-color: rgba(148, 163, 184, 0.14) !important;
   }
+}
+
+/* Touch / iOS: hide decor + kill entrance motion (overflow overrides live after boot-app) */
+html.touch-ui .bg,
+html.touch-ui .bg-orb,
+html.touch-ui .bg-grid {
+  display: none !important;
+}
+html.touch-ui .top,
+html.touch-ui .card,
+html.touch-ui .task,
+html.touch-ui .page-tasks .tasks > .task {
+  animation: none !important;
+  transform: none !important;
+}
+html.touch-ui .task {
+  border-color: rgba(148, 163, 184, 0.18) !important;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.05) !important;
+}
+html.touch-ui .app-nav {
+  box-shadow: none !important;
+  border-color: rgba(148, 163, 184, 0.16);
+}
+html.touch-ui .top {
+  box-shadow: none !important;
+  border: 0 !important;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -331,6 +356,39 @@ html.boot-app #stageApp > .page {
 }
 html.boot-app #stageApp > .page[hidden] {
   display: none !important;
+}
+
+/* After boot-app lock: re-open document scroll on touch (beats nested shell scroll seams) */
+html.touch-ui.boot-app,
+html.touch-ui.boot-app body {
+  height: auto !important;
+}
+html.touch-ui.boot-app body {
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+  -webkit-overflow-scrolling: touch;
+}
+html.touch-ui.boot-app #app.shell {
+  height: auto !important;
+  min-height: 100dvh;
+  overflow: visible !important;
+}
+html.touch-ui.boot-app #stageApp,
+html.touch-ui.boot-app #stageApp > .page {
+  flex: 0 0 auto !important;
+  min-height: auto !important;
+  overflow: visible !important;
+}
+html.touch-ui .page-tasks .tasks-page-shell {
+  flex: 0 0 auto !important;
+  min-height: auto !important;
+  overflow: visible !important;
+  -webkit-overflow-scrolling: auto;
+  overscroll-behavior: auto;
+}
+/* Class toggle forces WebKit style recalc without filter/transform streaks */
+html.ios-repaint-nudge {
+  outline-color: transparent;
 }
 
 /* —— Header —— */

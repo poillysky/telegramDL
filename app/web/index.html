@@ -23,9 +23,28 @@
       } catch (e) {
         document.documentElement.classList.add("boot-pending");
       }
+      /* Touch / iOS: mark before CSS so cold-start never paints bg/animations that leave black hairlines */
+      try {
+        var touch =
+          (window.matchMedia &&
+            (matchMedia("(hover: none) and (pointer: coarse)").matches ||
+              matchMedia("(max-width: 860px)").matches)) ||
+          /iPhone|iPad|iPod|Android/i.test(navigator.userAgent || "");
+        if (touch) document.documentElement.classList.add("touch-ui");
+      } catch (e2) {}
     })();
   </script>
-  <link rel="stylesheet" href="/static/style.css?v=20260803-ios-step" />
+  <style>
+    /* Critical: hide decorative bg + entrance motion on touch before stylesheet arrives */
+    html.touch-ui .bg,
+    html.touch-ui .bg-orb,
+    html.touch-ui .bg-grid { display: none !important; }
+    html.touch-ui .top,
+    html.touch-ui .card,
+    html.touch-ui .task,
+    html.touch-ui .page-tasks .tasks > .task { animation: none !important; transform: none !important; }
+  </style>
+  <link rel="stylesheet" href="/static/style.css?v=20260803-hairline-cold" />
   <!-- Webfonts: non-blocking + optional (no 3s spinner / no late glyph swap stretch) -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -973,6 +992,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260803-queue-dedupe"></script>
+  <script src="/static/app.js?v=20260803-save-fast"></script>
 </body>
 </html>

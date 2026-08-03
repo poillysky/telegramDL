@@ -1453,14 +1453,32 @@ class Database:
             rows = await cur.fetchall()
             return [{"tag": r["tag"], "count": int(r["count"])} for r in rows]
 
+    # chat_id -> (monotonic_ts, groups) — expand_related scans whole index otherwise
+    _tag_groups_cache: dict[str, tuple[float, list[list[str]]]] = {}
+    _TAG_GROUPS_TTL = 45.0
+
+    def invalidate_tag_groups_cache(self, chat_id: str | int | None = None) -> None:
+        if chat_id is None:
+            self._tag_groups_cache.clear()
+            return
+        self._tag_groups_cache.pop(str(chat_id), None)
+
     async def list_index_tag_groups(self, chat_id: str | int) -> list[list[str]]:
         """Tag lists from each indexed caption (for co-occurrence / relatedness)."""
+        import time
+
+        key = str(chat_id)
+        now = time.monotonic()
+        cached = self._tag_groups_cache.get(key)
+        if cached and (now - cached[0]) < self._TAG_GROUPS_TTL:
+            return cached[1]
+
         async with self.conn.execute(
             """
             SELECT tags FROM chat_media_index
             WHERE chat_id = ? AND tags != '[]' AND tags IS NOT NULL
             """,
-            (str(chat_id),),
+            (key,),
         ) as cur:
             rows = await cur.fetchall()
         groups: list[list[str]] = []
@@ -1473,6 +1491,7 @@ class Database:
             cleaned = [str(t).strip().lstrip("#") for t in tags if str(t).strip()]
             if cleaned:
                 groups.append(cleaned)
+        self._tag_groups_cache[key] = (now, groups)
         return groups
 
     async def list_tag_cooccur_bundles(

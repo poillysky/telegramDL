@@ -116,6 +116,10 @@ async def _chat_index_media_count(chat_id) -> int:
 
 def invalidate_index_count_cache(chat_id=None) -> None:
     """Drop cached index totals and match/done counts (call after index scan)."""
+    try:
+        db.invalidate_tag_groups_cache(chat_id)
+    except Exception:
+        pass
     if chat_id is None:
         _index_count_cache.clear()
         _tag_match_cache.clear()
@@ -530,18 +534,22 @@ async def update_task_settings(
     if body.include_tags is not None:
         tags = normalize_tag_list(body.include_tags)
         mode = "any"
-        if body.expand_related and tags:
-            try:
-                expanded = await db.expand_related_tags(task["chat_id"], tags)
-                if len(expanded) > len(tags):
-                    tags = expanded
-            except Exception:
-                pass
-        # 监控任务允许清空标签（仅索引）；有标签时才按标签下载
-        fields["include_tags"] = tags
-        fields["tag_match_mode"] = mode
-        joined = " ".join(f"#{t}" for t in tags) if tags else "（无）"
-        log_bits.append(f"标签 {joined}")
+        # Skip expensive full-index co-occurrence expand when tag set is unchanged
+        # (common path: user only tweaks concurrency / delay / media / auto-index).
+        same_tags = {t.lower() for t in tags} == {t.lower() for t in old_tags}
+        if not same_tags:
+            if body.expand_related and tags:
+                try:
+                    expanded = await db.expand_related_tags(task["chat_id"], tags)
+                    if len(expanded) > len(tags):
+                        tags = expanded
+                except Exception:
+                    pass
+            # 监控任务允许清空标签（仅索引）；有标签时才按标签下载
+            fields["include_tags"] = tags
+            fields["tag_match_mode"] = mode
+            joined = " ".join(f"#{t}" for t in tags) if tags else "（无）"
+            log_bits.append(f"标签 {joined}")
 
     if body.caption_keywords is not None:
         kws = normalize_keyword_list(body.caption_keywords)

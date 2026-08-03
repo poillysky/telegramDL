@@ -577,6 +577,7 @@ function restoreTaskListCache() {
     if (!html) return false;
     list.innerHTML = html;
     bindTaskActions(list);
+    scheduleIosHairlinePass();
     return true;
   } catch (_) {
     return false;
@@ -689,6 +690,7 @@ function showApp() {
   $("stageLogin").hidden = true;
   $("stageApp").hidden = false;
   document.body.classList.remove("is-login-stage");
+  scheduleIosHairlinePass();
 }
 
 function setTgBanner(show) {
@@ -1288,48 +1290,82 @@ function isCoarseTouchUi() {
 
 /** iOS Safari sometimes leaves 1px black streaks until a compositor refresh. */
 function nudgeIosRepaint(root) {
-  if (!isCoarseTouchUi()) return;
+  if (!isCoarseTouchUi() && !document.documentElement.classList.contains("touch-ui")) {
+    return;
+  }
   const el = root || document.body;
   if (!el) return;
-  const prev = el.style.webkitFilter;
-  el.style.webkitFilter = "opacity(0.999)";
-  // Force layout, then clear — cheaper than toggling display
+  // Toggle a harmless class — filter tricks can themselves streak on some WebKits
+  el.classList.add("ios-repaint-nudge");
   void el.offsetHeight;
   requestAnimationFrame(() => {
-    el.style.webkitFilter = prev || "";
+    el.classList.remove("ios-repaint-nudge");
   });
 }
 
+function scheduleIosHairlinePass() {
+  if (!isCoarseTouchUi() && !document.documentElement.classList.contains("touch-ui")) {
+    return;
+  }
+  const delays = [0, 50, 150, 400, 900, 1800];
+  delays.forEach((ms) => {
+    setTimeout(() => nudgeIosRepaint(document.documentElement), ms);
+  });
+  // After webfonts settle (cold start glyph swap)
+  try {
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(() => {
+        nudgeIosRepaint(document.documentElement);
+        setTimeout(() => nudgeIosRepaint(document.documentElement), 200);
+      });
+    }
+  } catch (_) {}
+}
+
 function bindIosHairlineGuards() {
-  if (!isCoarseTouchUi() || state._iosHairlineBound) return;
+  if (!isCoarseTouchUi() && !document.documentElement.classList.contains("touch-ui")) {
+    return;
+  }
+  if (state._iosHairlineBound) return;
   state._iosHairlineBound = true;
   let t = 0;
   const kick = () => {
     clearTimeout(t);
-    t = setTimeout(() => nudgeIosRepaint(document.documentElement), 120);
+    t = setTimeout(() => nudgeIosRepaint(document.documentElement), 80);
   };
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) kick();
+    if (!document.hidden) {
+      kick();
+      scheduleIosHairlinePass();
+    }
   });
-  window.addEventListener("pageshow", kick);
-  // Capture scroll from task/history panes (delegation — containers remount often)
+  window.addEventListener("pageshow", (ev) => {
+    kick();
+    if (ev.persisted) scheduleIosHairlinePass();
+  });
+  window.addEventListener("orientationchange", () => {
+    scheduleIosHairlinePass();
+  });
   document.addEventListener(
     "scroll",
     (ev) => {
-      const t = ev.target;
-      if (!t || t === document || t === document.documentElement || t === document.body) {
+      const tgt = ev.target;
+      if (!tgt || tgt === document || tgt === document.documentElement || tgt === document.body) {
+        kick();
         return;
       }
       if (
-        t.classList?.contains("tasks") ||
-        t.classList?.contains("history-list") ||
-        t.classList?.contains("task-log-body")
+        tgt.classList?.contains("tasks") ||
+        tgt.classList?.contains("tasks-page-shell") ||
+        tgt.classList?.contains("history-list") ||
+        tgt.classList?.contains("task-log-body")
       ) {
         kick();
       }
     },
     { passive: true, capture: true }
   );
+  scheduleIosHairlinePass();
 }
 
 function switchPage(name) {
@@ -1348,7 +1384,10 @@ function switchPage(name) {
   } else {
     loadTasks().catch(() => {});
   }
-  requestAnimationFrame(() => nudgeIosRepaint(document.documentElement));
+  requestAnimationFrame(() => {
+    nudgeIosRepaint(document.documentElement);
+    scheduleIosHairlinePass();
+  });
 }
 
 async function openCreateModal() {
@@ -4280,6 +4319,7 @@ function fillTaskSettingsFields(task) {
     taskId: String(task.id),
     chatId: task.chat_id,
     tags,
+    tagsBaseline: tags.map((t) => String(t).toLowerCase()).sort().join("\0"),
     groups: tags.map((t) => [normalizeTagName(t)]).filter((g) => g[0]),
     mode: "any",
     downloadMode,
@@ -5022,9 +5062,14 @@ async function saveTaskTagsModal() {
   };
 
   if (downloadMode === "monitor") {
-    body.include_tags = draft.tags || [];
-    body.tag_match_mode = "any";
-    body.expand_related = expand;
+    const nextTags = draft.tags || [];
+    const nextKey = nextTags.map((t) => String(t).toLowerCase()).sort().join("\0");
+    // Only send tags when changed — avoids server re-scanning the whole index
+    if (nextKey !== (draft.tagsBaseline || "")) {
+      body.include_tags = nextTags;
+      body.tag_match_mode = "any";
+      body.expand_related = expand;
+    }
   } else {
     const startDate = ($("tagsModalStartDate") && $("tagsModalStartDate").value) || "";
     const endDate = ($("tagsModalEndDate") && $("tagsModalEndDate").value) || "";
@@ -5049,64 +5094,67 @@ async function saveTaskTagsModal() {
   );
 
   const btn = $("btnTagsModalSave");
-  if (btn) btn.disabled = true;
-  try {
-    const r = await api(`/api/tasks/${draft.taskId}/settings`, {
-      method: "PATCH",
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) throw new Error(r.message || "保存失败");
-
-    if (downloadMode === "monitor") {
-      await api(`/api/index/${encodeURIComponent(draft.chatId)}/auto-scan`, {
+  const tagsChanged =
+    downloadMode === "monitor" && Object.prototype.hasOwnProperty.call(body, "include_tags");
+  await withBusy(btn, async () => {
+    try {
+      const r = await api(`/api/tasks/${draft.taskId}/settings`, {
         method: "PATCH",
-        body: JSON.stringify({
-          enabled: autoEnabled,
-          interval_min: autoInterval,
-          chat_title: draft.title || "",
-        }),
+        body: JSON.stringify(body),
       });
-      if (state.indexMeta && String(state.indexMetaChatId) === String(draft.chatId)) {
-        state.indexMeta = {
-          ...state.indexMeta,
-          auto_incremental: autoEnabled ? 1 : 0,
-          auto_interval_min: autoInterval,
-        };
-        rememberIndexMetaCache(draft.chatId, {
-          meta: state.indexMeta,
-          coverage: state.indexCoverage,
-          scanning: false,
-        });
-      } else {
-        const cached = readIndexMetaCache(draft.chatId);
-        if (cached?.meta) {
+      if (!r.ok) throw new Error(r.message || "保存失败");
+
+      // Close immediately — auto-scan + task list refresh must not block the button
+      const tagN = (draft.tags || []).length;
+      let msg = "任务设置已保存";
+      if (downloadMode === "monitor") {
+        if (tagsChanged && tagN) msg += " · 开始按标签下载";
+        if (autoEnabled) msg += ` · 自动增量每 ${autoInterval} 分钟`;
+      }
+      toast(msg, "ok");
+      closeTaskTagsModal();
+
+      if (downloadMode === "monitor") {
+        api(`/api/index/${encodeURIComponent(draft.chatId)}/auto-scan`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            enabled: autoEnabled,
+            interval_min: autoInterval,
+            chat_title: draft.title || "",
+          }),
+        }).catch(() => {});
+        if (state.indexMeta && String(state.indexMetaChatId) === String(draft.chatId)) {
+          state.indexMeta = {
+            ...state.indexMeta,
+            auto_incremental: autoEnabled ? 1 : 0,
+            auto_interval_min: autoInterval,
+          };
           rememberIndexMetaCache(draft.chatId, {
-            meta: {
-              ...cached.meta,
-              auto_incremental: autoEnabled ? 1 : 0,
-              auto_interval_min: autoInterval,
-            },
-            coverage: cached.coverage,
-            scanning: !!cached.scanning,
+            meta: state.indexMeta,
+            coverage: state.indexCoverage,
+            scanning: false,
           });
+        } else {
+          const cached = readIndexMetaCache(draft.chatId);
+          if (cached?.meta) {
+            rememberIndexMetaCache(draft.chatId, {
+              meta: {
+                ...cached.meta,
+                auto_incremental: autoEnabled ? 1 : 0,
+                auto_interval_min: autoInterval,
+              },
+              coverage: cached.coverage,
+              scanning: !!cached.scanning,
+            });
+          }
         }
       }
-    }
 
-    const tagN = (draft.tags || []).length;
-    let msg = "任务设置已保存";
-    if (downloadMode === "monitor") {
-      if (tagN) msg += " · 开始按标签下载";
-      if (autoEnabled) msg += ` · 自动增量每 ${autoInterval} 分钟`;
+      loadTasks({ force: true }).catch(() => {});
+    } catch (e) {
+      toast("保存失败: " + (e.message || e), "err");
     }
-    toast(msg, "ok");
-    closeTaskTagsModal();
-    await loadTasks();
-  } catch (e) {
-    toast("保存失败: " + (e.message || e), "err");
-  } finally {
-    if (btn) btn.disabled = false;
-  }
+  });
 }
 
 function liveWorkersActive(workers) {
@@ -5699,6 +5747,7 @@ async function loadTasks(opts = {}) {
       });
       restoreTaskLogScroll(scrollMap);
       bindTaskActions(list);
+      scheduleIosHairlinePass();
     } catch (e) {
       if (isSoftAuthError(e)) return;
       if (list && !list.querySelector(".task[data-task-id]")) {
