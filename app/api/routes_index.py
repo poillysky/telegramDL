@@ -61,6 +61,35 @@ async def get_index_tags_only(
     return {"ok": True, "tags": tags, "bundles": bundles, "related": {}}
 
 
+@router.get("/{chat_id}/meta")
+async def get_index_meta_status(
+    chat_id: int | str, _: None = Depends(require_web_auth)
+):
+    """Fast path for task settings: meta + scanning only (no related map / TG tip)."""
+    meta = await db.get_index_meta(chat_id)
+    if not meta:
+        meta = {
+            "chat_id": str(chat_id),
+            "chat_title": "",
+            "last_scan_at": None,
+            "last_message_id": 0,
+            "media_count": 0,
+            "scanned_count": 0,
+            "status": "idle",
+            "last_error": None,
+            "auto_incremental": 0,
+            "auto_interval_min": 60,
+        }
+    return {
+        "ok": True,
+        "meta": meta,
+        "tags": [],
+        "related": {},
+        "coverage": None,
+        "scanning": indexer.is_scanning(chat_id),
+    }
+
+
 @router.get("/{chat_id}")
 async def get_index(chat_id: int | str, _: None = Depends(require_web_auth)):
     meta = await db.get_index_meta(chat_id)

@@ -1543,7 +1543,7 @@ function getIndexTargetChat() {
   return null;
 }
 
-async function refreshIndexPanel() {
+async function refreshIndexPanel(opts = {}) {
   const metaEl = $("indexMetaText");
   const cloud = $("indexTagCloud");
   const chat = getIndexTargetChat();
@@ -1571,17 +1571,27 @@ async function refreshIndexPanel() {
     metaEl.textContent = "加载索引状态…";
   }
 
+  // Settings modal only needs meta/auto-scan — skip related map + Telegram tip probe
+  const light =
+    !!opts.light ||
+    ($("tagsModal") && !$("tagsModal").hidden && (!$("tagPickerModal") || $("tagPickerModal").hidden));
+
   try {
-    const r = await api(`/api/index/${encodeURIComponent(chat.id)}`);
+    const path = light
+      ? `/api/index/${encodeURIComponent(chat.id)}/meta`
+      : `/api/index/${encodeURIComponent(chat.id)}`;
+    const r = await api(path);
     // Ignore late responses if user switched chat/task
     const still = getIndexTargetChat();
     if (!still || String(still.id) !== String(chat.id)) return;
 
     state.indexMeta = r.meta || null;
     state.indexMetaChatId = String(chat.id);
-    state.indexTags = r.tags || [];
-    state.tagRelated = r.related || {};
-    state.indexCoverage = r.coverage || null;
+    if (!light) {
+      state.indexTags = r.tags || [];
+      state.tagRelated = r.related || {};
+    }
+    if (r.coverage) state.indexCoverage = r.coverage;
     const scanning = !!(r.scanning || (r.meta && r.meta.status === "scanning"));
     rememberIndexMetaCache(chat.id, {
       meta: state.indexMeta,
@@ -1593,14 +1603,14 @@ async function refreshIndexPanel() {
     );
     renderIndexMeta(scanning);
     // Avoid rebuilding the whole tag cloud every poll tick while scanning
-    if (!scanning || tagsSig !== state._indexTagsSig || !state._indexWasScanning) {
+    if (!light && (!scanning || tagsSig !== state._indexTagsSig || !state._indexWasScanning)) {
       renderTagCloud();
     }
     state._indexTagsSig = tagsSig;
     state._indexWasScanning = scanning;
     if (scanning) scheduleIndexPoll();
     else stopIndexPolling();
-    refreshIndexPreview();
+    if (!light) refreshIndexPreview();
   } catch (e) {
     if (isSoftAuthError(e)) return;
     if (metaEl && !paintIndexPanelFromCache(chat.id)) {
@@ -4988,14 +4998,32 @@ async function openTaskTagsModal(taskId, opts = {}) {
   const modal = $("tagsModal");
   if (!modal) return;
   const panel = modal.querySelector(".tags-panel");
-  panel?.classList.add("is-loading");
+  const id = String(taskId);
+
+  // Instant paint from the already-loaded task list — do not wait on GET /tasks/{id}
+  let task = (state.tasks || []).find((t) => String(t.id) === id) || null;
+
   if (!opts.keepOpen || modal.hidden) {
     modal.hidden = false;
     document.body.classList.add("confirm-open");
   }
-  let task = null;
+
+  if (task) {
+    panel?.classList.remove("is-loading");
+    fillTaskSettingsFields(task);
+    const mode = normalizeDownloadMode(task.download_mode);
+    if (mode === "monitor") {
+      paintIndexPanelFromCache(task.chat_id);
+      refreshIndexPanel({ light: true }).catch(() => {});
+    } else {
+      stopIndexPolling();
+    }
+    return;
+  }
+
+  panel?.classList.add("is-loading");
   try {
-    const r = await api(`/api/tasks/${taskId}`);
+    const r = await api(`/api/tasks/${id}`);
     task = r.task;
   } catch (_) {
     task = null;
@@ -5010,9 +5038,8 @@ async function openTaskTagsModal(taskId, opts = {}) {
   fillTaskSettingsFields(task);
   const mode = normalizeDownloadMode(task.download_mode);
   if (mode === "monitor") {
-    // Show last cached index status immediately, then refresh in background
     paintIndexPanelFromCache(task.chat_id);
-    refreshIndexPanel().catch(() => {});
+    refreshIndexPanel({ light: true }).catch(() => {});
   } else {
     stopIndexPolling();
   }
