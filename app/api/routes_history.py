@@ -122,21 +122,13 @@ async def list_history(
     )
     for it in items:
         path_str = it.get("file_path") or ""
-        kind = "file"
-        previewable = False
-        missing = False
-        if path_str:
-            candidate = _resolve_download_path(path_str)
-            if candidate is not None:
-                kind = _guess_media_kind(candidate)
-                previewable = candidate.suffix.lower() in _PREVIEW_EXT
-            else:
-                # Still guess kind from extension for UI icons
-                kind = _guess_media_kind(Path(path_str))
-                missing = True
+        # List view: no per-row disk stat (slow on large NAS / 10万+ rows pages).
+        # Existence is checked when opening / previewing the file.
+        kind = _guess_media_kind(Path(path_str)) if path_str else "file"
+        previewable = bool(path_str) and Path(path_str).suffix.lower() in _PREVIEW_EXT
         it["media_kind"] = kind
         it["previewable"] = previewable
-        it["file_missing"] = missing
+        it["file_missing"] = False
     return {
         "ok": True,
         "items": items,

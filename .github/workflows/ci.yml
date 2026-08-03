@@ -18,5 +18,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest
+      - name: Minify web assets
+        run: python scripts/minify_web.py
       - name: Run tests
-        run: pytest
+        run: pytest -q

@@ -7,6 +7,7 @@ import logging
 import random
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -112,6 +113,8 @@ class DownloadScheduler:
         self._startup_resume_ids: list[int] = []
         # Delayed auto-retry handles for sequential tasks with leftover failures
         self._failed_retry_handles: dict[int, asyncio.Task] = {}
+        # task_id -> live download pool (for hot concurrency changes)
+        self._live_pools: dict[int, dict[str, Any]] = {}
 
     def _chat_wake_event(self, chat_id: str | int) -> asyncio.Event:
         """Lazy Event for this chat (must run on the asyncio loop)."""
@@ -130,6 +133,22 @@ class DownloadScheduler:
             ev = self._index_wake.get(key)
         if ev is not None:
             ev.set()
+
+    async def apply_live_concurrency(
+        self, task_id: int, concurrency: int | None = None
+    ) -> None:
+        """Hot-apply task concurrency to a running download pool (if any)."""
+        tid = int(task_id)
+        pool = self._live_pools.get(tid)
+        if not pool or not pool.get("started"):
+            return
+        if concurrency is None:
+            try:
+                task = await self.db.get_task(tid) or {}
+                concurrency = int(task.get("concurrency") or 1)
+            except Exception:
+                return
+        await self._apply_pool_concurrency(pool, int(concurrency))
 
     def notify_index_updated(self, chat_id: str | int) -> None:
         """After manual/auto/full index scan: mark bump and wake monitor."""
@@ -3093,30 +3112,99 @@ class DownloadScheduler:
         return {
             "concurrency": n,
             "queue": asyncio.Queue(),
-            "workers": [],  # asyncio.Task list
+            "priority": deque(),  # deferred jobs — resume ASAP under new concurrency
+            "workers": [],  # asyncio.Task list (legacy order)
+            "worker_tasks": {},  # worker_id -> Task
             "started": False,
             "in_flight": 0,
             "blocked": False,
+            "_stopping": False,
             "done_event": asyncio.Event(),
             "lock": asyncio.Lock(),
             "order": [],  # scan order for checkpoint
             "settled": {},  # message_id -> True(ok) | False(blocked)
             "order_idx": 0,
+            "active": {},  # worker_id -> {yield: Event, job}
             # settle kwargs filled by _ensure_pool_workers
             "_ctx": None,
+            "_task_id": None,
         }
 
     def _pool_busy(self, pool: dict[str, Any]) -> bool:
+        pri = pool.get("priority")
         return bool(pool.get("started")) and (
             int(pool.get("in_flight") or 0) > 0
             or not pool["queue"].empty()
+            or bool(pri)
             or bool(pool.get("workers"))
         )
+
+    def _pool_pending_count(self, pool: dict[str, Any]) -> int:
+        pri = pool.get("priority")
+        return int(pool["queue"].qsize()) + (len(pri) if pri else 0)
 
     def _pool_signal_done(self, pool: dict[str, Any]) -> None:
         ev = pool.get("done_event")
         if ev is not None:
             ev.set()
+
+    async def _apply_pool_concurrency(self, pool: dict[str, Any], desired: int) -> None:
+        """Raise/lower live concurrency; excess in-flight downloads yield and requeue."""
+        desired = max(1, min(5, int(desired or 1)))
+        prev = max(1, int(pool.get("concurrency") or 1))
+        if not pool.get("started"):
+            pool["concurrency"] = desired
+            return
+        pool["concurrency"] = desired
+        ctx = pool.get("_ctx") or {}
+        task_id = int(ctx.get("task_id") or pool.get("_task_id") or 0)
+
+        # Shrink: ask workers above the new limit to yield their current file
+        yielded = 0
+        for wid, info in list((pool.get("active") or {}).items()):
+            if int(wid) > desired:
+                ev = info.get("yield")
+                if isinstance(ev, asyncio.Event) and not ev.is_set():
+                    ev.set()
+                    yielded += 1
+        if yielded and task_id:
+            try:
+                asyncio.get_running_loop().create_task(
+                    self.db.append_log(
+                        task_id,
+                        f"并发 {prev}→{desired}：多余下载改排队续传（当前文件下完后立即处理）",
+                    )
+                )
+            except Exception:
+                pass
+
+        # Grow / refill: spawn missing workers
+        if desired > len(pool.get("worker_tasks") or {}):
+            await self._spawn_missing_pool_workers(pool)
+
+        if task_id:
+            self._ensure_worker_progress(task_id, desired)
+        self._pool_signal_done(pool)
+
+    async def _spawn_missing_pool_workers(self, pool: dict[str, Any]) -> None:
+        ctx = pool.get("_ctx")
+        if not ctx or not pool.get("started"):
+            return
+        n = max(1, min(5, int(pool.get("concurrency") or 1)))
+        tasks_map: dict[int, asyncio.Task] = pool.setdefault("worker_tasks", {})
+        workers_list: list = pool.setdefault("workers", [])
+        task_id = int(ctx["task_id"])
+        for wid in range(1, n + 1):
+            existing = tasks_map.get(wid)
+            if existing is not None and not existing.done():
+                continue
+            t = asyncio.create_task(
+                self._download_worker_loop(wid, pool),
+                name=f"dl-worker-{task_id}-{wid}",
+            )
+            tasks_map[wid] = t
+            workers_list.append(t)
+        self._ensure_worker_progress(task_id, n)
 
     async def _ensure_pool_workers(
         self,
@@ -3131,12 +3219,8 @@ class DownloadScheduler:
         test_mode: bool = False,
         log_prefix: str = "",
     ) -> None:
-        if pool.get("started"):
-            return
         n = max(1, min(5, int(pool.get("concurrency") or 1)))
         pool["concurrency"] = n
-        pool["started"] = True
-        pool["blocked"] = False
         pool["_ctx"] = {
             "task_id": task_id,
             "stop_event": stop_event,
@@ -3147,28 +3231,64 @@ class DownloadScheduler:
             "test_mode": test_mode,
             "log_prefix": log_prefix,
         }
+        pool["_task_id"] = int(task_id)
+        if pool.get("started"):
+            # Already running — only sync concurrency / spawn missing workers
+            await self._apply_pool_concurrency(pool, n)
+            return
+        pool["started"] = True
+        pool["blocked"] = False
+        pool["_stopping"] = False
+        pool.setdefault("priority", deque())
+        pool.setdefault("active", {})
+        pool.setdefault("worker_tasks", {})
+        self._live_pools[int(task_id)] = pool
         self._ensure_worker_progress(task_id, n)
-        workers = []
-        for wid in range(1, n + 1):
-            workers.append(
-                asyncio.create_task(
-                    self._download_worker_loop(wid, pool),
-                    name=f"dl-worker-{task_id}-{wid}",
-                )
-            )
-        pool["workers"] = workers
+        await self._spawn_missing_pool_workers(pool)
 
     async def _download_worker_loop(self, worker_id: int, pool: dict[str, Any]) -> None:
-        """Resident worker: pull jobs until sentinel None."""
+        """Resident worker: pull jobs until sentinel None; park when above concurrency."""
         q: asyncio.Queue = pool["queue"]
+        wid = int(worker_id)
         while True:
-            job = await q.get()
+            if pool.get("_stopping"):
+                return
+
+            # Above current concurrency → park (do not pull new work)
+            while wid > int(pool.get("concurrency") or 1) and not pool.get("_stopping"):
+                await asyncio.sleep(0.12)
+            if pool.get("_stopping"):
+                return
+
+            job = None
+            from_queue = False
+            pri = pool.get("priority")
+            if pri:
+                try:
+                    job = pri.popleft()
+                except IndexError:
+                    job = None
+            if job is None:
+                try:
+                    job = await asyncio.wait_for(q.get(), timeout=0.35)
+                    from_queue = True
+                except asyncio.TimeoutError:
+                    continue
+
             try:
                 if job is None:
                     return
+
+                # Became excess while waiting — put job back for lower workers
+                if wid > int(pool.get("concurrency") or 1):
+                    pool.setdefault("priority", deque()).appendleft(job)
+                    continue
+
                 ctx = pool.get("_ctx") or {}
                 task_id = int(ctx["task_id"])
                 stop_event: asyncio.Event = ctx["stop_event"]
+                yield_ev = asyncio.Event()
+                pool.setdefault("active", {})[wid] = {"yield": yield_ev, "job": job}
                 async with pool["lock"]:
                     pool["in_flight"] = int(pool.get("in_flight") or 0) + 1
                 result: bool | str = False
@@ -3181,16 +3301,18 @@ class DownloadScheduler:
                         test_mode=bool(ctx.get("test_mode")),
                         caption=job.caption,
                         message_id=job.message_id,
-                        worker_id=worker_id,
+                        worker_id=wid,
+                        yield_event=yield_ev,
                     )
                 except Exception:
                     logger.exception(
-                        "download worker %s crashed: msg %s", worker_id, job.message_id
+                        "download worker %s crashed: msg %s", wid, job.message_id
                     )
                     result = False
                     pool["blocked"] = True
                 finally:
-                    self._set_worker_idle(task_id, worker_id)
+                    pool.get("active", {}).pop(wid, None)
+                    self._set_worker_idle(task_id, wid)
                     async with pool["lock"]:
                         pool["in_flight"] = max(0, int(pool.get("in_flight") or 0) - 1)
                     self._pool_signal_done(pool)
@@ -3214,7 +3336,8 @@ class DownloadScheduler:
                     pool["blocked"] = True
                     self._pool_signal_done(pool)
             finally:
-                q.task_done()
+                if from_queue:
+                    q.task_done()
 
     async def _settle_pool_job(
         self,
@@ -3232,8 +3355,18 @@ class DownloadScheduler:
     ) -> None:
         """Apply one finished job to counters / checkpoint (worker-safe)."""
         merge_groups: list[list[str]] = []
+        deferred_rel = None
         async with pool["lock"]:
-            if result == "paused":
+            if result == "deferred":
+                # Concurrency shrink: keep .part, resume ASAP on a free slot
+                pool["settled"].pop(job.message_id, None)
+                pool.setdefault("priority", deque()).appendleft(job)
+                try:
+                    deferred_rel = str(job.target_path.relative_to(settings.download_dir))
+                except Exception:
+                    deferred_rel = str(job.target_path)
+                self._pool_signal_done(pool)
+            elif result == "paused":
                 if await self._salvage_complete_file(
                     task_id=task_id,
                     message_id=job.message_id,
@@ -3246,6 +3379,16 @@ class DownloadScheduler:
                     pool["blocked"] = True
                     return
 
+        if deferred_rel is not None:
+            await self.db.append_log(
+                task_id, f"排队续传（并发已调整）: {deferred_rel}"
+            )
+            return
+
+        async with pool["lock"]:
+            if result == "paused":
+                # already handled above
+                return
             pool["settled"][job.message_id] = True
             downloaded = int(counters["downloaded"])
             failed = int(counters["failed"])
@@ -3258,6 +3401,8 @@ class DownloadScheduler:
                     job.message_id,
                     status="done",
                     file_path=str(job.target_path),
+                    chat_id=counters.get("chat_id"),
+                    commit=False,
                 )
                 label = "测试占位" if test_mode else (log_prefix or "已下载")
                 try:
@@ -3274,6 +3419,7 @@ class DownloadScheduler:
                     job.message_id,
                     status="failed",
                     error="download failed",
+                    commit=False,
                 )
                 await self.db.append_log(
                     task_id,
@@ -3310,6 +3456,7 @@ class DownloadScheduler:
                 counters["_db_flush_t"] = now_m
                 await self.db.update_task(
                     task_id,
+                    commit=False,
                     current_folder=current_folder,
                     last_message_id=last_id,
                     processed_count=processed,
@@ -3317,6 +3464,7 @@ class DownloadScheduler:
                     failed_count=failed,
                     skipped_count=int(counters.get("skipped") or 0),
                 )
+            await self.db.commit()
 
         if merge_groups:
             cid = counters.get("chat_id")
@@ -3351,13 +3499,13 @@ class DownloadScheduler:
             return False
         if not wait:
             return bool(pool.get("blocked"))
-        if int(pool.get("in_flight") or 0) <= 0 and pool["queue"].empty():
+        if int(pool.get("in_flight") or 0) <= 0 and self._pool_pending_count(pool) <= 0:
             return bool(pool.get("blocked"))
         ev: asyncio.Event = pool["done_event"]
         while True:
             if pool.get("blocked"):
                 return True
-            if int(pool.get("in_flight") or 0) <= 0 and pool["queue"].empty():
+            if int(pool.get("in_flight") or 0) <= 0 and self._pool_pending_count(pool) <= 0:
                 return bool(pool.get("blocked"))
             ev.clear()
             try:
@@ -3386,7 +3534,7 @@ class DownloadScheduler:
         while True:
             if pool.get("blocked"):
                 break
-            if int(pool.get("in_flight") or 0) <= 0 and pool["queue"].empty():
+            if int(pool.get("in_flight") or 0) <= 0 and self._pool_pending_count(pool) <= 0:
                 break
             await self._pool_reap(
                 pool,
@@ -3412,6 +3560,12 @@ class DownloadScheduler:
                         pool["settled"][job.message_id] = False
                 finally:
                     pool["queue"].task_done()
+            pri = pool.get("priority")
+            if pri:
+                while pri:
+                    job = pri.popleft()
+                    if job is not None:
+                        pool["settled"][job.message_id] = False
             # Wait for the file currently inside each worker (bounded)
             wait_rounds = 0
             while int(pool.get("in_flight") or 0) > 0:
@@ -3434,9 +3588,16 @@ class DownloadScheduler:
                     wait=True,
                 )
 
-        # Stop resident workers with sentinels
-        n = max(1, int(pool.get("concurrency") or 1))
-        for _ in range(n):
+        # Stop resident workers with sentinels (include parked excess workers)
+        pool["_stopping"] = True
+        n_workers = max(
+            len(pool.get("worker_tasks") or {}),
+            len(pool.get("workers") or {}),
+            int(pool.get("concurrency") or 1),
+        )
+        # Unpark excess workers so they can receive sentinels
+        pool["concurrency"] = max(n_workers, int(pool.get("concurrency") or 1))
+        for _ in range(n_workers):
             await pool["queue"].put(None)
         workers = list(pool.get("workers") or [])
         if workers:
@@ -3452,8 +3613,13 @@ class DownloadScheduler:
                         w.cancel()
                 await asyncio.gather(*workers, return_exceptions=True)
         pool["workers"] = []
+        pool["worker_tasks"] = {}
+        pool["active"] = {}
+        pool["priority"] = deque()
         pool["started"] = False
+        pool["_stopping"] = False
         pool["_ctx"] = None
+        self._live_pools.pop(int(task_id), None)
         blocked = bool(pool.get("blocked"))
         if blocked:
             # Pause: keep frozen progress on the live box
@@ -3492,8 +3658,14 @@ class DownloadScheduler:
         Enqueue a job for a resident worker.
         Returns: 'ok' | 'paused' | 'limit'
         """
-        conc = max(1, min(5, int(concurrency or pool.get("concurrency") or 1)))
-        pool["concurrency"] = conc
+        # Prefer live task setting so mid-run concurrency edits apply immediately
+        try:
+            fresh = await self.db.get_task(task_id) or {}
+            live_c = int(fresh.get("concurrency") or concurrency or 1)
+        except Exception:
+            live_c = int(concurrency or pool.get("concurrency") or 1)
+        conc = max(1, min(5, live_c))
+        await self._apply_pool_concurrency(pool, conc)
         await self._ensure_pool_workers(
             pool,
             task_id=task_id,
@@ -3512,14 +3684,14 @@ class DownloadScheduler:
             downloaded = int(counters["downloaded"])
             if max_messages and downloaded >= max_messages:
                 return "limit"
-            limit_cap = conc
+            limit_cap = int(pool.get("concurrency") or conc)
             if max_messages is not None:
                 limit_cap = min(limit_cap, max(0, max_messages - downloaded))
             if limit_cap <= 0:
                 return "limit"
             in_flight = int(pool.get("in_flight") or 0)
-            queued = pool["queue"].qsize()
-            if in_flight + queued < limit_cap:
+            pending = self._pool_pending_count(pool)
+            if in_flight + pending < limit_cap:
                 break
             waited_for_slot = True
             if await self._pool_reap(
@@ -3858,8 +4030,9 @@ class DownloadScheduler:
         caption: str = "",
         message_id: Optional[int] = None,
         worker_id: int | None = None,
+        yield_event: asyncio.Event | None = None,
     ) -> bool | str:
-        """Return True/False, or 'paused' if stop requested / long flood wait."""
+        """Return True/False, 'paused' (task stop), or 'deferred' (concurrency yield)."""
         settings = get_settings()
         mid = int(message_id or getattr(message, "id", 0) or 0)
         try:
@@ -3867,13 +4040,50 @@ class DownloadScheduler:
         except ValueError:
             rel = str(target_path)
 
+        def _stop_or_yield() -> str | None:
+            if stop_event.is_set():
+                return "paused"
+            if yield_event is not None and yield_event.is_set():
+                return "deferred"
+            return None
+
+        async def _combined_stop() -> tuple[asyncio.Event, asyncio.Task | None]:
+            """Bridge task-stop + concurrency-yield into one Event for Telethon."""
+            if yield_event is None:
+                return stop_event, None
+            combined = asyncio.Event()
+            if stop_event.is_set() or yield_event.is_set():
+                combined.set()
+                return combined, None
+
+            async def _bridge() -> None:
+                t_stop = asyncio.create_task(stop_event.wait())
+                t_yield = asyncio.create_task(yield_event.wait())
+                try:
+                    await asyncio.wait(
+                        {t_stop, t_yield}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    combined.set()
+                finally:
+                    for t in (t_stop, t_yield):
+                        if not t.done():
+                            t.cancel()
+                            try:
+                                await t
+                            except asyncio.CancelledError:
+                                pass
+
+            bridge_task = asyncio.create_task(_bridge())
+            return combined, bridge_task
+
         expected_size = 0
         if message.file and getattr(message.file, "size", None):
             expected_size = int(message.file.size)
 
         if test_mode:
-            if stop_event.is_set():
-                return "paused"
+            reason = _stop_or_yield()
+            if reason:
+                return reason
             try:
                 self._begin_file_progress(
                     task_id, mid, rel, total=len(caption or "") or 1, worker_id=worker_id
@@ -3888,6 +4098,12 @@ class DownloadScheduler:
                 target_path.write_bytes(data)
                 self._on_bytes_progress(task_id, mid, len(data), len(data))
                 await asyncio.sleep(0.05)
+                reason = _stop_or_yield()
+                if reason:
+                    self._finish_file_progress(
+                        task_id, mid, remove=True, completed=False, worker_id=worker_id
+                    )
+                    return reason
                 self._finish_file_progress(
                     task_id,
                     mid,
@@ -3910,7 +4126,8 @@ class DownloadScheduler:
 
         retries = max(1, settings.max_retries)
         for attempt in range(1, retries + 1):
-            if stop_event.is_set():
+            reason = _stop_or_yield()
+            if reason:
                 self._finish_file_progress(task_id, mid, remove=True)
                 if await self._salvage_complete_file(
                     task_id=task_id,
@@ -3921,9 +4138,10 @@ class DownloadScheduler:
                 ):
                     await self.db.append_log(task_id, f"暂停前已下完，保留: {rel}")
                     return True
-                return "paused"
+                return reason
             watch_stop = asyncio.Event()
             watch_task: asyncio.Task | None = None
+            bridge_task: asyncio.Task | None = None
             try:
                 self._begin_file_progress(task_id, mid, rel, total=expected_size, worker_id=worker_id)
                 # No "正在下载"/"断点续传" logs — live progress already shows that.
@@ -3967,6 +4185,7 @@ class DownloadScheduler:
                         task_id, mid, tmp_path, watch_stop, expected_size
                     )
                 )
+                combined_stop, bridge_task = await _combined_stop()
                 try:
                     result = await asyncio.wait_for(
                         tg_manager.download_media_to(
@@ -3974,12 +4193,18 @@ class DownloadScheduler:
                             tmp_path,
                             progress_callback=_cb,
                             resume=True,
-                            stop_event=stop_event,
+                            stop_event=combined_stop,
                         ),
                         timeout=7200,
                     )
                 finally:
                     watch_stop.set()
+                    if bridge_task and not bridge_task.done():
+                        bridge_task.cancel()
+                        try:
+                            await bridge_task
+                        except asyncio.CancelledError:
+                            pass
                     if watch_task and not watch_task.done():
                         watch_task.cancel()
                         try:
@@ -4025,6 +4250,8 @@ class DownloadScheduler:
                 return True
             except DownloadPaused:
                 watch_stop.set()
+                if bridge_task and not bridge_task.done():
+                    bridge_task.cancel()
                 if watch_task:
                     watch_task.cancel()
                 # Preserve real stop-time bytes (do not bump bar to 100%)
@@ -4038,12 +4265,20 @@ class DownloadScheduler:
                 ):
                     await self.db.append_log(task_id, f"暂停前已下完，保留: {rel}")
                     return True
+                reason = _stop_or_yield() or "paused"
+                if reason == "deferred":
+                    await self.db.append_log(
+                        task_id, f"并发让出，保留进度: {rel}（优先续传）"
+                    )
+                    return "deferred"
                 await self.db.append_log(
                     task_id, f"已暂停，保留进度: {rel}（可继续续传）"
                 )
                 return "paused"
             except asyncio.CancelledError:
                 watch_stop.set()
+                if bridge_task and not bridge_task.done():
+                    bridge_task.cancel()
                 if watch_task:
                     watch_task.cancel()
                 self._finish_file_progress(task_id, mid, remove=True, completed=False)
@@ -4059,6 +4294,8 @@ class DownloadScheduler:
                 raise
             except FloodWaitError as e:
                 watch_stop.set()
+                if bridge_task and not bridge_task.done():
+                    bridge_task.cancel()
                 if watch_task:
                     watch_task.cancel()
                 self._finish_file_progress(task_id, mid, remove=True, completed=False)
@@ -4074,6 +4311,8 @@ class DownloadScheduler:
                     return "paused"
             except Exception as e:
                 watch_stop.set()
+                if bridge_task and not bridge_task.done():
+                    bridge_task.cancel()
                 if watch_task:
                     watch_task.cancel()
                 self._finish_file_progress(task_id, mid, remove=True, completed=False)

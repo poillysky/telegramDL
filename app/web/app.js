@@ -578,6 +578,7 @@ function restoreTaskListCache() {
     list.innerHTML = html;
     bindTaskActions(list);
     scheduleIosHairlinePass();
+    scheduleFitMobileTaskLog();
     return true;
   } catch (_) {
     return false;
@@ -932,6 +933,10 @@ function bindUi() {
   window.addEventListener("resize", () => {
     const modal = $("createModal");
     if (modal && !modal.hidden) syncModeTabSlider();
+    scheduleFitMobileTaskLog();
+  });
+  window.addEventListener("orientationchange", () => {
+    setTimeout(scheduleFitMobileTaskLog, 120);
   });
   const btnScan = $("btnIndexScan");
   const btnFull = $("btnIndexFull");
@@ -1288,6 +1293,60 @@ function isCoarseTouchUi() {
   }
 }
 
+/** Mobile: stretch the single-task log so its bottom meets the viewport bottom. */
+function fitMobileTaskLogToBottom() {
+  const touch =
+    document.documentElement.classList.contains("touch-ui") || isCoarseTouchUi();
+  if (!touch) return;
+  const page = $("pageTasks");
+  if (!page || page.hidden) return;
+  const tasks = document.querySelectorAll(".page-tasks .tasks > .task");
+  const clearFit = (log) => {
+    const body = log?.querySelector(".task-log-body, .task-log-empty");
+    if (!body) return;
+    body.style.height = "";
+    body.style.minHeight = "";
+    body.style.maxHeight = "";
+    log.style.maxHeight = "";
+  };
+  if (tasks.length !== 1) {
+    tasks.forEach((t) => clearFit(t.querySelector(".task-log")));
+    return;
+  }
+  const log = tasks[0].querySelector(".task-log");
+  const body = log?.querySelector(".task-log-body, .task-log-empty");
+  if (!body) return;
+  log.style.maxHeight = "none";
+  body.style.height = "";
+  body.style.minHeight = "";
+  body.style.maxHeight = "none";
+  void body.offsetHeight;
+  const rect = body.getBoundingClientRect();
+  const scrollY = window.scrollY || window.pageYOffset || 0;
+  const topDoc = rect.top + scrollY;
+  let safeBottom = 0;
+  try {
+    safeBottom =
+      parseFloat(
+        getComputedStyle(document.documentElement).getPropertyValue("--safe-bottom")
+      ) || 0;
+  } catch (_) {}
+  const bottomPad = Math.max(10, safeBottom + 6);
+  const h = Math.max(200, Math.floor(window.innerHeight - topDoc - bottomPad));
+  body.style.height = `${h}px`;
+  body.style.minHeight = `${h}px`;
+  body.style.maxHeight = "none";
+}
+
+function scheduleFitMobileTaskLog() {
+  if (state._fitLogRaf) cancelAnimationFrame(state._fitLogRaf);
+  state._fitLogRaf = requestAnimationFrame(() => {
+    state._fitLogRaf = 0;
+    fitMobileTaskLogToBottom();
+    requestAnimationFrame(fitMobileTaskLogToBottom);
+  });
+}
+
 /** iOS Safari sometimes leaves 1px black streaks until a compositor refresh. */
 function nudgeIosRepaint(root) {
   if (!isCoarseTouchUi() && !document.documentElement.classList.contains("touch-ui")) {
@@ -1387,6 +1446,7 @@ function switchPage(name) {
   requestAnimationFrame(() => {
     nudgeIosRepaint(document.documentElement);
     scheduleIosHairlinePass();
+    scheduleFitMobileTaskLog();
   });
 }
 
@@ -1678,6 +1738,13 @@ function paintIndexPanelFromCache(chatId) {
   return true;
 }
 
+function formatAutoIntervalShort(min) {
+  const n = Math.max(1, Number(min) || 60);
+  if (n % 1440 === 0) return `${n / 1440} 天`;
+  if (n % 60 === 0) return `${n / 60} 小时`;
+  return `${n} 分钟`;
+}
+
 function renderIndexMeta(scanning) {
   const metaEl = $("indexMetaText");
   const btnStop = $("btnIndexStop");
@@ -1691,21 +1758,21 @@ function renderIndexMeta(scanning) {
     : "尚未扫描";
   const coverHint =
     cov.complete === true
-      ? " · 已覆盖全群"
+      ? " · 已覆盖"
       : cov.complete === false
-        ? ` · 未全覆盖（落后 ${cov.behind || "?"}）`
+        ? ` · 落后 ${cov.behind || "?"}`
         : "";
   const autoOn = !!Number(m.auto_incremental);
   const autoMin = Number(m.auto_interval_min) || 60;
-  const autoHint = autoOn ? ` · 自动增量每 ${autoMin} 分钟` : "";
+  const autoHint = autoOn ? ` · 自动 ${formatAutoIntervalShort(autoMin)}` : "";
   if (scanning || m.status === "scanning") {
-    metaEl.textContent = `扫描中… 已看 ${scanned} 条消息，已存 ${count} 条媒体文案${
+    metaEl.textContent = `扫描中… 已看 ${scanned} · 已存 ${count}${
       m.last_error ? `（${m.last_error}）` : ""
     }${autoHint}`;
   } else if (m.status === "error") {
-    metaEl.textContent = `索引出错：${m.last_error || "未知错误"} · 已存 ${count} 条`;
+    metaEl.textContent = `出错：${m.last_error || "未知"} · ${count} 条`;
   } else {
-    metaEl.textContent = `上次扫描 ${last} · 已存 ${count} 条媒体完整文案${coverHint}${autoHint}`;
+    metaEl.textContent = `${last} · ${count} 条${coverHint}${autoHint}`;
   }
   if (btnStop) btnStop.hidden = !(scanning || m.status === "scanning");
   syncAutoIndexControls(m);
@@ -5123,48 +5190,54 @@ async function saveTaskTagsModal() {
   const btn = $("btnTagsModalSave");
   const tagsChanged =
     downloadMode === "monitor" && Object.prototype.hasOwnProperty.call(body, "include_tags");
-  await withBusy(btn, async () => {
-    try {
-      const r = await api(`/api/tasks/${draft.taskId}/settings`, {
-        method: "PATCH",
-        body: JSON.stringify(body),
-      });
-      if (!r.ok) throw new Error(r.message || "保存失败");
+  const tagN = (draft.tags || []).length;
+  let msg = "任务设置已保存";
+  if (downloadMode === "monitor") {
+    if (tagsChanged && tagN) msg += " · 开始按标签下载";
+    if (autoEnabled) msg += ` · 自动增量每 ${autoInterval} 分钟`;
+  }
 
-      // Close immediately — auto-scan + task list refresh must not block the button
-      const tagN = (draft.tags || []).length;
-      let msg = "任务设置已保存";
-      if (downloadMode === "monitor") {
-        if (tagsChanged && tagN) msg += " · 开始按标签下载";
-        if (autoEnabled) msg += ` · 自动增量每 ${autoInterval} 分钟`;
+  // Close instantly — do not wait for SQLite / live-pool work on the button
+  toast(msg, "ok");
+  closeTaskTagsModal();
+
+  const taskId = draft.taskId;
+  const chatId = draft.chatId;
+  const title = draft.title || "";
+
+  api(`/api/tasks/${taskId}/settings`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  })
+    .then((r) => {
+      if (!r || r.ok === false) {
+        toast("保存失败: " + ((r && r.message) || "未知错误"), "err");
+        return;
       }
-      toast(msg, "ok");
-      closeTaskTagsModal();
-
       if (downloadMode === "monitor") {
-        api(`/api/index/${encodeURIComponent(draft.chatId)}/auto-scan`, {
+        api(`/api/index/${encodeURIComponent(chatId)}/auto-scan`, {
           method: "PATCH",
           body: JSON.stringify({
             enabled: autoEnabled,
             interval_min: autoInterval,
-            chat_title: draft.title || "",
+            chat_title: title,
           }),
         }).catch(() => {});
-        if (state.indexMeta && String(state.indexMetaChatId) === String(draft.chatId)) {
+        if (state.indexMeta && String(state.indexMetaChatId) === String(chatId)) {
           state.indexMeta = {
             ...state.indexMeta,
             auto_incremental: autoEnabled ? 1 : 0,
             auto_interval_min: autoInterval,
           };
-          rememberIndexMetaCache(draft.chatId, {
+          rememberIndexMetaCache(chatId, {
             meta: state.indexMeta,
             coverage: state.indexCoverage,
             scanning: false,
           });
         } else {
-          const cached = readIndexMetaCache(draft.chatId);
+          const cached = readIndexMetaCache(chatId);
           if (cached?.meta) {
-            rememberIndexMetaCache(draft.chatId, {
+            rememberIndexMetaCache(chatId, {
               meta: {
                 ...cached.meta,
                 auto_incremental: autoEnabled ? 1 : 0,
@@ -5176,12 +5249,11 @@ async function saveTaskTagsModal() {
           }
         }
       }
-
       loadTasks({ force: true }).catch(() => {});
-    } catch (e) {
+    })
+    .catch((e) => {
       toast("保存失败: " + (e.message || e), "err");
-    }
-  });
+    });
 }
 
 function liveWorkersActive(workers) {
@@ -5755,6 +5827,7 @@ async function loadTasks(opts = {}) {
         }
         restoreTaskLogScroll(scrollMap);
         bindTaskActions(list);
+        scheduleFitMobileTaskLog();
         // sessionStorage rewrite is expensive — only every ~8s while polling
         const now = Date.now();
         if (!state._tasksCacheAt || now - state._tasksCacheAt > 8000) {
@@ -5775,6 +5848,7 @@ async function loadTasks(opts = {}) {
       restoreTaskLogScroll(scrollMap);
       bindTaskActions(list);
       scheduleIosHairlinePass();
+      scheduleFitMobileTaskLog();
     } catch (e) {
       if (isSoftAuthError(e)) return;
       if (list && !list.querySelector(".task[data-task-id]")) {

@@ -331,6 +331,48 @@ async def _with_tag_progress(task: dict) -> dict:
     return out
 
 
+def _task_list_snapshot(task: dict) -> dict:
+    """Fast task payload for settings save — cache only, no DB COUNT / index probes."""
+    tid = int(task["id"])
+    chat_id = task.get("chat_id")
+    if chat_id is not None:
+        _task_chat_map[tid] = str(chat_id)
+
+    match_cached = _tag_match_cache.get(tid)
+    done_cached = _tag_done_cache.get(tid)
+    tag_match = int(match_cached[1]) if match_cached else 0
+    tag_done = (
+        int(done_cached[1])
+        if done_cached
+        else int(task.get("downloaded_count") or 0)
+    )
+    key = str(chat_id or "").strip()
+    idx_cached = _index_count_cache.get(key) if key else None
+    index_n = int(idx_cached[1]) if idx_cached else int(
+        (task.get("index_media_count") or 0)
+    )
+
+    last_log = task.get("last_log") or ""
+    if isinstance(last_log, str) and len(last_log) > 2500:
+        chunk = last_log[:2500]
+        nl = chunk.rfind("\n")
+        if nl >= 800:
+            chunk = chunk[:nl]
+        last_log = chunk
+
+    out = {
+        **task,
+        "last_log": last_log,
+        "tag_match_count": tag_match,
+        "tag_processed_count": tag_done,
+        "index_media_count": index_n,
+    }
+    prog = scheduler.get_live_progress(tid)
+    if prog:
+        out = {**out, "live": prog}
+    return out
+
+
 _last_heal_mono: float = 0.0
 
 
@@ -558,8 +600,15 @@ async def update_task_settings(
 
     if body.concurrency is not None:
         conc = max(1, min(5, int(body.concurrency)))
-        fields["concurrency"] = conc
-        log_bits.append(f"并发 {conc}")
+        old_conc = max(1, min(5, int(task.get("concurrency") or 1)))
+        if conc != old_conc:
+            fields["concurrency"] = conc
+            log_bits.append(f"并发 {conc}")
+            concurrency_changed = True
+        else:
+            concurrency_changed = False
+    else:
+        concurrency_changed = False
 
     if body.delay_min is not None or body.delay_max is not None:
         dmin = float(
@@ -574,17 +623,26 @@ async def update_task_settings(
         )
         if dmax < dmin:
             dmax = dmin
-        fields["delay_min"] = dmin
-        fields["delay_max"] = dmax
-        log_bits.append(f"延迟 {dmin:g}–{dmax:g}s")
+        old_dmin = float(
+            task.get("delay_min") if task.get("delay_min") is not None else 0.5
+        )
+        old_dmax = float(
+            task.get("delay_max") if task.get("delay_max") is not None else old_dmin
+        )
+        if abs(dmin - old_dmin) > 1e-9 or abs(dmax - old_dmax) > 1e-9:
+            fields["delay_min"] = dmin
+            fields["delay_max"] = dmax
+            log_bits.append(f"延迟 {dmin:g}–{dmax:g}s")
 
     if body.media_types is not None:
         allowed = {"photo", "video", "document", "audio", "voice", "video_note"}
         media = [str(x) for x in body.media_types if str(x) in allowed]
         if not media:
             media = list(DEFAULT_MEDIA)
-        fields["media_types"] = media
-        log_bits.append("媒体 " + "、".join(media))
+        old_media = [str(x) for x in (task.get("media_types") or [])]
+        if set(media) != set(old_media) or len(media) != len(old_media):
+            fields["media_types"] = media
+            log_bits.append("媒体 " + "、".join(media))
 
     if body.folder_mode is not None:
         folder_mode = str(body.folder_mode or "caption")
@@ -650,13 +708,38 @@ async def update_task_settings(
         log_bits.append(f"最大文件 {fields['max_file_bytes']}B")
 
     if not fields:
-        return {"ok": True, "task": await _with_tag_progress(task)}
+        return {"ok": True, "task": _task_list_snapshot(task)}
 
     await db.update_task(task_id, **fields)
-    await db.append_log(task_id, "已更新任务设置: " + " · ".join(log_bits))
+    # Log in background — append_log contends with downloaders on SQLite
+    try:
+        import asyncio
+
+        asyncio.get_running_loop().create_task(
+            db.append_log(task_id, "已更新任务设置: " + " · ".join(log_bits))
+        )
+    except Exception:
+        await db.append_log(task_id, "已更新任务设置: " + " · ".join(log_bits))
     _tag_match_cache.pop(int(task_id), None)
     _tag_done_cache.pop(int(task_id), None)
     task = await db.get_task(task_id)
+
+    # Hot-apply concurrency without blocking the HTTP response
+    if concurrency_changed:
+        try:
+            import asyncio
+
+            conc_now = int(task.get("concurrency") or 1)
+
+            async def _hot_conc() -> None:
+                try:
+                    await scheduler.apply_live_concurrency(task_id, conc_now)
+                except Exception:
+                    pass
+
+            asyncio.get_running_loop().create_task(_hot_conc())
+        except Exception:
+            pass
 
     # Wake idle local monitor (non-tag settings, or tag clear)
     try:
@@ -673,14 +756,34 @@ async def update_task_settings(
         new_kws = normalize_keyword_list(task.get("caption_keywords") or [])
         changed = set(new_tags) != set(old_tags) or set(new_kws) != set(old_kws)
         if changed and (new_tags or new_kws):
-            await db.append_log(task_id, "标签已更新，开始补下")
-            await db.update_task(task_id, status="pending", last_error=None)
-            await scheduler.start_task(task_id)
-            task = await db.get_task(task_id)
-        elif changed:
-            await db.append_log(task_id, "标签已清空，等待配置")
+            try:
+                import asyncio
 
-    return {"ok": True, "task": await _with_tag_progress(task)}
+                async def _kick_tags() -> None:
+                    try:
+                        await db.append_log(task_id, "标签已更新，开始补下")
+                        await db.update_task(task_id, status="pending", last_error=None)
+                        await scheduler.start_task(task_id)
+                    except Exception:
+                        pass
+
+                asyncio.get_running_loop().create_task(_kick_tags())
+            except Exception:
+                await db.append_log(task_id, "标签已更新，开始补下")
+                await db.update_task(task_id, status="pending", last_error=None)
+                await scheduler.start_task(task_id)
+                task = await db.get_task(task_id)
+        elif changed:
+            try:
+                import asyncio
+
+                asyncio.get_running_loop().create_task(
+                    db.append_log(task_id, "标签已清空，等待配置")
+                )
+            except Exception:
+                await db.append_log(task_id, "标签已清空，等待配置")
+
+    return {"ok": True, "task": _task_list_snapshot(task)}
 
 
 @router.post("/{task_id}/start")

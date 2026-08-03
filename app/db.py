@@ -249,6 +249,7 @@ CREATE TABLE IF NOT EXISTS downloaded (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
+    chat_id TEXT,
     file_path TEXT,
     status TEXT NOT NULL DEFAULT 'done',
     error TEXT,
@@ -270,6 +271,8 @@ CREATE TABLE IF NOT EXISTS web_users (
 );
 
 CREATE INDEX IF NOT EXISTS idx_downloaded_task ON downloaded(task_id);
+CREATE INDEX IF NOT EXISTS idx_downloaded_status_id ON downloaded(status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_downloaded_chat_status_id ON downloaded(chat_id, status, id DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 
 CREATE TABLE IF NOT EXISTS chat_completed (
@@ -323,11 +326,20 @@ class Database:
         self.db_path = Path(db_path or get_settings().db_path)
         self._conn: Optional[aiosqlite.Connection] = None
         self._tag_bl_cache: Optional[frozenset[str]] = None
+        # Debounced log lines: task_id -> [line, ...]
+        self._log_pending: dict[int, list[str]] = {}
+        self._log_flush_task: Optional[asyncio.Task] = None
+        self._write_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
+        # Cut writer lock storms under multi-task downloads / index scans
+        await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("PRAGMA busy_timeout=30000")
+        await self._conn.execute("PRAGMA synchronous=NORMAL")
+        await self._conn.execute("PRAGMA temp_store=MEMORY")
         await self._conn.executescript(SCHEMA)
         await self._migrate()
         await self._conn.commit()
@@ -437,7 +449,48 @@ class Database:
             )
             await self.set_meta("chat_completed_backfilled", "1")
 
+        # Denormalize chat_id onto downloaded for fast history queries
+        async with self.conn.execute("PRAGMA table_info(downloaded)") as cur:
+            dl_cols = {row["name"] for row in await cur.fetchall()}
+        if "chat_id" not in dl_cols:
+            await self.conn.execute(
+                "ALTER TABLE downloaded ADD COLUMN chat_id TEXT"
+            )
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_downloaded_status_id ON downloaded(status, id DESC)"
+        )
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_downloaded_chat_status_id "
+            "ON downloaded(chat_id, status, id DESC)"
+        )
+        if not await self.get_meta("downloaded_chat_id_backfilled"):
+            await self.conn.execute(
+                """
+                UPDATE downloaded
+                SET chat_id = (
+                    SELECT t.chat_id FROM tasks t WHERE t.id = downloaded.task_id
+                )
+                WHERE chat_id IS NULL OR chat_id = ''
+                """
+            )
+            await self.set_meta("downloaded_chat_id_backfilled", "1")
+
+        await self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_tag_graph_cache (
+                chat_id TEXT PRIMARY KEY,
+                groups_json TEXT NOT NULL DEFAULT '[]',
+                related_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
     async def close(self) -> None:
+        try:
+            await self.flush_pending_logs()
+        except Exception:
+            pass
         if self._conn:
             await self._conn.close()
             self._conn = None
@@ -482,6 +535,11 @@ class Database:
         cleaned = normalize_blacklist_tags(tags)
         await self.set_meta(_TAG_BL_META_KEY, json.dumps(cleaned, ensure_ascii=False))
         self._tag_bl_cache = frozenset(cleaned)
+        # Related map depends on blacklist — drop durable graph for all chats
+        try:
+            await self.invalidate_tag_graph_cache()
+        except Exception:
+            self.invalidate_tag_groups_cache()
         return cleaned
 
     async def add_tag_relation_blacklist(self, tag: str) -> list[str]:
@@ -644,7 +702,9 @@ class Database:
             rows = await cur.fetchall()
             return [self._row_to_task(r) for r in rows]
 
-    async def update_task(self, task_id: int, **fields: Any) -> Optional[dict[str, Any]]:
+    async def update_task(
+        self, task_id: int, *, commit: bool = True, **fields: Any
+    ) -> Optional[dict[str, Any]]:
         if not fields:
             return await self.get_task(task_id)
         if "media_types" in fields and not isinstance(fields["media_types"], str):
@@ -666,7 +726,8 @@ class Database:
         await self.conn.execute(
             f"UPDATE tasks SET {cols} WHERE id = ?", values
         )
-        await self.conn.commit()
+        if commit:
+            await self.conn.commit()
         return await self.get_task(task_id)
 
     async def delete_task(self, task_id: int) -> None:
@@ -844,26 +905,29 @@ class Database:
         error: Optional[str] = None,
         *,
         chat_id: str | int | None = None,
+        commit: bool = True,
     ) -> None:
+        cid = chat_id
+        if cid is None:
+            task = await self.get_task(task_id)
+            cid = task.get("chat_id") if task else None
+        cid_s = str(cid) if cid is not None else None
         await self.conn.execute(
             """
-            INSERT INTO downloaded(task_id, message_id, file_path, status, error, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO downloaded(task_id, message_id, chat_id, file_path, status, error, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(task_id, message_id) DO UPDATE SET
+                chat_id = COALESCE(excluded.chat_id, downloaded.chat_id),
                 file_path = excluded.file_path,
                 status = excluded.status,
                 error = excluded.error
             """,
-            (task_id, message_id, file_path, status, error, _utcnow()),
+            (task_id, message_id, cid_s, file_path, status, error, _utcnow()),
         )
-        if status == "done":
-            cid = chat_id
-            if cid is None:
-                task = await self.get_task(task_id)
-                cid = task.get("chat_id") if task else None
-            if cid is not None:
-                await self.mark_chat_completed(cid, message_id, file_path=file_path)
-        await self.conn.commit()
+        if status == "done" and cid_s is not None:
+            await self.mark_chat_completed(cid_s, message_id, file_path=file_path)
+        if commit:
+            await self.conn.commit()
 
     async def list_download_history(
         self,
@@ -874,62 +938,105 @@ class Database:
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
+        """
+        History page query.
+
+        Avoids correlated ORDER BY subqueries (O(n²) on large tables). Uses
+        denormalized downloaded.chat_id + a one-shot chat_last CTE when listing
+        across all groups.
+        """
         limit = max(1, min(200, int(limit)))
         offset = max(0, int(offset))
-        where = ["1=1"]
+        status = (status or "").strip()
+        chat_id = str(chat_id or "").strip()
+        q = (q or "").strip()
+
+        where: list[str] = ["1=1"]
         params: list[Any] = []
         if status:
             where.append("d.status = ?")
             params.append(status)
         if chat_id:
-            where.append("t.chat_id = ?")
-            params.append(str(chat_id))
+            where.append("d.chat_id = ?")
+            params.append(chat_id)
         if q:
             where.append(
-                "(d.file_path LIKE ? OR t.chat_title LIKE ? OR CAST(d.message_id AS TEXT) LIKE ?)"
+                "(d.file_path LIKE ? OR IFNULL(t.chat_title,'') LIKE ? "
+                "OR CAST(d.message_id AS TEXT) LIKE ?)"
             )
             like = f"%{q}%"
             params.extend([like, like, like])
         clause = " AND ".join(where)
-        async with self.conn.execute(
-            f"""
-            SELECT COUNT(*) AS c
-            FROM downloaded d
-            JOIN tasks t ON t.id = d.task_id
-            WHERE {clause}
-            """,
-            params,
-        ) as cur:
-            total = int((await cur.fetchone())["c"])
-        # Cluster by chat (most recently active group first), then newest file
-        if chat_id:
-            order_sql = "d.id DESC"
-            order_params: list[Any] = []
-        else:
-            order_sql = """
-            (
-              SELECT MAX(d2.id)
-              FROM downloaded d2
-              JOIN tasks t2 ON t2.id = d2.task_id
-              WHERE t2.chat_id = t.chat_id
-                AND (? = '' OR d2.status = ?)
-            ) DESC,
-            t.chat_id,
-            d.id DESC
+
+        # COUNT: prefer downloaded-only when search does not touch chat_title
+        if q:
+            count_sql = f"""
+                SELECT COUNT(*) AS c
+                FROM downloaded d
+                LEFT JOIN tasks t ON t.id = d.task_id
+                WHERE {clause}
             """
-            order_params = [status or "", status or ""]
-        async with self.conn.execute(
-            f"""
-            SELECT d.id, d.task_id, d.message_id, d.file_path, d.status, d.error, d.created_at,
-                   t.chat_id, t.chat_title
-            FROM downloaded d
-            JOIN tasks t ON t.id = d.task_id
-            WHERE {clause}
-            ORDER BY {order_sql}
-            LIMIT ? OFFSET ?
-            """,
-            params + order_params + [limit, offset],
-        ) as cur:
+            count_params = list(params)
+        elif chat_id and status:
+            count_sql = (
+                "SELECT COUNT(*) AS c FROM downloaded d "
+                "WHERE d.status = ? AND d.chat_id = ?"
+            )
+            count_params = [status, chat_id]
+        elif status:
+            count_sql = "SELECT COUNT(*) AS c FROM downloaded d WHERE d.status = ?"
+            count_params = [status]
+        else:
+            count_sql = f"""
+                SELECT COUNT(*) AS c
+                FROM downloaded d
+                LEFT JOIN tasks t ON t.id = d.task_id
+                WHERE {clause}
+            """
+            count_params = list(params)
+
+        async with self.conn.execute(count_sql, count_params) as cur:
+            total = int((await cur.fetchone())["c"])
+
+        select_cols = """
+            d.id, d.task_id, d.message_id, d.file_path, d.status, d.error, d.created_at,
+            COALESCE(d.chat_id, t.chat_id) AS chat_id,
+            IFNULL(t.chat_title, '') AS chat_title
+        """
+        if chat_id:
+            # Single group: cheap index scan on (chat_id, status, id)
+            list_sql = f"""
+                SELECT {select_cols}
+                FROM downloaded d
+                LEFT JOIN tasks t ON t.id = d.task_id
+                WHERE {clause}
+                ORDER BY d.id DESC
+                LIMIT ? OFFSET ?
+            """
+            list_params = params + [limit, offset]
+        else:
+            # All groups: cluster by latest activity without per-row subquery
+            status_for_cte = status or "done"
+            list_sql = f"""
+                WITH chat_last AS (
+                    SELECT chat_id AS cid, MAX(id) AS last_id
+                    FROM downloaded
+                    WHERE status = ?
+                      AND chat_id IS NOT NULL
+                      AND chat_id != ''
+                    GROUP BY chat_id
+                )
+                SELECT {select_cols}
+                FROM downloaded d
+                LEFT JOIN tasks t ON t.id = d.task_id
+                LEFT JOIN chat_last cl ON cl.cid = d.chat_id
+                WHERE {clause}
+                ORDER BY COALESCE(cl.last_id, d.id) DESC, d.chat_id, d.id DESC
+                LIMIT ? OFFSET ?
+            """
+            list_params = [status_for_cte] + params + [limit, offset]
+
+        async with self.conn.execute(list_sql, list_params) as cur:
             rows = await cur.fetchall()
         items = []
         for r in rows:
@@ -945,6 +1052,8 @@ class Database:
         q: str = "",
         status: str = "done",
     ) -> list[dict[str, Any]]:
+        status = (status or "").strip()
+        q = (q or "").strip()
         where = ["1=1"]
         params: list[Any] = []
         if status:
@@ -952,22 +1061,24 @@ class Database:
             params.append(status)
         if q:
             where.append(
-                "(d.file_path LIKE ? OR t.chat_title LIKE ? OR CAST(d.message_id AS TEXT) LIKE ?)"
+                "(d.file_path LIKE ? OR IFNULL(t.chat_title,'') LIKE ? "
+                "OR CAST(d.message_id AS TEXT) LIKE ?)"
             )
             like = f"%{q}%"
             params.extend([like, like, like])
         clause = " AND ".join(where)
+        # Prefer denormalized chat_id; fall back to tasks join for title / legacy rows
         async with self.conn.execute(
             f"""
-            SELECT t.chat_id AS chat_id,
-                   MAX(t.chat_title) AS chat_title,
+            SELECT COALESCE(d.chat_id, t.chat_id) AS chat_id,
+                   MAX(IFNULL(t.chat_title, '')) AS chat_title,
                    COUNT(*) AS count,
                    MAX(d.created_at) AS latest_at,
                    MAX(d.id) AS latest_id
             FROM downloaded d
-            JOIN tasks t ON t.id = d.task_id
+            LEFT JOIN tasks t ON t.id = d.task_id
             WHERE {clause}
-            GROUP BY t.chat_id
+            GROUP BY COALESCE(d.chat_id, t.chat_id)
             ORDER BY latest_id DESC
             """,
             params,
@@ -1066,24 +1177,61 @@ class Database:
         return val
 
     async def append_log(self, task_id: int, message: str, keep: int = 80) -> None:
-        task = await self.get_task(task_id)
-        if not task:
-            return
-        lines = [x for x in (task.get("last_log") or "").split("\n") if x.strip()]
-        # Migrate legacy oldest-first logs → newest-first
-        times = []
-        for line in lines:
-            m = re.match(r"^\[(\d{2}:\d{2}:\d{2})\]", line.strip())
-            if m:
-                times.append(m.group(1))
-        if len(times) >= 2 and times == sorted(times):
-            lines = list(reversed(lines))
+        """Buffer log lines and flush in batches (cuts SQLite commits under load)."""
         stamp = datetime.now().strftime("%H:%M:%S")
-        lines.insert(0, f"[{stamp}] {message}")
-        lines = lines[:keep]
-        await self.update_task(task_id, last_log="\n".join(lines))
+        line = f"[{stamp}] {message}"
+        async with self._write_lock:
+            self._log_pending.setdefault(int(task_id), []).append(line)
+            # Bound memory if flush is delayed
+            if len(self._log_pending[int(task_id)]) > keep:
+                self._log_pending[int(task_id)] = self._log_pending[int(task_id)][-keep:]
+        self._arm_log_flush(keep=keep)
+
+    def _arm_log_flush(self, *, keep: int = 80) -> None:
+        if self._log_flush_task and not self._log_flush_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _delayed() -> None:
+            try:
+                await asyncio.sleep(0.4)
+                await self.flush_pending_logs(keep=keep)
+            except Exception:
+                pass
+
+        self._log_flush_task = loop.create_task(_delayed())
+
+    async def flush_pending_logs(self, *, keep: int = 80) -> None:
+        async with self._write_lock:
+            pending = self._log_pending
+            self._log_pending = {}
+        if not pending:
+            return
+        for task_id, new_lines in pending.items():
+            task = await self.get_task(task_id)
+            if not task:
+                continue
+            lines = [x for x in (task.get("last_log") or "").split("\n") if x.strip()]
+            times = []
+            for line in lines:
+                m = re.match(r"^\[(\d{2}:\d{2}:\d{2})\]", line.strip())
+                if m:
+                    times.append(m.group(1))
+            if len(times) >= 2 and times == sorted(times):
+                lines = list(reversed(lines))
+            # Newest first: later buffered lines end up on top
+            for line in new_lines:
+                lines.insert(0, line)
+            lines = lines[:keep]
+            await self.update_task(task_id, commit=False, last_log="\n".join(lines))
+        await self.conn.commit()
 
     async def clear_log(self, task_id: int) -> bool:
+        async with self._write_lock:
+            self._log_pending.pop(int(task_id), None)
         task = await self.get_task(task_id)
         if not task:
             return False
@@ -1336,16 +1484,18 @@ class Database:
             "DELETE FROM chat_tag_map WHERE chat_id = ? AND message_id = ?",
             (chat_id, int(message_id)),
         )
+        tag_rows = []
         for tag in tags:
             tag = str(tag).strip().lstrip("#")
-            if not tag:
-                continue
-            await self.conn.execute(
+            if tag:
+                tag_rows.append((chat_id, tag, int(message_id)))
+        if tag_rows:
+            await self.conn.executemany(
                 """
                 INSERT OR IGNORE INTO chat_tag_map(chat_id, tag, message_id)
                 VALUES (?, ?, ?)
                 """,
-                (chat_id, tag, int(message_id)),
+                tag_rows,
             )
 
     async def commit(self) -> None:
@@ -1463,16 +1613,21 @@ class Database:
             return
         self._tag_groups_cache.pop(str(chat_id), None)
 
-    async def list_index_tag_groups(self, chat_id: str | int) -> list[list[str]]:
-        """Tag lists from each indexed caption (for co-occurrence / relatedness)."""
-        import time
+    async def invalidate_tag_graph_cache(self, chat_id: str | int | None = None) -> None:
+        """Drop durable + memory tag graph (call after index scan / before rebuild)."""
+        self.invalidate_tag_groups_cache(chat_id)
+        if chat_id is None:
+            await self.conn.execute("DELETE FROM chat_tag_graph_cache")
+        else:
+            await self.conn.execute(
+                "DELETE FROM chat_tag_graph_cache WHERE chat_id = ?",
+                (str(chat_id),),
+            )
+        await self.conn.commit()
 
+    async def _load_tag_groups_raw(self, chat_id: str | int) -> list[list[str]]:
+        """Scan chat_media_index for caption tag groups (no cache)."""
         key = str(chat_id)
-        now = time.monotonic()
-        cached = self._tag_groups_cache.get(key)
-        if cached and (now - cached[0]) < self._TAG_GROUPS_TTL:
-            return cached[1]
-
         async with self.conn.execute(
             """
             SELECT tags FROM chat_media_index
@@ -1491,6 +1646,90 @@ class Database:
             cleaned = [str(t).strip().lstrip("#") for t in tags if str(t).strip()]
             if cleaned:
                 groups.append(cleaned)
+        return groups
+
+    async def rebuild_tag_graph_cache(self, chat_id: str | int) -> None:
+        """Precompute groups + related map after index scan (avoids cold full-table expand)."""
+        import time
+        from collections import defaultdict
+
+        from app.organizer import strip_relation_blacklist
+
+        key = str(chat_id)
+        groups = await self._load_tag_groups_raw(key)
+        self._tag_groups_cache[key] = (time.monotonic(), groups)
+
+        blacklist = await self.get_tag_relation_blacklist()
+        weight: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        casing: dict[str, str] = {}
+        for group in groups:
+            tags = strip_relation_blacklist(group, blacklist)
+            if len(tags) < 2:
+                continue
+            for t in tags:
+                casing.setdefault(t.lower(), t)
+            for i, a in enumerate(tags):
+                for b in tags[i + 1 :]:
+                    ka, kb = a.lower(), b.lower()
+                    if ka == kb:
+                        continue
+                    weight[ka][kb] += 1
+                    weight[kb][ka] += 1
+        related: dict[str, list[str]] = {}
+        bl = {t.lower() for t in blacklist}
+        for k, partners in weight.items():
+            if k in bl:
+                continue
+            name = casing.get(k, k)
+            ranked = sorted(partners.items(), key=lambda kv: (-kv[1], kv[0]))
+            related[name] = [
+                casing.get(p, p) for p, c in ranked if c >= 2 and p not in bl
+            ]
+
+        await self.conn.execute(
+            """
+            INSERT INTO chat_tag_graph_cache(chat_id, groups_json, related_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                groups_json = excluded.groups_json,
+                related_json = excluded.related_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                key,
+                json.dumps(groups, ensure_ascii=False),
+                json.dumps(related, ensure_ascii=False),
+                _utcnow(),
+            ),
+        )
+        await self.conn.commit()
+
+    async def list_index_tag_groups(self, chat_id: str | int) -> list[list[str]]:
+        """Tag lists from each indexed caption (for co-occurrence / relatedness)."""
+        import time
+
+        key = str(chat_id)
+        now = time.monotonic()
+        cached = self._tag_groups_cache.get(key)
+        if cached and (now - cached[0]) < self._TAG_GROUPS_TTL:
+            return cached[1]
+
+        # Durable cache (rebuilt after index scan) — skip full table parse on cold start
+        async with self.conn.execute(
+            "SELECT groups_json FROM chat_tag_graph_cache WHERE chat_id = ?",
+            (key,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row and row["groups_json"]:
+            try:
+                groups = json.loads(row["groups_json"])
+                if isinstance(groups, list):
+                    self._tag_groups_cache[key] = (now, groups)
+                    return groups
+            except Exception:
+                pass
+
+        groups = await self._load_tag_groups_raw(key)
         self._tag_groups_cache[key] = (now, groups)
         return groups
 
@@ -1537,41 +1776,37 @@ class Database:
     async def get_tag_relations(self, chat_id: str | int) -> dict[str, list[str]]:
         """
         Direct co-occurrence partners (same caption, count ≥ 2).
-        For UI chips / tips only — download expand & folders use UF
-        (expand_related_tags / build_tag_folder_map_from_groups).
+        Prefer durable cache rebuilt after index scan.
         """
-        from collections import defaultdict
+        key = str(chat_id)
+        async with self.conn.execute(
+            "SELECT related_json FROM chat_tag_graph_cache WHERE chat_id = ?",
+            (key,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row and row["related_json"]:
+            try:
+                data = json.loads(row["related_json"])
+                if isinstance(data, dict):
+                    return {str(k): list(v or []) for k, v in data.items()}
+            except Exception:
+                pass
 
-        from app.organizer import strip_relation_blacklist
-
-        blacklist = await self.get_tag_relation_blacklist()
-
-        weight: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        casing: dict[str, str] = {}
-        for group in await self.list_index_tag_groups(chat_id):
-            tags = strip_relation_blacklist(group, blacklist)
-            if len(tags) < 2:
-                continue
-            for t in tags:
-                casing.setdefault(t.lower(), t)
-            for i, a in enumerate(tags):
-                for b in tags[i + 1 :]:
-                    ka, kb = a.lower(), b.lower()
-                    if ka == kb:
-                        continue
-                    weight[ka][kb] += 1
-                    weight[kb][ka] += 1
-        out: dict[str, list[str]] = {}
-        bl = {t.lower() for t in blacklist}
-        for key, partners in weight.items():
-            if key in bl:
-                continue
-            name = casing.get(key, key)
-            ranked = sorted(partners.items(), key=lambda kv: (-kv[1], kv[0]))
-            out[name] = [
-                casing.get(p, p) for p, c in ranked if c >= 2 and p not in bl
-            ]
-        return out
+        # Cold path: build once and persist
+        await self.rebuild_tag_graph_cache(key)
+        async with self.conn.execute(
+            "SELECT related_json FROM chat_tag_graph_cache WHERE chat_id = ?",
+            (key,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row and row["related_json"]:
+            try:
+                data = json.loads(row["related_json"])
+                if isinstance(data, dict):
+                    return {str(k): list(v or []) for k, v in data.items()}
+            except Exception:
+                pass
+        return {}
 
     async def expand_related_tags(
         self, chat_id: str | int, tags: list[str]

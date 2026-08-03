@@ -282,6 +282,24 @@ body {
   .task-filter-line {
     border-color: rgba(148, 163, 184, 0.14) !important;
   }
+  /* Phone + single task: log stretches toward screen bottom (JS refines) */
+  .page-tasks .tasks > .task:only-child .task-body {
+    padding-bottom: 0;
+  }
+  .page-tasks .tasks > .task:only-child .task-log {
+    max-height: none !important;
+    margin-bottom: 0;
+  }
+  .page-tasks .tasks > .task:only-child .task-log-body,
+  .page-tasks .tasks > .task:only-child .task-log-empty {
+    max-height: none !important;
+    min-height: calc(
+      100dvh - 22.5rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
+    );
+    height: calc(
+      100dvh - 22.5rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
+    );
+  }
 }
 
 /* Touch / iOS: hide decor + kill entrance motion (overflow overrides live after boot-app) */
@@ -1068,13 +1086,13 @@ button:disabled {
   flex-direction: column;
   gap: 12px;
 }
-/* Align with .tag-summary-btn in the same settings modal */
+/* Status text on row 1, action buttons on row 2 */
 .index-panel-row {
-  flex-direction: row;
+  flex-direction: column;
   flex-wrap: nowrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px 16px;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 10px;
   margin: 0;
   padding: 12px 14px;
   border-radius: 12px;
@@ -1087,7 +1105,7 @@ button:disabled {
   background: rgba(243, 246, 250, 0.95);
 }
 .index-panel-row .index-meta-block {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -1103,10 +1121,10 @@ button:disabled {
   font-size: 0.86rem;
   font-weight: 600;
   color: var(--ink);
-  line-height: 1.35;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  line-height: 1.4;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: unset;
 }
 /* Segmented: 4 equal action slots + adaptive interval */
 .index-toolbar {
@@ -1114,6 +1132,7 @@ button:disabled {
   flex-wrap: nowrap;
   align-items: stretch;
   width: 100%;
+  flex: 0 0 auto;
   min-height: 32px;
   border-radius: 999px;
   border: 1px solid rgba(59, 130, 246, 0.28);
@@ -1310,10 +1329,6 @@ button:disabled {
   color: var(--ink) !important;
 }
 @media (max-width: 720px) {
-  .index-panel-row {
-    flex-wrap: wrap;
-    align-items: stretch;
-  }
   .index-panel-row .index-meta {
     white-space: normal;
   }
@@ -1637,7 +1652,7 @@ button:disabled {
 .tags-modal .tags-panel {
   position: relative;
   width: min(760px, 96vw);
-  max-height: min(92vh, 860px);
+  max-height: min(98vh, 946px);
   overflow: auto;
   padding: 22px 24px 18px;
 }
@@ -3175,7 +3190,7 @@ button:disabled {
 }
 .page-tasks .tasks > .task .task-log {
   flex: 0 0 auto;
-  max-height: min(32vh, 280px);
+  max-height: min(42vh, 364px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -3186,7 +3201,7 @@ button:disabled {
 .page-tasks .tasks > .task .task-log-body {
   flex: 1 1 auto;
   min-height: 0;
-  max-height: min(28vh, 240px);
+  max-height: min(36vh, 312px);
 }
 .page-tasks .tasks > .task .task-log-empty {
   flex: 0 0 auto;
@@ -3923,7 +3938,7 @@ button.log-clear-btn:hover {
 }
 
 .task-log-body {
-  max-height: min(28vh, 240px);
+  max-height: min(36vh, 312px);
   overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;
@@ -4110,17 +4125,23 @@ button.log-clear-btn:hover {
   }
   .log-title { font-size: 0.9rem; }
   .log-detail { font-size: 0.88rem; }
-  .task-log-body { max-height: min(28vh, 220px); }
-  .page-tasks .tasks > .task .task-log {
-    max-height: min(32vh, 260px);
+  .page-tasks .tasks > .task:only-child .task-log {
+    max-height: none !important;
   }
-  .page-tasks .tasks > .task .task-log-body,
-  .page-tasks .tasks > .task .task-log-empty {
-    max-height: min(28vh, 220px);
-    height: auto;
+  .page-tasks .tasks > .task:only-child .task-log-body,
+  .page-tasks .tasks > .task:only-child .task-log-empty {
+    max-height: none !important;
+    min-height: calc(
+      100dvh - 20rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
+    );
+    height: calc(
+      100dvh - 20rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
+    );
   }
-  .page-tasks .tasks > .task .task-log-empty {
-    min-height: 72px;
+  .page-tasks .tasks > .task:only-child .task-log-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 }
 

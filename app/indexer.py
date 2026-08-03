@@ -500,7 +500,7 @@ class ChatIndexer:
                                 prev_caption_id=prev_caption_id,
                             )
 
-                        if scanned % 40 == 0:
+                        if scanned % 80 == 0:
                             await db.commit()
                             await db.upsert_index_meta(
                                 chat_id,
@@ -598,6 +598,11 @@ class ChatIndexer:
                 invalidate_index_count_cache(chat_id)
             except Exception:
                 logger.debug("invalidate_index_count_cache failed", exc_info=True)
+            # Precompute tag groups + related map for fast expand / picker
+            try:
+                await db.rebuild_tag_graph_cache(chat_id)
+            except Exception:
+                logger.debug("rebuild_tag_graph_cache failed", exc_info=True)
         except Exception as e:
             logger.exception("index scan failed chat=%s", chat_id)
             await db.upsert_index_meta(

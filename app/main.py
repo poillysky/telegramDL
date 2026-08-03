@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -75,6 +76,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Telegram Group Downloader", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=400)
 app.include_router(auth_router)
 app.include_router(chats_router)
 app.include_router(tasks_router)
