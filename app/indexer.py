@@ -584,6 +584,20 @@ class ChatIndexer:
                 media_count,
                 scanned,
             )
+            # Wake local monitor tasks for this chat to download index gaps
+            try:
+                from app.downloader import scheduler
+
+                scheduler.notify_index_updated(chat_id)
+            except Exception:
+                logger.debug("notify_index_updated failed", exc_info=True)
+            # Drop UI caches so 命中/索引 counts refresh on next poll
+            try:
+                from app.api.routes_tasks import invalidate_index_count_cache
+
+                invalidate_index_count_cache(chat_id)
+            except Exception:
+                logger.debug("invalidate_index_count_cache failed", exc_info=True)
         except Exception as e:
             logger.exception("index scan failed chat=%s", chat_id)
             await db.upsert_index_meta(

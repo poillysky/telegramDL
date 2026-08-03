@@ -75,6 +75,58 @@ class BatchCreateBody(BaseModel):
 _tag_match_cache: dict[int, tuple[float, int]] = {}
 _tag_match_refreshing: set[int] = set()
 _TAG_MATCH_TTL = 12.0  # seconds — avoid heavy index counts on every 0.8s poll
+# task_id -> (monotonic_ts, tag_done_count) — chat_completed / local aware
+_tag_done_cache: dict[int, tuple[float, int]] = {}
+_tag_done_refreshing: set[int] = set()
+# chat_id -> (monotonic_ts, media_count)
+_index_count_cache: dict[str, tuple[float, int]] = {}
+_INDEX_COUNT_TTL = 20.0
+# task_id -> chat_id (for cache invalidation after index scan)
+_task_chat_map: dict[int, str] = {}
+_local_sync_at: dict[str, float] = {}
+_LOCAL_SYNC_TTL = 60.0
+
+
+async def _chat_index_media_count(chat_id) -> int:
+    """Local caption-index size for this chat (meta, with COUNT fallback)."""
+    import time
+
+    key = str(chat_id or "").strip()
+    if not key:
+        return 0
+    now = time.monotonic()
+    cached = _index_count_cache.get(key)
+    if cached and (now - cached[0]) < _INDEX_COUNT_TTL and int(cached[1]) > 0:
+        return int(cached[1])
+    n = 0
+    try:
+        meta = await db.get_index_meta(key) or {}
+        n = int(meta.get("media_count") or 0)
+    except Exception:
+        n = 0
+    # Meta can lag / miss; COUNT is authoritative when meta says 0
+    if n <= 0:
+        try:
+            n = await db.count_media_index(key)
+        except Exception:
+            n = 0
+    _index_count_cache[key] = (now, n)
+    return n
+
+
+def invalidate_index_count_cache(chat_id=None) -> None:
+    """Drop cached index totals and match/done counts (call after index scan)."""
+    if chat_id is None:
+        _index_count_cache.clear()
+        _tag_match_cache.clear()
+        _tag_done_cache.clear()
+        return
+    key = str(chat_id)
+    _index_count_cache.pop(key, None)
+    for tid, cid in list(_task_chat_map.items()):
+        if str(cid) == key:
+            _tag_match_cache.pop(tid, None)
+            _tag_done_cache.pop(tid, None)
 
 
 async def _refresh_tag_match_count(
@@ -84,6 +136,8 @@ async def _refresh_tag_match_count(
     keywords: list,
     media_types: list,
     mode: str,
+    *,
+    download_mode: str = "sequential",
 ) -> None:
     """Background COUNT — never block /api/tasks first paint."""
     import asyncio
@@ -93,18 +147,86 @@ async def _refresh_tag_match_count(
         return
     _tag_match_refreshing.add(tid)
     try:
-        tag_match = await db.count_media_index_filtered(
-            chat_id,
-            tags=tags or None,
-            tag_match_mode=mode,
-            media_types=media_types or None,
-            keywords=keywords or None,
-        )
+        # Monitor with no tags/keywords must not treat whole index as "hits"
+        if normalize_download_mode(download_mode) == "monitor" and not tags and not keywords:
+            tag_match = 0
+        else:
+            tag_match = await db.count_media_index_filtered(
+                chat_id,
+                tags=tags or None,
+                tag_match_mode=mode,
+                media_types=media_types or None,
+                keywords=keywords or None,
+            )
         _tag_match_cache[tid] = (time.monotonic(), int(tag_match))
     except Exception:
         pass
     finally:
         _tag_match_refreshing.discard(tid)
+
+
+async def _refresh_tag_done_count(
+    tid: int,
+    chat_id,
+    tags: list,
+    keywords: list,
+    media_types: list,
+    mode: str,
+    *,
+    download_mode: str = "sequential",
+) -> None:
+    """Background done COUNT against chat_completed + task records."""
+    import time
+
+    if tid in _tag_done_refreshing:
+        return
+    _tag_done_refreshing.add(tid)
+    try:
+        if normalize_download_mode(download_mode) == "monitor" and not tags and not keywords:
+            tag_done = 0
+        else:
+            tag_done = await db.count_index_done(
+                tid,
+                chat_id,
+                tags=tags or None,
+                tag_match_mode=mode,
+                media_types=media_types or None,
+                keywords=keywords or None,
+            )
+        _tag_done_cache[tid] = (time.monotonic(), int(tag_done))
+    except Exception:
+        pass
+    finally:
+        _tag_done_refreshing.discard(tid)
+
+
+async def _maybe_sync_local_completed(task: dict, *, force: bool = False) -> None:
+    """Throttle local-dir → chat_completed sync (queue/已处理 use disk, not only task records)."""
+    import time
+
+    from app.config import get_settings
+    from app.organizer import sanitize_name
+
+    chat_id = task.get("chat_id")
+    if chat_id is None:
+        return
+    key = str(chat_id)
+    now = time.monotonic()
+    prev = _local_sync_at.get(key) or 0.0
+    if not force and now - prev < _LOCAL_SYNC_TTL:
+        return
+    _local_sync_at[key] = now
+    title = (task.get("chat_title") or "").strip() or str(chat_id)
+    group_dir = get_settings().download_dir / sanitize_name(title)
+    try:
+        await db.sync_local_completed_from_dir(chat_id, group_dir)
+        # Done counts may change after disk sync
+        tid = int(task.get("id") or 0)
+        if tid:
+            _tag_done_cache.pop(tid, None)
+            _tag_match_cache.pop(tid, None)
+    except Exception:
+        pass
 
 
 async def _with_tag_progress(task: dict) -> dict:
@@ -118,23 +240,66 @@ async def _with_tag_progress(task: dict) -> dict:
     keywords = normalize_keyword_list(task.get("caption_keywords") or [])
     media_types = list(task.get("media_types") or [])
     mode = str(task.get("tag_match_mode") or "any")
+    download_mode = normalize_download_mode(task.get("download_mode") or "")
     tid = int(task["id"])
-    # "已处理" uses the task counter — skip expensive join on every poll
-    tag_done = int(task.get("downloaded_count") or 0)
+    if chat_id is not None:
+        _task_chat_map[tid] = str(chat_id)
 
     now = time.monotonic()
-    cached = _tag_match_cache.get(tid)
-    if cached and (now - cached[0]) < _TAG_MATCH_TTL:
-        tag_match = cached[1]
+    # Monitor + 未选标签：命中/队列/已处理应为 0
+    if download_mode == "monitor" and not tags and not keywords:
+        tag_match = 0
+        tag_done = 0
+        _tag_match_cache[tid] = (now, 0)
+        _tag_done_cache[tid] = (now, 0)
     else:
-        # Serve stale/0 immediately; refresh COUNT in background
-        tag_match = int(cached[1]) if cached else 0
-        try:
-            asyncio.get_running_loop().create_task(
-                _refresh_tag_match_count(
-                    tid, chat_id, tags, keywords, media_types, mode
+        cached = _tag_match_cache.get(tid)
+        if cached and (now - cached[0]) < _TAG_MATCH_TTL:
+            tag_match = cached[1]
+        else:
+            tag_match = int(cached[1]) if cached else 0
+            try:
+                asyncio.get_running_loop().create_task(
+                    _refresh_tag_match_count(
+                        tid,
+                        chat_id,
+                        tags,
+                        keywords,
+                        media_types,
+                        mode,
+                        download_mode=download_mode,
+                    )
                 )
+            except RuntimeError:
+                pass
+
+        done_cached = _tag_done_cache.get(tid)
+        if done_cached and (now - done_cached[0]) < _TAG_MATCH_TTL:
+            tag_done = done_cached[1]
+        else:
+            # Prefer last known done; fall back to task counter until refresh lands
+            tag_done = (
+                int(done_cached[1])
+                if done_cached
+                else int(task.get("downloaded_count") or 0)
             )
+            try:
+                asyncio.get_running_loop().create_task(
+                    _refresh_tag_done_count(
+                        tid,
+                        chat_id,
+                        tags,
+                        keywords,
+                        media_types,
+                        mode,
+                        download_mode=download_mode,
+                    )
+                )
+            except RuntimeError:
+                pass
+        # Opportunistic local sync (throttled) so recreate-task sees disk files
+        try:
+            asyncio.get_running_loop().create_task(_maybe_sync_local_completed(task))
         except RuntimeError:
             pass
 
@@ -154,6 +319,7 @@ async def _with_tag_progress(task: dict) -> dict:
         "last_log": last_log,
         "tag_match_count": tag_match,
         "tag_processed_count": tag_done,
+        "index_media_count": await _chat_index_media_count(chat_id),
     }
     prog = scheduler.get_live_progress(tid)
     if prog:
@@ -191,7 +357,9 @@ async def get_settings_defaults(_: None = Depends(require_web_auth)):
             "download_delay_max": s.download_delay_max,
             "max_retries": s.max_retries,
             "min_folder_title_len": s.min_folder_title_len,
-            "max_flood_wait": s.max_flood_wait,
+            "max_flood_wait": await db.get_max_flood_wait(),
+            "failed_retry_interval_sec": await db.get_failed_retry_interval_sec(),
+            "monitor_heartbeat_sec": await db.get_monitor_heartbeat_sec(),
             "download_dir": str(s.download_dir),
             "test_mode": s.test_mode,
             "test_duration_sec": s.test_duration_sec,
@@ -309,6 +477,19 @@ class UpdateTaskSettingsBody(BaseModel):
     concurrency: Optional[int] = Field(default=None, ge=1, le=5)
     delay_min: Optional[float] = Field(default=None, ge=0)
     delay_max: Optional[float] = Field(default=None, ge=0)
+    media_types: Optional[List[str]] = None
+    folder_mode: Optional[str] = None
+    use_text_as_folder: Optional[bool] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    clear_start_date: bool = False
+    clear_end_date: bool = False
+    download_order: Optional[str] = None
+    max_messages: Optional[int] = Field(default=None, ge=1)
+    clear_max_messages: bool = False
+    file_formats: Optional[Any] = None
+    min_file_bytes: Optional[int] = Field(default=None, ge=0)
+    max_file_bytes: Optional[int] = Field(default=None, ge=0)
 
 
 @router.patch("/{task_id}/tags")
@@ -335,7 +516,7 @@ async def update_task_settings(
     body: UpdateTaskSettingsBody,
     _: None = Depends(require_web_auth),
 ):
-    """Update tags / concurrency / delay. Monitor: new tags auto-start index backlog."""
+    """Update tags / concurrency / delay. Monitor: tag changes immediately re-check gaps."""
     task = await db.get_task(task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
@@ -389,29 +570,107 @@ async def update_task_settings(
         fields["delay_max"] = dmax
         log_bits.append(f"延迟 {dmin:g}–{dmax:g}s")
 
+    if body.media_types is not None:
+        allowed = {"photo", "video", "document", "audio", "voice", "video_note"}
+        media = [str(x) for x in body.media_types if str(x) in allowed]
+        if not media:
+            media = list(DEFAULT_MEDIA)
+        fields["media_types"] = media
+        log_bits.append("媒体 " + "、".join(media))
+
+    if body.folder_mode is not None:
+        folder_mode = str(body.folder_mode or "caption")
+        if folder_mode not in ("caption", "media_type", "flat"):
+            folder_mode = "caption"
+        fields["folder_mode"] = folder_mode
+        use_text = (
+            bool(body.use_text_as_folder)
+            if body.use_text_as_folder is not None
+            else folder_mode == "caption"
+        )
+        if folder_mode != "caption":
+            use_text = False
+        fields["use_text_as_folder"] = use_text
+        log_bits.append(f"目录 {folder_mode}")
+    elif body.use_text_as_folder is not None:
+        fields["use_text_as_folder"] = bool(body.use_text_as_folder)
+
+    if body.clear_start_date:
+        fields["start_date"] = None
+        log_bits.append("起始日期 清空")
+    elif body.start_date is not None:
+        sd = str(body.start_date).strip() or None
+        fields["start_date"] = sd
+        log_bits.append(f"起始日期 {sd or '空'}")
+
+    if body.clear_end_date:
+        fields["end_date"] = None
+        log_bits.append("结束日期 清空")
+    elif body.end_date is not None:
+        ed = str(body.end_date).strip() or None
+        fields["end_date"] = ed
+        log_bits.append(f"结束日期 {ed or '空'}")
+
+    if body.download_order is not None:
+        order = str(body.download_order or "added_first")
+        if order not in ("added_first", "oldest_first", "newest_first"):
+            order = "added_first"
+        fields["download_order"] = order
+        log_bits.append(f"方向 {order}")
+
+    if body.clear_max_messages:
+        fields["max_messages"] = None
+        log_bits.append("上限 不限")
+    elif body.max_messages is not None:
+        fields["max_messages"] = int(body.max_messages)
+        log_bits.append(f"上限 {fields['max_messages']}")
+
+    if body.file_formats is not None:
+        formats = normalize_file_formats(body.file_formats)
+        fields["file_formats"] = formats
+        if isinstance(formats, dict):
+            n = sum(len(v or []) for v in formats.values())
+        else:
+            n = len(formats or [])
+        log_bits.append(f"扩展名 {n or '全部'}")
+
+    if body.min_file_bytes is not None:
+        fields["min_file_bytes"] = max(0, int(body.min_file_bytes))
+        log_bits.append(f"最小文件 {fields['min_file_bytes']}B")
+    if body.max_file_bytes is not None:
+        fields["max_file_bytes"] = max(0, int(body.max_file_bytes))
+        log_bits.append(f"最大文件 {fields['max_file_bytes']}B")
+
     if not fields:
         return {"ok": True, "task": await _with_tag_progress(task)}
 
     await db.update_task(task_id, **fields)
     await db.append_log(task_id, "已更新任务设置: " + " · ".join(log_bits))
     _tag_match_cache.pop(int(task_id), None)
+    _tag_done_cache.pop(int(task_id), None)
     task = await db.get_task(task_id)
 
-    # Monitor: newly added tags/keywords → auto-start backlog download
+    # Wake idle local monitor (non-tag settings, or tag clear)
+    try:
+        scheduler.wake_local_monitor(task.get("chat_id"))
+    except Exception:
+        pass
+
+    # Monitor: any tag/keyword change → immediately re-check local index gaps
     mode = normalize_download_mode(task.get("download_mode") or "")
     if mode == "monitor" and (
         body.include_tags is not None or body.caption_keywords is not None
     ):
         new_tags = normalize_tag_list(task.get("include_tags") or [])
         new_kws = normalize_keyword_list(task.get("caption_keywords") or [])
-        gained = (set(new_tags) - set(old_tags)) or (set(new_kws) - set(old_kws))
-        if gained and (new_tags or new_kws):
-            await db.append_log(
-                task_id, "标签/关键词已更新，自动开始按索引下载…"
-            )
+        changed = set(new_tags) != set(old_tags) or set(new_kws) != set(old_kws)
+        if changed and (new_tags or new_kws):
+            await db.append_log(task_id, "标签已更新，开始补下")
             await db.update_task(task_id, status="pending", last_error=None)
             await scheduler.start_task(task_id)
             task = await db.get_task(task_id)
+        elif changed:
+            await db.append_log(task_id, "标签已清空，等待配置")
 
     return {"ok": True, "task": await _with_tag_progress(task)}
 
@@ -478,8 +737,8 @@ async def get_task_files(
     """
     kind:
       - matches: 标签命中（索引匹配）
-      - done: 已处理（本任务已下载完成）
-      - queue: 待下载（匹配且未完成）+ 正在下载
+      - done: 已处理（本群本地/完成记录，不单看本任务队列）
+      - queue: 待下载（匹配且本地未完成）+ 正在下载
     """
     task = await db.get_task(task_id)
     if not task:
@@ -494,15 +753,28 @@ async def get_task_files(
     mode = str(task.get("tag_match_mode") or "any")
     order = (task.get("download_order") or "added_first").strip()
     newest_first = order == "newest_first"
+    download_mode = normalize_download_mode(task.get("download_mode") or "")
+    # Monitor without filters: not a download queue (whole index ≠ hits)
+    no_monitor_filters = download_mode == "monitor" and not tags and not keywords
+
+    # Refresh chat_completed from local filenames before queue/done listing
+    if kind_n in ("done", "queue") and not no_monitor_filters:
+        await _maybe_sync_local_completed(task, force=True)
 
     active_files: list = []
     if kind_n == "done":
         items, total = await db.list_task_done_items(
             task_id,
             task["chat_id"],
+            tags=tags or None,
+            tag_match_mode=mode,
+            media_types=media_types or None,
+            keywords=keywords or None,
             limit=limit,
             offset=offset,
         )
+    elif no_monitor_filters and kind_n in ("matches", "queue"):
+        items, total = [], 0
     elif kind_n == "matches":
         items, total = await db.list_task_match_items(
             task["chat_id"],

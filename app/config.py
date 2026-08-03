@@ -32,8 +32,12 @@ class Settings(BaseSettings):
     download_delay_max: float = 0.5
     max_retries: int = 3
     min_folder_title_len: int = 2
-    # FloodWait 超过该秒数则暂停任务，避免长时间无响应；以内则自动等待续下
+    # FloodWait：单次最多自动等待这么久，然后继续重试（不再直接暂停）
     max_flood_wait: int = 1800
+    # 监控待命后，失败/卡住队列定时再试间隔（秒）
+    failed_retry_interval_sec: int = 900
+    # 监控空闲心跳（秒）；到点会复查队列与失败项
+    monitor_heartbeat_sec: int = 600
     # Official help.getAppConfig (this account):
     #   large_queue_max_active_operations_count = 2  (>20MB files)
     #   small_queue_max_active_operations_count = 5

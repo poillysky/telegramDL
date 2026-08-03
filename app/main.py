@@ -42,13 +42,19 @@ async def lifespan(app: FastAPI):
             result = await tg_manager.try_auto_reconnect()
             if result.get("ok"):
                 logger.info("Telegram session restored after restart")
+                n = await scheduler.auto_resume_after_telegram()
+                if n:
+                    logger.info("Auto-resumed %s task(s) after restart", n)
             else:
+                reason = str(result.get("reason") or "unknown")
                 logger.info(
                     "Telegram not auto-connected (%s) — login in Settings if needed",
-                    result.get("reason") or "unknown",
+                    reason,
                 )
+                scheduler.abandon_startup_resume(reason)
         except Exception:
             logger.exception("Telegram auto-reconnect background task failed")
+            scheduler.abandon_startup_resume("reconnect error")
 
     asyncio.create_task(_auto_tg())
     indexer.start_auto_scheduler()

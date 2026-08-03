@@ -23,7 +23,7 @@ from app.config import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 # Same meta style as dineshkarthik_ref/utils/meta.py
-APP_VERSION = "Telegram Media Downloader 1.0.3"
+APP_VERSION = "Telegram Media Downloader 1.0.4"
 DEVICE_MODEL = f"{platform.python_implementation()} {platform.python_version()}"
 SYSTEM_VERSION = f"{platform.system()} {platform.release()}"
 LANG_CODE = "en"
@@ -1045,6 +1045,7 @@ class TelegramManager:
         )
 
         with path.open(mode) as f:
+            idle_spins = 0
             while True:
                 if stop_event is not None and stop_event.is_set():
                     _cancel_pending()
@@ -1066,6 +1067,7 @@ class TelegramManager:
                     break
 
                 if pending:
+                    idle_spins = 0
                     done, _ = await asyncio.wait(
                         pending.values(), return_when=asyncio.FIRST_COMPLETED
                     )
@@ -1187,7 +1189,14 @@ class TelegramManager:
                         # just restarted after mis-aligned LIMIT_INVALID
                         continue
 
+                wrote = False
                 while next_write in ready:
+                    if stop_event is not None and stop_event.is_set():
+                        _cancel_pending()
+                        f.flush()
+                        raise DownloadPaused()
+                    wrote = True
+                    idle_spins = 0
                     data = ready.pop(next_write)
                     want = asked.pop(next_write, part)
                     if not data:
@@ -1209,6 +1218,37 @@ class TelegramManager:
                         ready.clear()
                         asked.clear()
                         return next_write
+
+                # Head-of-line hole / stall: always yield so HTTP stays responsive.
+                if not pending and not wrote:
+                    idle_spins += 1
+                    if ready and next_write not in ready:
+                        logger.warning(
+                            "pipeline hole at off=%s (ready=%s); resync from head",
+                            next_write,
+                            sorted(ready)[:8],
+                        )
+                        ready.clear()
+                        asked.clear()
+                        next_fetch = next_write
+                    elif expected > 0 and next_write >= expected:
+                        break
+                    elif expected > 0 and next_fetch >= expected and not ready:
+                        break
+                    elif idle_spins >= 32:
+                        logger.warning(
+                            "pipeline stall at off=%s/%s — abort to sequential",
+                            next_write,
+                            expected or "?",
+                        )
+                        _cancel_pending()
+                        ready.clear()
+                        asked.clear()
+                        raise RuntimeError("pipeline_stall")
+                    await asyncio.sleep(0.05 if idle_spins > 4 else 0)
+                else:
+                    # Yield between waves so pause/API are not starved
+                    await asyncio.sleep(0)
 
         return next_write
 
@@ -1312,7 +1352,10 @@ class TelegramManager:
                 raise
             except Exception as exc:
                 logger.warning(
-                    "pipelined download fallback for %s: %s", path.name, exc
+                    "pipelined download fallback for %s: %s: %r",
+                    path.name,
+                    type(exc).__name__,
+                    exc,
                 )
                 downloaded = -1  # force sequential path below
 

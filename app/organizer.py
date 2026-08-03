@@ -894,6 +894,43 @@ def file_looks_complete(path: Path, expected_size: int = 0) -> bool:
         return False
 
 
+def collect_local_message_ids(
+    group_dir: Path,
+    known_message_ids: Optional[set[int]] = None,
+) -> set[int]:
+    """
+    Scan group_dir for filenames that embed a Telegram message id.
+
+    Matches: ``photo_123.jpg``, ``name_123.mp4``, ``name_123_1.mp4``.
+    Only ids present in ``known_message_ids`` (index) are kept — avoids false hits.
+    """
+    found: set[int] = set()
+    root = Path(group_dir) if group_dir else None
+    if not root or not root.exists():
+        return found
+    pat = re.compile(r"_(\d+)(?:_\d+)?\.[^.]+$", re.IGNORECASE)
+    try:
+        for p in root.rglob("*"):
+            try:
+                if not p.is_file():
+                    continue
+                name = p.name
+                if name.endswith(".part"):
+                    continue
+                m = pat.search(name)
+                if not m:
+                    continue
+                mid = int(m.group(1))
+                if known_message_ids is not None and mid not in known_message_ids:
+                    continue
+                found.add(mid)
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        return found
+    return found
+
+
 def build_identical_file_index(group_dir: Path) -> dict[tuple[str, int], Path]:
     """
     Index finished files under group_dir by (filename_lower, size).

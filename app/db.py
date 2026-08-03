@@ -1,5 +1,6 @@
 import json
 import re
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -137,6 +138,9 @@ TAG_RELATION_BLACKLIST = DEFAULT_TAG_RELATION_BLACKLIST
 
 _TAG_BL_META_KEY = "tag_relation_blacklist"
 _META_MAX_PARALLEL = "max_parallel_chats"
+_META_FAILED_RETRY = "failed_retry_interval_sec"
+_META_MONITOR_HEARTBEAT = "monitor_heartbeat_sec"
+_META_MAX_FLOOD_WAIT = "max_flood_wait"
 
 
 def normalize_file_formats(raw: Any) -> list[str] | dict[str, list[str]]:
@@ -268,6 +272,15 @@ CREATE TABLE IF NOT EXISTS web_users (
 CREATE INDEX IF NOT EXISTS idx_downloaded_task ON downloaded(task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 
+CREATE TABLE IF NOT EXISTS chat_completed (
+    chat_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    file_path TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_chat_completed_chat ON chat_completed(chat_id);
+
 CREATE TABLE IF NOT EXISTS chat_index_meta (
     chat_id TEXT PRIMARY KEY,
     chat_title TEXT NOT NULL DEFAULT '',
@@ -393,6 +406,36 @@ class Database:
             await self.conn.execute(
                 "ALTER TABLE chat_index_meta ADD COLUMN auto_interval_min INTEGER NOT NULL DEFAULT 60"
             )
+
+        # Chat-level completed media (survives task delete; queue uses this + local files)
+        await self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_completed (
+                chat_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                file_path TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            )
+            """
+        )
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_completed_chat ON chat_completed(chat_id)"
+        )
+        # One-time backfill from historical downloaded rows
+        if not await self.get_meta("chat_completed_backfilled"):
+            await self.conn.execute(
+                """
+                INSERT OR IGNORE INTO chat_completed(chat_id, message_id, file_path, updated_at)
+                SELECT t.chat_id, d.message_id, d.file_path, COALESCE(d.created_at, ?)
+                FROM downloaded d
+                JOIN tasks t ON t.id = d.task_id
+                WHERE d.status = 'done'
+                """
+                ,
+                (_utcnow(),),
+            )
+            await self.set_meta("chat_completed_backfilled", "1")
 
     async def close(self) -> None:
         if self._conn:
@@ -627,21 +670,136 @@ class Database:
         return await self.get_task(task_id)
 
     async def delete_task(self, task_id: int) -> None:
+        # Preserve chat-level completion so recreate can skip local/already-done media
+        task = await self.get_task(task_id)
+        if task:
+            chat_id = str(task.get("chat_id") or "")
+            if chat_id:
+                await self.conn.execute(
+                    """
+                    INSERT INTO chat_completed(chat_id, message_id, file_path, updated_at)
+                    SELECT ?, d.message_id, d.file_path, COALESCE(d.created_at, ?)
+                    FROM downloaded d
+                    WHERE d.task_id = ? AND d.status = 'done'
+                    ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                        file_path = COALESCE(excluded.file_path, chat_completed.file_path),
+                        updated_at = excluded.updated_at
+                    """,
+                    (chat_id, _utcnow(), int(task_id)),
+                )
         await self.conn.execute("DELETE FROM downloaded WHERE task_id = ?", (task_id,))
         await self.conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         await self.conn.commit()
 
-    async def is_message_done(self, task_id: int, message_id: int) -> bool:
+    async def mark_chat_completed(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        file_path: Optional[str] = None,
+    ) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO chat_completed(chat_id, message_id, file_path, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                file_path = COALESCE(excluded.file_path, chat_completed.file_path),
+                updated_at = excluded.updated_at
+            """,
+            (str(chat_id), int(message_id), file_path, _utcnow()),
+        )
+
+    async def is_chat_message_completed(
+        self, chat_id: str | int, message_id: int
+    ) -> bool:
+        async with self.conn.execute(
+            """
+            SELECT 1 FROM chat_completed
+            WHERE chat_id = ? AND message_id = ?
+            """,
+            (str(chat_id), int(message_id)),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def is_message_done(
+        self, task_id: int, message_id: int, *, chat_id: str | int | None = None
+    ) -> bool:
         async with self.conn.execute(
             "SELECT 1 FROM downloaded WHERE task_id = ? AND message_id = ? AND status = 'done'",
             (task_id, message_id),
         ) as cur:
-            return await cur.fetchone() is not None
+            if await cur.fetchone() is not None:
+                return True
+        cid = chat_id
+        if cid is None:
+            task = await self.get_task(task_id)
+            cid = task.get("chat_id") if task else None
+        if cid is None:
+            return False
+        return await self.is_chat_message_completed(cid, message_id)
+
+    async def list_done_message_ids(self, task_id: int) -> set[int]:
+        async with self.conn.execute(
+            """
+            SELECT message_id FROM downloaded
+            WHERE task_id = ? AND status = 'done'
+            """,
+            (int(task_id),),
+        ) as cur:
+            rows = await cur.fetchall()
+            ids = {int(r["message_id"]) for r in rows}
+        task = await self.get_task(task_id)
+        if task and task.get("chat_id") is not None:
+            async with self.conn.execute(
+                """
+                SELECT message_id FROM chat_completed WHERE chat_id = ?
+                """,
+                (str(task["chat_id"]),),
+            ) as cur:
+                rows = await cur.fetchall()
+                ids.update(int(r["message_id"]) for r in rows)
+        return ids
+
+    async def count_index_pending(
+        self,
+        task_id: int,
+        chat_id: str | int,
+        *,
+        tags: list[str] | None = None,
+        tag_match_mode: str = "any",
+        keywords: list[str] | None = None,
+        media_types: list[str] | None = None,
+    ) -> int:
+        """How many indexed matches are not yet done (task + chat-level / local)."""
+        _, total = await self.list_task_queue_items(
+            task_id,
+            chat_id,
+            tags=tags,
+            tag_match_mode=tag_match_mode,
+            keywords=keywords,
+            media_types=media_types,
+            limit=1,
+            offset=0,
+        )
+        return int(total)
 
     async def find_chat_completed_file(
         self, chat_id: str | int, message_id: int
     ) -> Optional[str]:
-        """Return file_path if any task for this chat already finished the message."""
+        """Return file_path if this chat already finished the message (any task / local)."""
+        chat_id = str(chat_id)
+        mid = int(message_id)
+        async with self.conn.execute(
+            """
+            SELECT file_path FROM chat_completed
+            WHERE chat_id = ? AND message_id = ?
+              AND file_path IS NOT NULL AND file_path != ''
+            LIMIT 1
+            """,
+            (chat_id, mid),
+        ) as cur:
+            row = await cur.fetchone()
+            if row and row["file_path"]:
+                return str(row["file_path"])
         async with self.conn.execute(
             """
             SELECT d.file_path
@@ -652,7 +810,7 @@ class Database:
             ORDER BY d.id DESC
             LIMIT 1
             """,
-            (str(chat_id), int(message_id)),
+            (chat_id, mid),
         ) as cur:
             row = await cur.fetchone()
             return str(row["file_path"]) if row and row["file_path"] else None
@@ -684,6 +842,8 @@ class Database:
         status: str = "done",
         file_path: Optional[str] = None,
         error: Optional[str] = None,
+        *,
+        chat_id: str | int | None = None,
     ) -> None:
         await self.conn.execute(
             """
@@ -696,6 +856,13 @@ class Database:
             """,
             (task_id, message_id, file_path, status, error, _utcnow()),
         )
+        if status == "done":
+            cid = chat_id
+            if cid is None:
+                task = await self.get_task(task_id)
+                cid = task.get("chat_id") if task else None
+            if cid is not None:
+                await self.mark_chat_completed(cid, message_id, file_path=file_path)
         await self.conn.commit()
 
     async def list_download_history(
@@ -734,6 +901,23 @@ class Database:
             params,
         ) as cur:
             total = int((await cur.fetchone())["c"])
+        # Cluster by chat (most recently active group first), then newest file
+        if chat_id:
+            order_sql = "d.id DESC"
+            order_params: list[Any] = []
+        else:
+            order_sql = """
+            (
+              SELECT MAX(d2.id)
+              FROM downloaded d2
+              JOIN tasks t2 ON t2.id = d2.task_id
+              WHERE t2.chat_id = t.chat_id
+                AND (? = '' OR d2.status = ?)
+            ) DESC,
+            t.chat_id,
+            d.id DESC
+            """
+            order_params = [status or "", status or ""]
         async with self.conn.execute(
             f"""
             SELECT d.id, d.task_id, d.message_id, d.file_path, d.status, d.error, d.created_at,
@@ -741,10 +925,10 @@ class Database:
             FROM downloaded d
             JOIN tasks t ON t.id = d.task_id
             WHERE {clause}
-            ORDER BY d.id DESC
+            ORDER BY {order_sql}
             LIMIT ? OFFSET ?
             """,
-            params + [limit, offset],
+            params + order_params + [limit, offset],
         ) as cur:
             rows = await cur.fetchall()
         items = []
@@ -754,6 +938,50 @@ class Database:
             d["file_name"] = Path(path).name if path else ""
             items.append(d)
         return items, total
+
+    async def list_download_history_groups(
+        self,
+        *,
+        q: str = "",
+        status: str = "done",
+    ) -> list[dict[str, Any]]:
+        where = ["1=1"]
+        params: list[Any] = []
+        if status:
+            where.append("d.status = ?")
+            params.append(status)
+        if q:
+            where.append(
+                "(d.file_path LIKE ? OR t.chat_title LIKE ? OR CAST(d.message_id AS TEXT) LIKE ?)"
+            )
+            like = f"%{q}%"
+            params.extend([like, like, like])
+        clause = " AND ".join(where)
+        async with self.conn.execute(
+            f"""
+            SELECT t.chat_id AS chat_id,
+                   MAX(t.chat_title) AS chat_title,
+                   COUNT(*) AS count,
+                   MAX(d.created_at) AS latest_at,
+                   MAX(d.id) AS latest_id
+            FROM downloaded d
+            JOIN tasks t ON t.id = d.task_id
+            WHERE {clause}
+            GROUP BY t.chat_id
+            ORDER BY latest_id DESC
+            """,
+            params,
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            {
+                "chat_id": str(r["chat_id"] or ""),
+                "chat_title": r["chat_title"] or str(r["chat_id"] or "未知群组"),
+                "count": int(r["count"] or 0),
+                "latest_at": r["latest_at"] or "",
+            }
+            for r in rows
+        ]
 
     async def get_download_by_id(self, item_id: int) -> Optional[dict[str, Any]]:
         async with self.conn.execute(
@@ -786,6 +1014,55 @@ class Database:
     async def set_max_parallel_chats(self, n: int) -> int:
         val = max(1, min(10, int(n)))
         await self.set_meta(_META_MAX_PARALLEL, str(val))
+        return val
+
+    async def _get_meta_int(
+        self,
+        key: str,
+        *,
+        default: int,
+        min_v: int,
+        max_v: int,
+    ) -> int:
+        raw = await self.get_meta(key)
+        if raw is None or str(raw).strip() == "":
+            return max(min_v, min(max_v, int(default)))
+        try:
+            return max(min_v, min(max_v, int(raw)))
+        except (TypeError, ValueError):
+            return max(min_v, min(max_v, int(default)))
+
+    async def get_failed_retry_interval_sec(self) -> int:
+        env = int(get_settings().failed_retry_interval_sec or 900)
+        return await self._get_meta_int(
+            _META_FAILED_RETRY, default=env, min_v=120, max_v=86400
+        )
+
+    async def set_failed_retry_interval_sec(self, n: int) -> int:
+        val = max(120, min(86400, int(n)))
+        await self.set_meta(_META_FAILED_RETRY, str(val))
+        return val
+
+    async def get_monitor_heartbeat_sec(self) -> int:
+        env = int(get_settings().monitor_heartbeat_sec or 600)
+        return await self._get_meta_int(
+            _META_MONITOR_HEARTBEAT, default=env, min_v=60, max_v=86400
+        )
+
+    async def set_monitor_heartbeat_sec(self, n: int) -> int:
+        val = max(60, min(86400, int(n)))
+        await self.set_meta(_META_MONITOR_HEARTBEAT, str(val))
+        return val
+
+    async def get_max_flood_wait(self) -> int:
+        env = int(get_settings().max_flood_wait or 1800)
+        return await self._get_meta_int(
+            _META_MAX_FLOOD_WAIT, default=env, min_v=60, max_v=86400
+        )
+
+    async def set_max_flood_wait(self, n: int) -> int:
+        val = max(60, min(86400, int(n)))
+        await self.set_meta(_META_MAX_FLOOD_WAIT, str(val))
         return val
 
     async def append_log(self, task_id: int, message: str, keep: int = 80) -> None:
@@ -1716,7 +1993,7 @@ class Database:
         offset: int = 0,
         newest_first: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Indexed matches not yet marked done for this task (pending queue)."""
+        """Indexed matches not yet done for this chat (local/chat_completed, not only task queue)."""
         chat_id = str(chat_id)
         limit = max(1, min(200, int(limit or 50)))
         offset = max(0, int(offset or 0))
@@ -1727,14 +2004,17 @@ class Database:
             media_types=media_types,
             keywords=keywords,
         )
+        # Done = this task downloaded OR chat-level completed (survives task delete / local sync)
         not_done = (
             "m.message_id NOT IN ("
             "SELECT message_id FROM downloaded "
             "WHERE task_id = ? AND status = 'done'"
+            ") AND m.message_id NOT IN ("
+            "SELECT message_id FROM chat_completed WHERE chat_id = ?"
             ")"
         )
         full_where = f"{where_sql} AND {not_done}"
-        count_params = [*params, int(task_id)]
+        count_params = [*params, int(task_id), chat_id]
         async with self.conn.execute(
             f"SELECT COUNT(*) AS c FROM chat_media_index m WHERE {full_where}",
             count_params,
@@ -1755,39 +2035,94 @@ class Database:
             rows = await cur.fetchall()
         return [self._parse_index_row(r) for r in rows], total
 
+    async def count_index_done(
+        self,
+        task_id: int,
+        chat_id: str | int,
+        *,
+        tags: list[str] | None = None,
+        tag_match_mode: str = "any",
+        media_types: list[str] | None = None,
+        keywords: list[str] | None = None,
+    ) -> int:
+        """Indexed matches already done (task record or chat/local completed)."""
+        chat_id = str(chat_id)
+        where_sql, params = self._index_filter_sql(
+            chat_id,
+            tags=tags,
+            tag_match_mode=tag_match_mode,
+            media_types=media_types,
+            keywords=keywords,
+        )
+        done = (
+            "("
+            "m.message_id IN ("
+            "SELECT message_id FROM downloaded "
+            "WHERE task_id = ? AND status = 'done'"
+            ") OR m.message_id IN ("
+            "SELECT message_id FROM chat_completed WHERE chat_id = ?"
+            ")"
+            ")"
+        )
+        async with self.conn.execute(
+            f"SELECT COUNT(*) AS c FROM chat_media_index m WHERE {where_sql} AND {done}",
+            [*params, int(task_id), chat_id],
+        ) as cur:
+            return int((await cur.fetchone())["c"])
+
     async def list_task_done_items(
         self,
         task_id: int,
         chat_id: str | int,
         *,
+        tags: list[str] | None = None,
+        tag_match_mode: str = "any",
+        media_types: list[str] | None = None,
+        keywords: list[str] | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Completed downloads for this task (已处理), with index caption when available."""
+        """Completed items for this chat (chat_completed preferred; local-aware)."""
         chat_id = str(chat_id)
         limit = max(1, min(200, int(limit or 50)))
         offset = max(0, int(offset or 0))
-        tid = int(task_id)
+        where_sql, params = self._index_filter_sql(
+            chat_id,
+            tags=tags,
+            tag_match_mode=tag_match_mode,
+            media_types=media_types,
+            keywords=keywords,
+        )
+        # Prefer chat_completed path; fall back to this task's downloaded row
+        done_where = (
+            f"{where_sql} AND ("
+            "m.message_id IN (SELECT message_id FROM chat_completed WHERE chat_id = ?) "
+            "OR m.message_id IN ("
+            "SELECT message_id FROM downloaded WHERE task_id = ? AND status = 'done')"
+            ")"
+        )
+        count_params = [*params, chat_id, int(task_id)]
         async with self.conn.execute(
-            """
-            SELECT COUNT(*) AS c FROM downloaded
-            WHERE task_id = ? AND status = 'done'
-            """,
-            (tid,),
+            f"SELECT COUNT(*) AS c FROM chat_media_index m WHERE {done_where}",
+            count_params,
         ) as cur:
             total = int((await cur.fetchone())["c"])
         async with self.conn.execute(
-            """
-            SELECT d.message_id, d.file_path, d.status, d.created_at,
-                   m.media_type, m.caption, m.tags, m.msg_date, m.grouped_id
-            FROM downloaded d
-            LEFT JOIN chat_media_index m
-              ON m.chat_id = ? AND m.message_id = d.message_id
-            WHERE d.task_id = ? AND d.status = 'done'
-            ORDER BY d.id DESC
+            f"""
+            SELECT m.message_id, m.grouped_id, m.media_type, m.caption, m.tags, m.msg_date,
+                   COALESCE(c.file_path, d.file_path) AS file_path,
+                   COALESCE(c.updated_at, d.created_at) AS created_at
+            FROM chat_media_index m
+            LEFT JOIN chat_completed c
+              ON c.chat_id = ? AND c.message_id = m.message_id
+            LEFT JOIN downloaded d
+              ON d.task_id = ? AND d.message_id = m.message_id AND d.status = 'done'
+            WHERE {where_sql}
+              AND (c.message_id IS NOT NULL OR d.message_id IS NOT NULL)
+            ORDER BY COALESCE(c.updated_at, d.created_at) DESC
             LIMIT ? OFFSET ?
             """,
-            (chat_id, tid, limit, offset),
+            [chat_id, int(task_id), *params, limit, offset],
         ) as cur:
             rows = await cur.fetchall()
         items: list[dict[str, Any]] = []
@@ -1797,6 +2132,55 @@ class Database:
             d["file_name"] = Path(path).name if path else ""
             items.append(d)
         return items, total
+
+    async def sync_local_completed_from_dir(
+        self,
+        chat_id: str | int,
+        group_dir: Path,
+        *,
+        known_message_ids: Optional[set[int]] = None,
+    ) -> int:
+        """Mark index message_ids found as local files under group_dir as chat_completed.
+
+        Filenames like ``photo_123.jpg`` / ``name_123.mp4`` / ``name_123_1.mp4``.
+        Returns how many new completions were written.
+        """
+        from app.organizer import collect_local_message_ids
+
+        chat_id = str(chat_id)
+        if known_message_ids is None:
+            async with self.conn.execute(
+                "SELECT message_id FROM chat_media_index WHERE chat_id = ?",
+                (chat_id,),
+            ) as cur:
+                rows = await cur.fetchall()
+                known_message_ids = {int(r["message_id"]) for r in rows}
+        if not known_message_ids:
+            return 0
+        found = await asyncio.to_thread(
+            collect_local_message_ids, Path(group_dir), known_message_ids
+        )
+        if not found:
+            return 0
+        # Only insert missing ones
+        async with self.conn.execute(
+            "SELECT message_id FROM chat_completed WHERE chat_id = ?",
+            (chat_id,),
+        ) as cur:
+            already = {int(r["message_id"]) for r in await cur.fetchall()}
+        new_ids = found - already
+        if not new_ids:
+            return 0
+        now = _utcnow()
+        await self.conn.executemany(
+            """
+            INSERT OR IGNORE INTO chat_completed(chat_id, message_id, file_path, updated_at)
+            VALUES (?, ?, NULL, ?)
+            """,
+            [(chat_id, int(mid), now) for mid in new_ids],
+        )
+        await self.conn.commit()
+        return len(new_ids)
 
 
 db = Database()

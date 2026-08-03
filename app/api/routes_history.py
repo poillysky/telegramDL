@@ -32,17 +32,63 @@ _PREVIEW_EXT = {
 }
 
 
-def _safe_download_path(file_path: str) -> Path:
-    """Resolve path and ensure it stays under download_dir."""
+def _resolve_download_path(file_path: str) -> Optional[Path]:
+    """Resolve a stored path to a real file under download_dir.
+
+    Paths may be absolute, relative to download_dir, or accidentally prefixed
+    with the download_dir name itself (e.g. ``downloads\\chat\\a.mp4`` while
+    download_dir is already ``downloads``).
+    """
+    if not file_path or not str(file_path).strip():
+        return None
     settings = get_settings()
     root = Path(settings.download_dir).resolve()
-    raw = Path(file_path)
-    candidate = raw.resolve() if raw.is_absolute() else (root / raw).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail="路径不允许") from e
-    if not candidate.is_file():
+    raw = Path(str(file_path).strip())
+
+    candidates: list[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.append(root / raw)
+        # cwd-relative as often produced by str(Path("downloads/..."))
+        candidates.append(Path.cwd() / raw)
+        if raw.parts and raw.parts[0].casefold() == root.name.casefold():
+            rest = Path(*raw.parts[1:]) if len(raw.parts) > 1 else Path(".")
+            candidates.append(root / rest)
+
+    seen: set[Path] = set()
+    for cand in candidates:
+        try:
+            resolved = cand.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _safe_download_path(file_path: str) -> Path:
+    """Resolve path and ensure it stays under download_dir."""
+    candidate = _resolve_download_path(file_path)
+    if candidate is None:
+        settings = get_settings()
+        root = Path(settings.download_dir).resolve()
+        raw = Path(str(file_path).strip()) if file_path else None
+        if raw is not None:
+            try:
+                probe = raw.resolve() if raw.is_absolute() else (root / raw).resolve()
+                probe.relative_to(root)
+            except ValueError as e:
+                raise HTTPException(status_code=403, detail="路径不允许") from e
+            except OSError:
+                pass
         raise HTTPException(status_code=404, detail="文件不存在")
     return candidate
 
@@ -74,29 +120,48 @@ async def list_history(
         limit=limit,
         offset=offset,
     )
-    root = Path(get_settings().download_dir).resolve()
     for it in items:
         path_str = it.get("file_path") or ""
         kind = "file"
         previewable = False
+        missing = False
         if path_str:
-            try:
-                p = Path(path_str)
-                candidate = p.resolve() if p.is_absolute() else (root / p).resolve()
-                candidate.relative_to(root)
-                if candidate.is_file():
-                    kind = _guess_media_kind(candidate)
-                    previewable = candidate.suffix.lower() in _PREVIEW_EXT
-            except Exception:
-                pass
+            candidate = _resolve_download_path(path_str)
+            if candidate is not None:
+                kind = _guess_media_kind(candidate)
+                previewable = candidate.suffix.lower() in _PREVIEW_EXT
+            else:
+                # Still guess kind from extension for UI icons
+                kind = _guess_media_kind(Path(path_str))
+                missing = True
         it["media_kind"] = kind
         it["previewable"] = previewable
+        it["file_missing"] = missing
     return {
         "ok": True,
         "items": items,
         "total": total,
         "limit": limit,
         "offset": offset,
+        "chat_id": chat_id.strip(),
+    }
+
+
+@router.get("/groups")
+async def list_history_groups(
+    q: str = Query(default=""),
+    status: str = Query(default="done"),
+    _: Optional[str] = Depends(require_web_auth),
+):
+    groups = await db.list_download_history_groups(
+        q=q.strip(),
+        status=status.strip() or "done",
+    )
+    return {
+        "ok": True,
+        "groups": groups,
+        "total_groups": len(groups),
+        "total_items": sum(int(g.get("count") or 0) for g in groups),
     }
 
 

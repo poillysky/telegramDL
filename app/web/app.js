@@ -8,11 +8,19 @@ const state = {
   webUsername: null,
   webUsers: [],
   historyOffset: 0,
-  historyLimit: 30,
+  historyLimit: 40,
   historyTotal: 0,
+  historyChatId: "",
+  historyGroups: [],
+  historyItems: [],
   historyTimer: null,
+  _previewPlaylist: [],
+  _previewIndex: -1,
   page: "tasks",
   indexMeta: null,
+  indexMetaChatId: null,
+  indexMetaCache: {}, // chatId -> { meta, coverage, scanning, at }
+  indexCountByChat: {}, // chatId -> media_count
   indexCoverage: null,
   indexTags: [],
   indexPolling: false,
@@ -31,6 +39,10 @@ const state = {
   tagPickerBundles: [], // [{tags: string[], count}] same-caption groups
   tagPickerRelated: {}, // tag -> [related...]
   tagPickerPage: "index", // mobile tabs: applied | index
+  tagPickerIndexPage: 1, // 1-based page in 库内索引
+  tagPickerIndexPageSize: 50,
+  _tagPickerRowsCache: null, // { key, rows }
+  _autoIndexMenuHome: null,
   _tagPickerSearchTimer: null,
   _tasksInflight: null,
   _tasksQueued: false,
@@ -60,6 +72,172 @@ function statusLabel(status, task) {
     return "监控中";
   }
   return STATUS_LABELS[status] || status || "未知";
+}
+
+/** Server stores UTC ISO; display as Beijing time (Asia/Shanghai). */
+function formatBeijingTime(iso) {
+  if (!iso) return "";
+  const raw = String(iso).trim();
+  let d;
+  if (/Z|[+-]\d{2}:?\d{2}$/.test(raw)) {
+    d = new Date(raw);
+  } else {
+    const normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
+    d = new Date(/Z|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}Z`);
+  }
+  if (Number.isNaN(d.getTime())) {
+    return raw.replace("T", " ").slice(0, 19);
+  }
+  try {
+    return new Intl.DateTimeFormat("sv-SE", {
+      timeZone: "Asia/Shanghai",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    })
+      .format(d)
+      .replace("T", " ");
+  } catch {
+    const bj = new Date(d.getTime() + 8 * 60 * 60 * 1000);
+    return bj.toISOString().replace("T", " ").slice(0, 19);
+  }
+}
+
+function taskHasMonitorTags(t) {
+  const tags = t && t.include_tags;
+  if (!Array.isArray(tags)) return false;
+  return tags.some((x) => String(x || "").trim().replace(/^#+/, ""));
+}
+
+function taskHasMonitorFilters(t) {
+  if (taskHasMonitorTags(t)) return true;
+  const kws = t && t.caption_keywords;
+  if (!Array.isArray(kws)) return false;
+  return kws.some((x) => String(x || "").trim());
+}
+
+function isMonitorTask(t) {
+  return normalizeDownloadMode(t && t.download_mode) === "monitor";
+}
+
+function tagMatchDisplay(t) {
+  // Monitor without tags: whole-index count must not show as「命中」
+  if (isMonitorTask(t) && !taskHasMonitorFilters(t)) return 0;
+  return Number(t.tag_match_count ?? 0);
+}
+
+function startActionLabel(t) {
+  if (isMonitorTask(t)) {
+    // Running: primary control is pause — keep label clear and clickable
+    return String(t && t.status) === "running" ? "暂停监控" : "恢复监控";
+  }
+  return String(t && t.status) === "running" ? "下载中" : "继续";
+}
+
+function startActionState(t) {
+  const running = String(t && t.status) === "running";
+  if (isMonitorTask(t)) {
+    return running ? "monitoring" : "idle";
+  }
+  return running ? "running" : "idle";
+}
+
+function taskStatTitles(t) {
+  if (isMonitorTask(t)) {
+    if (!taskHasMonitorFilters(t)) {
+      return {
+        match: "未选标签，命中为 0（添加标签后统计）",
+        done: "已处理（对照本群本地文件/完成记录）",
+        queue: "未选标签，队列为 0",
+        index: "本群文案索引总数（与是否选标签无关）",
+      };
+    }
+    return {
+      match: "标签命中",
+      done: "已处理（本地文件或本群完成记录）",
+      queue: "待下载（本地尚未有对应文件）",
+      index: "本群文案索引总数",
+    };
+  }
+  return {
+    match: "索引命中（本模式通常为 0）",
+    done: "已处理（本地文件或本群完成记录）",
+    queue: "待下载队列",
+    index: "本群文案索引总数",
+  };
+}
+
+function indexMediaDisplay(t) {
+  const fromTask = Number(t && t.index_media_count);
+  if (Number.isFinite(fromTask) && fromTask > 0) {
+    if (t && t.chat_id != null) {
+      state.indexCountByChat[String(t.chat_id)] = fromTask;
+    }
+    return fromTask;
+  }
+  if (t && t.chat_id != null) {
+    const cached = state.indexCountByChat[String(t.chat_id)];
+    if (cached != null && Number(cached) > 0) return Number(cached);
+    // Backfill from index API once (covers old server / missing field)
+    scheduleIndexCountBackfill(t.chat_id, t.id);
+  }
+  return Number.isFinite(fromTask) ? Math.max(0, fromTask) : 0;
+}
+
+function scheduleIndexCountBackfill(chatId, taskId) {
+  const key = String(chatId || "");
+  if (!key || (state._indexCountInflight && state._indexCountInflight[key])) return;
+  if (!state._indexCountInflight) state._indexCountInflight = {};
+  state._indexCountInflight[key] = true;
+  Promise.resolve()
+    .then(() => api(`/api/index/${encodeURIComponent(key)}`))
+    .then((r) => {
+      const n = Number(r?.meta?.media_count ?? r?.coverage?.media_count ?? 0);
+      if (Number.isFinite(n) && n >= 0) {
+        state.indexCountByChat[key] = n;
+        document.querySelectorAll(".task[data-task-id]").forEach((el) => {
+          const id = el.dataset.taskId;
+          const task = (state.tasks || []).find((x) => String(x.id) === String(id));
+          if (!task || String(task.chat_id) !== key) return;
+          const iEl = el.querySelector('[data-role="index-count"]');
+          if (iEl) iEl.textContent = String(n);
+          task.index_media_count = n;
+        });
+      }
+    })
+    .catch(() => {})
+    .finally(() => {
+      if (state._indexCountInflight) delete state._indexCountInflight[key];
+    });
+}
+
+function renderTaskStatsHtml(t, matchCount, queueCount, indexCount, statTitles) {
+  const id = escapeHtml(String(t.id));
+  return `
+      <button type="button" class="task-stat-btn" data-role="match-stat" data-action="show-matches" data-id="${id}" title="${escapeHtml(statTitles.match)}">
+        <span class="ui-ico ui-ico-tag" aria-hidden="true"></span>
+        <strong data-role="match-count">${matchCount}</strong>
+        <span class="task-stat-label">命中</span>
+      </button>
+      <button type="button" class="task-stat-btn" data-role="done-stat" data-action="show-done" data-id="${id}" title="${escapeHtml(statTitles.done)}">
+        <span class="ui-ico ui-ico-check" aria-hidden="true"></span>
+        <strong data-role="done-count">${Number(t.tag_processed_count ?? 0)}</strong>
+        <span class="task-stat-label">已处理</span>
+      </button>
+      <button type="button" class="task-stat-btn" data-role="queue-stat" data-action="show-queue" data-id="${id}" title="${escapeHtml(statTitles.queue)}">
+        <span class="ui-ico ui-ico-queue" aria-hidden="true"></span>
+        <strong data-role="queue-count">${queueCount}</strong>
+        <span class="task-stat-label">队列</span>
+      </button>
+      <span class="task-stat-btn is-static" data-role="index-stat" data-id="${id}" title="${escapeHtml(statTitles.index)}">
+        <span class="ui-ico ui-ico-index" aria-hidden="true"></span>
+        <strong data-role="index-count">${indexCount}</strong>
+        <span class="task-stat-label">索引</span>
+      </span>`;
 }
 
 class SoftAuthError extends Error {
@@ -167,9 +345,17 @@ function setMsg(el, text, type = "") {
 
 let _confirmResolver = null;
 let _confirmKeyHandler = null;
+let _confirmTypeInputHandler = null;
+let _confirmRequiredPhrase = "";
 
 function closeConfirmDialog(result) {
   const modal = $("confirmModal");
+  if (_confirmTypeInputHandler) {
+    const input = $("confirmTypeInput");
+    if (input) input.removeEventListener("input", _confirmTypeInputHandler);
+    _confirmTypeInputHandler = null;
+  }
+  _confirmRequiredPhrase = "";
   if (!modal || modal.hidden) {
     if (_confirmResolver) {
       const resolve = _confirmResolver;
@@ -184,6 +370,12 @@ function closeConfirmDialog(result) {
     document.removeEventListener("keydown", _confirmKeyHandler);
     _confirmKeyHandler = null;
   }
+  const typeWrap = $("confirmTypeWrap");
+  const typeInput = $("confirmTypeInput");
+  if (typeWrap) typeWrap.hidden = true;
+  if (typeInput) typeInput.value = "";
+  const btnOk = $("btnConfirmOk");
+  if (btnOk) btnOk.disabled = false;
   const resolve = _confirmResolver;
   _confirmResolver = null;
   if (resolve) resolve(!!result);
@@ -191,6 +383,7 @@ function closeConfirmDialog(result) {
 
 /**
  * Custom confirm (replaces window.confirm).
+ * opts.confirmPhrase — require typing this exact text before OK works
  * @returns {Promise<boolean>}
  */
 function confirmDialog(opts = {}) {
@@ -205,6 +398,8 @@ function confirmDialog(opts = {}) {
   const cancelText = opts.cancelText || "取消";
   const danger = !!opts.danger;
   const alertOnly = !!opts.alertOnly;
+  const confirmPhrase = String(opts.confirmPhrase || "").trim();
+  _confirmRequiredPhrase = confirmPhrase;
 
   const panel = modal.querySelector(".confirm-panel");
   const kicker = $("confirmKicker");
@@ -212,6 +407,9 @@ function confirmDialog(opts = {}) {
   const msgEl = $("confirmMessage");
   const btnOk = $("btnConfirmOk");
   const btnCancel = $("btnConfirmCancel");
+  const typeWrap = $("confirmTypeWrap");
+  const typeHint = $("confirmTypeHint");
+  const typeInput = $("confirmTypeInput");
 
   if (panel) panel.classList.toggle("is-danger", danger);
   if (kicker) kicker.textContent = alertOnly ? "提示" : danger ? "危险操作" : "确认";
@@ -226,6 +424,35 @@ function confirmDialog(opts = {}) {
     btnCancel.hidden = alertOnly;
   }
 
+  const syncPhraseGate = () => {
+    if (!confirmPhrase || !btnOk) return;
+    const typed = String(typeInput?.value || "").trim();
+    const match = typed === confirmPhrase;
+    btnOk.disabled = !match;
+    typeWrap?.classList.toggle("is-matched", match);
+  };
+
+  if (typeWrap && typeInput) {
+    if (_confirmTypeInputHandler) {
+      typeInput.removeEventListener("input", _confirmTypeInputHandler);
+    }
+    if (confirmPhrase && !alertOnly) {
+      typeWrap.hidden = false;
+      if (typeHint) {
+        typeHint.textContent = `请输入「${confirmPhrase}」以确认`;
+      }
+      typeInput.value = "";
+      typeInput.placeholder = confirmPhrase;
+      _confirmTypeInputHandler = syncPhraseGate;
+      typeInput.addEventListener("input", _confirmTypeInputHandler);
+      syncPhraseGate();
+    } else {
+      typeWrap.hidden = true;
+      typeInput.value = "";
+      if (btnOk) btnOk.disabled = false;
+    }
+  }
+
   modal.hidden = false;
   document.body.classList.add("confirm-open");
 
@@ -237,11 +464,32 @@ function confirmDialog(opts = {}) {
         closeConfirmDialog(alertOnly ? true : false);
       } else if (e.key === "Enter") {
         e.preventDefault();
+        if (alertOnly) {
+          closeConfirmDialog(true);
+          return;
+        }
+        // Typed confirm: Enter only when phrase matches
+        if (confirmPhrase) {
+          if (String(typeInput?.value || "").trim() === confirmPhrase) {
+            closeConfirmDialog(true);
+          }
+          return;
+        }
+        // Danger without phrase: Enter does not auto-confirm
+        if (danger) return;
         closeConfirmDialog(true);
       }
     };
     document.addEventListener("keydown", _confirmKeyHandler);
-    setTimeout(() => (btnOk || btnCancel)?.focus(), 30);
+    // Prefer typing field / cancel for danger; delay so opening click cannot land on OK
+    const focusEl = alertOnly
+      ? btnOk
+      : confirmPhrase
+        ? typeInput
+        : danger
+          ? btnCancel
+          : btnOk;
+    setTimeout(() => focusEl?.focus(), 80);
   });
 }
 
@@ -287,7 +535,7 @@ function isOverlayBlockingPoll() {
 }
 
 const WEB_AUTH_HINT_KEY = "tgdl_web_authed";
-const TASKS_HTML_CACHE_KEY = "tgdl_tasks_html_v6";
+const TASKS_HTML_CACHE_KEY = "tgdl_tasks_html_v9";
 
 function markWebAuthedHint() {
   try {
@@ -335,9 +583,10 @@ function restoreTaskListCache() {
   }
 }
 
-function toast(text, type = "info", ms = 3400) {
+let _toastCloseTimer = null;
+
+function toast(text, type = "info", ms = 2800) {
   if (text && /需要 Web 登录|未登录|会话/.test(String(text)) && type === "err") {
-    // Soft auth noise — never spam during iOS wake
     if (state._suppressAuthToasts) return;
   }
   const host = $("toastHost");
@@ -347,33 +596,41 @@ function toast(text, type = "info", ms = 3400) {
     return;
   }
   const kind = normalizeMsgType(text, type);
-  const msg = String(text || "");
-  // Dedupe: replace same toast instead of stacking
-  const twin = [...host.querySelectorAll(".toast")].find(
-    (t) => t.querySelector(".toast-text")?.textContent === msg
-  );
-  if (twin) {
-    twin.classList.add("show");
+  const msg = String(text || "").trim();
+  if (!msg) return;
+  const key = `${kind}|${msg}`;
+  const ttl = Math.max(1200, Number(ms) || 2800);
+
+  const dismiss = (el) => {
+    if (!el || !el.isConnected) return;
+    el.classList.remove("show", "is-bump");
+    window.setTimeout(() => el.remove(), 200);
+  };
+
+  // Same message already showing → bump + reset timer (no new popup)
+  const cur = host.querySelector(".toast");
+  if (cur && cur.dataset.key === key) {
+    if (_toastCloseTimer) clearTimeout(_toastCloseTimer);
+    cur.classList.remove("is-bump");
+    void cur.offsetWidth;
+    cur.classList.add("show", "is-bump");
+    _toastCloseTimer = window.setTimeout(() => dismiss(cur), ttl);
     return;
   }
-  while (host.children.length >= 3) host.firstElementChild?.remove();
+
+  // One toast at a time — replace previous
+  if (_toastCloseTimer) clearTimeout(_toastCloseTimer);
+  host.innerHTML = "";
+
   const el = document.createElement("div");
   el.className = `toast toast-${kind}`;
+  el.dataset.key = key;
   el.setAttribute("role", "status");
-  el.innerHTML = `
-    <span class="msg-icon" aria-hidden="true"></span>
-    <span class="toast-text"></span>
-    <button type="button" class="toast-close" aria-label="关闭">×</button>
-  `;
+  el.innerHTML = `<span class="toast-dot" aria-hidden="true"></span><span class="toast-text"></span>`;
   el.querySelector(".toast-text").textContent = msg;
-  const close = () => {
-    el.classList.remove("show");
-    window.setTimeout(() => el.remove(), 220);
-  };
-  el.querySelector(".toast-close").addEventListener("click", close);
   host.appendChild(el);
   requestAnimationFrame(() => el.classList.add("show"));
-  if (ms > 0) window.setTimeout(close, ms);
+  _toastCloseTimer = window.setTimeout(() => dismiss(el), ttl);
 }
 
 function syncBodyModalLock() {
@@ -485,6 +742,7 @@ function bindUi() {
           return;
         }
         state.webUsername = r.username || username || null;
+        applyAccountChip();
         markWebAuthedHint();
         setMsg($("webAuthMsg"), "登录成功", "ok");
         // Enter UI immediately — do not wait for Telegram / task list
@@ -550,8 +808,29 @@ function bindUi() {
     saveRuntimeSettings().catch((e) => setMsg($("runtimeMsg"), e.message || String(e), "err"));
   });
   $("btnHistoryPreviewClose")?.addEventListener("click", closeHistoryPreview);
-  $("btnHistoryPreviewDone")?.addEventListener("click", closeHistoryPreview);
   $("historyPreviewBackdrop")?.addEventListener("click", closeHistoryPreview);
+  $("btnHistoryPreviewPrev")?.addEventListener("click", () => {
+    stepHistoryPreview(-1).catch(() => {});
+  });
+  $("btnHistoryPreviewNext")?.addEventListener("click", () => {
+    stepHistoryPreview(1).catch(() => {});
+  });
+  document.addEventListener("keydown", (e) => {
+    const modal = $("historyPreviewModal");
+    if (!modal || modal.hidden) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeHistoryPreview();
+      return;
+    }
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+      e.preventDefault();
+      stepHistoryPreview(1).catch(() => {});
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+      e.preventDefault();
+      stepHistoryPreview(-1).catch(() => {});
+    }
+  });
   $("btnQueueClose")?.addEventListener("click", closeQueueModal);
   $("btnQueueDone")?.addEventListener("click", closeQueueModal);
   $("queueBackdrop")?.addEventListener("click", closeQueueModal);
@@ -566,9 +845,14 @@ function bindUi() {
     const id = Number(item.getAttribute("data-id"));
     const kind = item.getAttribute("data-kind") || "file";
     const previewable = item.getAttribute("data-previewable") === "1";
+    const missing = item.getAttribute("data-missing") === "1";
     const name = item.getAttribute("data-name") || "";
     if (!id) return;
-    if (previewable) {
+    if (missing) {
+      toast("本地文件不存在（可能已移动或删除）", "err");
+      return;
+    }
+    if (previewable || kind === "image" || kind === "video" || kind === "audio") {
       openHistoryPreview(id, kind, name);
     } else {
       window.open(`/api/history/${id}/file`, "_blank", "noopener");
@@ -627,10 +911,6 @@ function bindUi() {
   $("btnRefreshTasks").addEventListener("click", () =>
     withBusy($("btnRefreshTasks"), () => loadTasks({ force: true }))
   );
-  $("tagsModalTaskSelect")?.addEventListener("change", async (e) => {
-    const id = e.target && e.target.value;
-    if (id) await openTaskTagsModal(id, { keepOpen: true });
-  });
   $("btnCreateTask").addEventListener("click", () => createTask());
   $("chatSearch").addEventListener("input", () => {
     clearTimeout(state._chatSearchTimer);
@@ -669,7 +949,15 @@ function bindUi() {
   const btnConfirmOk = $("btnConfirmOk");
   const btnConfirmCancel = $("btnConfirmCancel");
   const confirmBackdrop = $("confirmBackdrop");
-  if (btnConfirmOk) btnConfirmOk.addEventListener("click", () => closeConfirmDialog(true));
+  if (btnConfirmOk) {
+    btnConfirmOk.addEventListener("click", () => {
+      if (_confirmRequiredPhrase) {
+        const typed = String($("confirmTypeInput")?.value || "").trim();
+        if (typed !== _confirmRequiredPhrase) return;
+      }
+      closeConfirmDialog(true);
+    });
+  }
   if (btnConfirmCancel) btnConfirmCancel.addEventListener("click", () => closeConfirmDialog(false));
   if (confirmBackdrop) {
     confirmBackdrop.addEventListener("click", () => {
@@ -701,7 +989,11 @@ function bindUi() {
     const sel = $("tagsModalAutoIndexInterval");
     const btn = $("tagsModalAutoIndexIntervalBtn");
     if (sel) sel.disabled = !on;
-    if (btn) btn.disabled = !on;
+    // Keep interval button clickable so mobile users can open the menu
+    if (btn) {
+      btn.disabled = false;
+      btn.classList.toggle("is-auto-off", !on);
+    }
     if (!on) closeAutoIndexIntervalMenu();
   });
   initAutoIndexIntervalDropdown();
@@ -755,7 +1047,19 @@ function bindUi() {
   });
   $("tagPickerSearch")?.addEventListener("input", () => {
     clearTimeout(state._tagPickerSearchTimer);
-    state._tagPickerSearchTimer = setTimeout(() => renderTagPickerIndex(), 120);
+    state._tagPickerSearchTimer = setTimeout(() => {
+      state.tagPickerIndexPage = 1;
+      renderTagPickerIndex();
+    }, 120);
+  });
+  $("btnTagPickerPrev")?.addEventListener("click", () => {
+    if (state.tagPickerIndexPage <= 1) return;
+    state.tagPickerIndexPage -= 1;
+    renderTagPickerIndex({ keepScroll: false });
+  });
+  $("btnTagPickerNext")?.addEventListener("click", () => {
+    state.tagPickerIndexPage += 1;
+    renderTagPickerIndex({ keepScroll: false });
   });
   if (btnStop) btnStop.addEventListener("click", stopIndexScan);
   const btnTagAdd = $("btnTagAdd");
@@ -846,6 +1150,15 @@ function bindUi() {
       state.historyTimer = setTimeout(() => loadHistory(0), 280);
     });
   }
+  $("historyGroupBar")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-history-chat]");
+    if (!btn) return;
+    const chatId = btn.getAttribute("data-history-chat") || "";
+    if (chatId === (state.historyChatId || "")) return;
+    state.historyChatId = chatId;
+    renderHistoryGroupBar();
+    loadHistory(0);
+  });
   const btnPrev = $("btnHistoryPrev");
   const btnNext = $("btnHistoryNext");
   if (btnPrev) {
@@ -873,6 +1186,7 @@ async function verifyWebSession() {
 
 async function bootstrap() {
   bindUi();
+  bindIosHairlineGuards();
   const hinted = hasWebAuthedHint();
 
   // Returning user: paint app + cached cards immediately — no session "确认" wait
@@ -882,6 +1196,7 @@ async function bootstrap() {
       .then((web) => {
         if (web && (web.authenticated || !web.need_password)) {
           state.webUsername = web.username || state.webUsername;
+          applyAccountChip();
           markWebAuthedHint();
           return;
         }
@@ -902,6 +1217,7 @@ async function bootstrap() {
     const web = await verifyWebSession();
     if (!web.need_password || web.authenticated) {
       state.webUsername = web.username || null;
+      applyAccountChip();
       markWebAuthedHint();
       enterApp({ background: true, soft: false });
       return;
@@ -961,6 +1277,61 @@ function enterApp(opts = {}) {
   return boot;
 }
 
+function isCoarseTouchUi() {
+  try {
+    return window.matchMedia("(hover: none) and (pointer: coarse)").matches
+      || window.matchMedia("(max-width: 860px)").matches;
+  } catch (_) {
+    return false;
+  }
+}
+
+/** iOS Safari sometimes leaves 1px black streaks until a compositor refresh. */
+function nudgeIosRepaint(root) {
+  if (!isCoarseTouchUi()) return;
+  const el = root || document.body;
+  if (!el) return;
+  const prev = el.style.webkitFilter;
+  el.style.webkitFilter = "opacity(0.999)";
+  // Force layout, then clear — cheaper than toggling display
+  void el.offsetHeight;
+  requestAnimationFrame(() => {
+    el.style.webkitFilter = prev || "";
+  });
+}
+
+function bindIosHairlineGuards() {
+  if (!isCoarseTouchUi() || state._iosHairlineBound) return;
+  state._iosHairlineBound = true;
+  let t = 0;
+  const kick = () => {
+    clearTimeout(t);
+    t = setTimeout(() => nudgeIosRepaint(document.documentElement), 120);
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) kick();
+  });
+  window.addEventListener("pageshow", kick);
+  // Capture scroll from task/history panes (delegation — containers remount often)
+  document.addEventListener(
+    "scroll",
+    (ev) => {
+      const t = ev.target;
+      if (!t || t === document || t === document.documentElement || t === document.body) {
+        return;
+      }
+      if (
+        t.classList?.contains("tasks") ||
+        t.classList?.contains("history-list") ||
+        t.classList?.contains("task-log-body")
+      ) {
+        kick();
+      }
+    },
+    { passive: true, capture: true }
+  );
+}
+
 function switchPage(name) {
   const page = name === "history" ? "history" : "tasks";
   state.page = page;
@@ -977,6 +1348,7 @@ function switchPage(name) {
   } else {
     loadTasks().catch(() => {});
   }
+  requestAnimationFrame(() => nudgeIosRepaint(document.documentElement));
 }
 
 async function openCreateModal() {
@@ -1003,7 +1375,6 @@ async function openCreateModal() {
       if (!isSoftAuthError(e)) toast(e.message || String(e), "err");
     });
   }
-  refreshIndexPanel();
 }
 
 function closeCreateModal() {
@@ -1103,13 +1474,13 @@ function setDownloadMode(mode) {
     hint.textContent =
       m === "sequential"
         ? "按时间顺序下载；日期、并发等见「更多选项」"
-        : "建索引并持续跟踪；标签在任务设置里再配";
+        : "创建后按本地索引差集补下；索引靠设置里手动/自动/全量更新";
   }
   if (createBtn) {
-    createBtn.textContent = m === "monitor" ? "开始建索引" : "开始下载";
+    createBtn.textContent = m === "monitor" ? "开始监控" : "开始下载";
   }
-  if (m === "monitor") refreshIndexPanel();
-  else stopIndexPolling();
+  // Index polling belongs in task settings, not create modal
+  if (m !== "monitor") stopIndexPolling();
 }
 
 function stopIndexPolling() {
@@ -1140,6 +1511,7 @@ async function refreshIndexPanel() {
   if (!chat) {
     stopIndexPolling();
     state.indexMeta = null;
+    state.indexMetaChatId = null;
     state.indexTags = [];
     state._indexTagsSig = "";
     state._indexWasScanning = false;
@@ -1153,13 +1525,30 @@ async function refreshIndexPanel() {
     if ($("indexPreview")) $("indexPreview").textContent = "";
     return;
   }
+
+  // Stale-while-revalidate: paint cached status immediately (avoids ~1s blank)
+  const painted = paintIndexPanelFromCache(chat.id);
+  if (!painted && metaEl && String(state.indexMetaChatId) !== String(chat.id)) {
+    metaEl.textContent = "加载索引状态…";
+  }
+
   try {
     const r = await api(`/api/index/${encodeURIComponent(chat.id)}`);
+    // Ignore late responses if user switched chat/task
+    const still = getIndexTargetChat();
+    if (!still || String(still.id) !== String(chat.id)) return;
+
     state.indexMeta = r.meta || null;
+    state.indexMetaChatId = String(chat.id);
     state.indexTags = r.tags || [];
     state.tagRelated = r.related || {};
     state.indexCoverage = r.coverage || null;
     const scanning = !!(r.scanning || (r.meta && r.meta.status === "scanning"));
+    rememberIndexMetaCache(chat.id, {
+      meta: state.indexMeta,
+      coverage: state.indexCoverage,
+      scanning,
+    });
     const tagsSig = JSON.stringify(
       (state.indexTags || []).map((t) => `${t.tag || t}:${t.count || 0}`)
     );
@@ -1175,10 +1564,69 @@ async function refreshIndexPanel() {
     refreshIndexPreview();
   } catch (e) {
     if (isSoftAuthError(e)) return;
-    if (metaEl && !(state.indexMeta)) {
+    if (metaEl && !paintIndexPanelFromCache(chat.id)) {
       metaEl.textContent = e.message || "加载索引失败";
     }
   }
+}
+
+function indexMetaCacheKey(chatId) {
+  return `tgdl_idx_meta_${chatId}`;
+}
+
+function rememberIndexMetaCache(chatId, entry) {
+  if (chatId == null) return;
+  const payload = {
+    meta: entry?.meta || null,
+    coverage: entry?.coverage || null,
+    scanning: !!entry?.scanning,
+    at: Date.now(),
+  };
+  state.indexMetaCache[String(chatId)] = payload;
+  try {
+    sessionStorage.setItem(indexMetaCacheKey(chatId), JSON.stringify(payload));
+  } catch (_) {
+    /* quota / private mode */
+  }
+}
+
+function readIndexMetaCache(chatId) {
+  if (chatId == null) return null;
+  const key = String(chatId);
+  const mem = state.indexMetaCache[key];
+  if (mem?.meta) return mem;
+  try {
+    const raw = sessionStorage.getItem(indexMetaCacheKey(key));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed?.meta) return null;
+    state.indexMetaCache[key] = parsed;
+    return parsed;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** Instantly show last-known index status for this chat. Returns true if painted. */
+function paintIndexPanelFromCache(chatId) {
+  if (chatId == null) return false;
+  // Prefer in-memory state if it already belongs to this chat
+  if (
+    state.indexMeta &&
+    String(state.indexMetaChatId) === String(chatId)
+  ) {
+    renderIndexMeta(
+      !!(state._indexWasScanning || state.indexMeta.status === "scanning")
+    );
+    return true;
+  }
+  const cached = readIndexMetaCache(chatId);
+  if (!cached?.meta) return false;
+  state.indexMeta = cached.meta;
+  state.indexMetaChatId = String(chatId);
+  state.indexCoverage = cached.coverage || null;
+  renderIndexMeta(!!cached.scanning || cached.meta.status === "scanning");
+  return true;
 }
 
 function renderIndexMeta(scanning) {
@@ -1190,7 +1638,7 @@ function renderIndexMeta(scanning) {
   const count = m.media_count ?? 0;
   const scanned = m.scanned_count ?? 0;
   const last = m.last_scan_at
-    ? String(m.last_scan_at).replace("T", " ").slice(0, 19)
+    ? formatBeijingTime(m.last_scan_at)
     : "尚未扫描";
   const coverHint =
     cov.complete === true
@@ -1226,7 +1674,11 @@ function syncAutoIndexControls(meta) {
     else sel.value = "60";
     const on = chk ? !!chk.checked : false;
     sel.disabled = !on;
-    if (btn) btn.disabled = !on;
+    // Interval trigger stays enabled for touch; dim when auto is off
+    if (btn) {
+      btn.disabled = false;
+      btn.classList.toggle("is-auto-off", !on);
+    }
     syncAutoIndexIntervalUi(sel.value);
   }
 }
@@ -1251,8 +1703,44 @@ function syncAutoIndexIntervalUi(value) {
 function closeAutoIndexIntervalMenu() {
   const menu = $("tagsModalAutoIndexIntervalMenu");
   const btn = $("tagsModalAutoIndexIntervalBtn");
-  if (menu) menu.hidden = true;
+  const home = state._autoIndexMenuHome;
+  if (menu) {
+    menu.hidden = true;
+    menu.style.position = "";
+    menu.style.top = "";
+    menu.style.left = "";
+    menu.style.right = "";
+    menu.style.bottom = "";
+    menu.style.minWidth = "";
+    menu.style.zIndex = "";
+    if (home && menu.parentElement !== home) {
+      home.appendChild(menu);
+    }
+  }
   if (btn) btn.setAttribute("aria-expanded", "false");
+}
+
+function placeAutoIndexIntervalMenu() {
+  const btn = $("tagsModalAutoIndexIntervalBtn");
+  const menu = $("tagsModalAutoIndexIntervalMenu");
+  if (!btn || !menu || menu.hidden) return;
+  const rect = btn.getBoundingClientRect();
+  const menuW = Math.max(120, rect.width, menu.offsetWidth || 0);
+  const pad = 8;
+  let left = rect.right - menuW;
+  left = Math.max(pad, Math.min(left, window.innerWidth - menuW - pad));
+  let top = rect.bottom + 6;
+  menu.style.position = "fixed";
+  menu.style.right = "auto";
+  menu.style.left = `${Math.round(left)}px`;
+  menu.style.top = `${Math.round(top)}px`;
+  menu.style.bottom = "auto";
+  menu.style.minWidth = `${Math.round(menuW)}px`;
+  menu.style.zIndex = "400";
+  const mh = menu.offsetHeight || 220;
+  if (top + mh > window.innerHeight - pad && rect.top > mh + pad) {
+    menu.style.top = `${Math.round(rect.top - mh - 6)}px`;
+  }
 }
 
 function initAutoIndexIntervalDropdown() {
@@ -1262,17 +1750,34 @@ function initAutoIndexIntervalDropdown() {
   const menu = $("tagsModalAutoIndexIntervalMenu");
   if (!root || !sel || !btn || !menu || root.dataset.bound) return;
   root.dataset.bound = "1";
+  state._autoIndexMenuHome = menu.parentElement;
+  let ignoreDocCloseUntil = 0;
+
+  const openMenu = () => {
+    const chk = $("tagsModalAutoIndex");
+    if (chk && !chk.checked) {
+      chk.checked = true;
+      chk.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    btn.disabled = false;
+    btn.classList.remove("is-auto-off");
+    sel.disabled = false;
+    // Move to body so overflow parents can't clip / block the menu on mobile
+    if (menu.parentElement !== document.body) {
+      document.body.appendChild(menu);
+    }
+    menu.hidden = false;
+    btn.setAttribute("aria-expanded", "true");
+    placeAutoIndexIntervalMenu();
+    ignoreDocCloseUntil = Date.now() + 400;
+  };
 
   btn.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    if (btn.disabled) return;
-    const open = menu.hidden;
+    const willOpen = menu.hidden;
     closeAutoIndexIntervalMenu();
-    if (open) {
-      menu.hidden = false;
-      btn.setAttribute("aria-expanded", "true");
-    }
+    if (willOpen) openMenu();
   });
 
   menu.addEventListener("click", (e) => {
@@ -1286,12 +1791,26 @@ function initAutoIndexIntervalDropdown() {
     sel.dispatchEvent(new Event("change", { bubbles: true }));
   });
 
-  document.addEventListener("click", (e) => {
-    if (!root.contains(e.target)) closeAutoIndexIntervalMenu();
-  });
+  document.addEventListener(
+    "pointerdown",
+    (e) => {
+      if (menu.hidden) return;
+      if (Date.now() < ignoreDocCloseUntil) return;
+      if (btn.contains(e.target) || menu.contains(e.target)) return;
+      closeAutoIndexIntervalMenu();
+    },
+    true
+  );
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeAutoIndexIntervalMenu();
   });
+  window.addEventListener(
+    "resize",
+    () => {
+      if (!menu.hidden) placeAutoIndexIntervalMenu();
+    },
+    { passive: true }
+  );
   syncAutoIndexIntervalUi(sel.value || "60");
 }
 
@@ -1736,8 +2255,14 @@ async function startIndexScan(full) {
         return;
       }
       state.indexMeta = r.meta || state.indexMeta;
+      state.indexMetaChatId = String(chat.id);
       state.indexTags = r.tags || state.indexTags;
       state._indexWasScanning = false; // force cloud refresh once
+      rememberIndexMetaCache(chat.id, {
+        meta: state.indexMeta,
+        coverage: state.indexCoverage,
+        scanning: true,
+      });
       renderIndexMeta(true);
       renderTagCloud();
       scheduleIndexPoll();
@@ -1896,38 +2421,51 @@ async function refreshTgState() {
 }
 
 function applyAccountChip(st) {
-  const u = (st && st.user) || {};
+  if (st) state._chipTg = st;
+  const tg = st || state._chipTg || { authorized: false };
+  const u = tg.user || {};
   const chip = $("btnOpenAccount");
-  const sub = $("userBadgeSub");
-  if (st && st.authorized) {
-    const connecting = !!st.connecting && !u.first_name && !u.username;
-    const name = connecting
-      ? "连接中…"
-      : u.first_name || u.username || (u.phone ? `+${u.phone}` : "已连接");
-    $("userBadge").textContent = name;
-    if (sub) {
-      sub.textContent = connecting
-        ? "正在连 Telegram"
-        : u.username
-          ? `@${u.username}`
-          : "已连接 · 设置";
+  const webEl = $("userBadgeWeb");
+  const tgEl = $("userBadge");
+  const webName = (state.webUsername || "").trim();
+
+  if (webEl) webEl.textContent = webName || "未登录";
+
+  let tgLabel = "未连接";
+  let connecting = false;
+  if (tg.authorized) {
+    connecting = !!tg.connecting && !u.first_name && !u.username;
+    if (connecting) {
+      tgLabel = "连接中…";
+    } else if (u.username && u.first_name) {
+      tgLabel = `${u.first_name} · @${u.username}`;
+    } else if (u.username) {
+      tgLabel = `@${u.username}`;
+    } else if (u.first_name) {
+      tgLabel = u.first_name;
+    } else if (u.phone) {
+      tgLabel = `+${u.phone}`;
+    } else {
+      tgLabel = "已连接";
     }
-    const av = initials(u.first_name || u.username || "TG");
-    $("accountAvatar").textContent = av;
-    if ($("accountAvatarLg")) $("accountAvatarLg").textContent = av;
-    if (chip) {
-      chip.classList.toggle("is-online", !connecting);
-      chip.classList.toggle("is-offline", connecting);
-    }
-  } else {
-    $("userBadge").textContent = "未连接";
-    if (sub) sub.textContent = "打开设置";
-    $("accountAvatar").textContent = "TG";
-    if ($("accountAvatarLg")) $("accountAvatarLg").textContent = "TG";
-    if (chip) {
-      chip.classList.add("is-offline");
-      chip.classList.remove("is-online");
-    }
+  }
+  if (tgEl) tgEl.textContent = tgLabel;
+
+  const av = webName
+    ? initials(webName)
+    : tg.authorized && !connecting
+      ? initials(u.first_name || u.username || "TG")
+      : "?";
+  if ($("accountAvatar")) $("accountAvatar").textContent = av;
+  if ($("accountAvatarLg") && tg.authorized && !connecting) {
+    $("accountAvatarLg").textContent = initials(u.first_name || u.username || "TG");
+  }
+
+  if (chip) {
+    const online = !!tg.authorized && !connecting;
+    chip.classList.toggle("is-online", online);
+    chip.classList.toggle("is-offline", !online);
+    chip.title = `设置 / 账号 · Web ${webName || "未登录"} · TG ${tgLabel}`;
   }
 }
 
@@ -1965,10 +2503,25 @@ function switchSettingsTab(tab) {
   }
 }
 
+function _clampInt(raw, min, max, fallback) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(n)));
+}
+
 async function loadRuntimeSettings() {
   const r = await api("/api/settings/runtime");
   if ($("maxParallelChats")) {
     $("maxParallelChats").value = String(r.max_parallel_chats || 1);
+  }
+  if ($("failedRetryIntervalSec")) {
+    $("failedRetryIntervalSec").value = String(r.failed_retry_interval_sec || 900);
+  }
+  if ($("monitorHeartbeatSec")) {
+    $("monitorHeartbeatSec").value = String(r.monitor_heartbeat_sec || 600);
+  }
+  if ($("maxFloodWait")) {
+    $("maxFloodWait").value = String(r.max_flood_wait || 1800);
   }
   if ($("notifyEnabled")) $("notifyEnabled").checked = !!r.notify_enabled;
   if ($("notifyWebhook")) $("notifyWebhook").value = r.notify_webhook || "";
@@ -1979,14 +2532,27 @@ async function loadRuntimeSettings() {
 }
 
 async function saveRuntimeSettings() {
-  const parallel = Math.max(1, Math.min(10, Number(($("maxParallelChats") && $("maxParallelChats").value) || 1)));
+  const parallel = _clampInt($("maxParallelChats")?.value, 1, 10, 1);
+  const failedRetry = _clampInt($("failedRetryIntervalSec")?.value, 120, 86400, 900);
+  const heartbeat = _clampInt($("monitorHeartbeatSec")?.value, 60, 86400, 600);
+  const floodWait = _clampInt($("maxFloodWait")?.value, 60, 86400, 1800);
   const body = {
     max_parallel_chats: parallel,
+    failed_retry_interval_sec: failedRetry,
+    monitor_heartbeat_sec: heartbeat,
+    max_flood_wait: floodWait,
     notify_enabled: !!($("notifyEnabled") && $("notifyEnabled").checked),
     notify_webhook: ($("notifyWebhook") && $("notifyWebhook").value.trim()) || "",
   };
   const r = await api("/api/settings/runtime", { method: "PUT", body: JSON.stringify(body) });
   if ($("maxParallelChats")) $("maxParallelChats").value = String(r.max_parallel_chats || parallel);
+  if ($("failedRetryIntervalSec")) {
+    $("failedRetryIntervalSec").value = String(r.failed_retry_interval_sec || failedRetry);
+  }
+  if ($("monitorHeartbeatSec")) {
+    $("monitorHeartbeatSec").value = String(r.monitor_heartbeat_sec || heartbeat);
+  }
+  if ($("maxFloodWait")) $("maxFloodWait").value = String(r.max_flood_wait || floodWait);
   setMsg($("runtimeMsg"), "已保存", "ok");
 }
 
@@ -2097,6 +2663,7 @@ function fillAccountPanel(r) {
 function fillWebUsersPanel(r) {
   state.webUsername = r.web_username || null;
   state.webUsers = r.web_users || [];
+  applyAccountChip();
   const cur = $("webCurrentUser");
   if (cur) cur.textContent = state.webUsername || "（未启用）";
   if ($("webProfileName")) $("webProfileName").textContent = state.webUsername || "未登录";
@@ -2426,9 +2993,6 @@ function selectChat(chat) {
   }
   updateSelectedUi();
   renderChats($("chatSearch").value);
-  if (normalizeDownloadMode($("downloadMode") && $("downloadMode").value) === "monitor") {
-    refreshIndexPanel();
-  }
 }
 
 function updateSelectedUi() {
@@ -2603,6 +3167,7 @@ async function loadHistory(offset = 0) {
   const run = (async () => {
     state.historyOffset = Math.max(0, offset);
     const q = ($("historySearch") && $("historySearch").value.trim()) || "";
+    const chatId = state.historyChatId || "";
     const btnPrev = $("btnHistoryPrev");
     const btnNext = $("btnHistoryNext");
     const btnRefresh = $("btnRefreshHistory");
@@ -2611,43 +3176,42 @@ async function loadHistory(offset = 0) {
       b.disabled = true;
       b.classList.add("is-busy");
     });
-    if (!listEl.querySelector(".history-item")) {
+    if (!listEl.querySelector(".history-item, .history-group")) {
       listEl.innerHTML = `<div class="empty-tasks list-loading">加载中…</div>`;
     }
     try {
-      const r = await api(
-        `/api/history?q=${encodeURIComponent(q)}&status=done&limit=${state.historyLimit}&offset=${state.historyOffset}`
-      );
+      const [r, groupsR] = await Promise.all([
+        api(
+          `/api/history?q=${encodeURIComponent(q)}&chat_id=${encodeURIComponent(chatId)}&status=done&limit=${state.historyLimit}&offset=${state.historyOffset}`
+        ),
+        api(`/api/history/groups?q=${encodeURIComponent(q)}&status=done`).catch(() => null),
+      ]);
+      if (groupsR && Array.isArray(groupsR.groups)) {
+        state.historyGroups = groupsR.groups;
+        // Drop stale filter if that group vanished under current search
+        if (
+          state.historyChatId &&
+          !state.historyGroups.some((g) => String(g.chat_id) === String(state.historyChatId))
+        ) {
+          state.historyChatId = "";
+          if (chatId) {
+            // Re-fetch without the stale group filter
+            const r2 = await api(
+              `/api/history?q=${encodeURIComponent(q)}&chat_id=&status=done&limit=${state.historyLimit}&offset=${state.historyOffset}`
+            );
+            Object.assign(r, r2);
+          }
+        }
+        renderHistoryGroupBar();
+      }
       state.historyTotal = r.total || 0;
       const items = r.items || [];
+      state.historyItems = items;
       if (!items.length) {
-        listEl.innerHTML = `<div class="empty-tasks">暂无下载记录<br/><span class="muted">${q ? "换个关键词试试" : "下载完成后会出现在这里"}</span></div>`;
+        listEl.innerHTML = `<div class="empty-tasks">暂无下载记录<br/><span class="muted">${q || chatId ? "换个关键词或群组试试" : "下载完成后会出现在这里"}</span></div>`;
       } else {
-        listEl.innerHTML = items
-          .map((it) => {
-            const name = it.file_name || (it.file_path || "").split(/[/\\]/).pop() || "—";
-            const when = (it.created_at || "").replace("T", " ").slice(0, 19);
-            const kind = it.media_kind || "file";
-            const previewable = it.previewable ? "1" : "0";
-            const thumb =
-              kind === "image" && it.previewable
-                ? `<div class="history-thumb"><img src="/api/history/${it.id}/file" alt="" loading="lazy" /></div>`
-                : kind === "video"
-                  ? `<div class="history-thumb history-thumb-icon" aria-hidden="true"><span class="ui-ico ui-ico-video"></span></div>`
-                  : kind === "audio"
-                    ? `<div class="history-thumb history-thumb-icon" aria-hidden="true"><span class="ui-ico ui-ico-audio"></span></div>`
-                    : `<div class="history-thumb history-thumb-icon" aria-hidden="true"><span class="ui-ico ui-ico-file"></span></div>`;
-            const meta = `${it.chat_title || it.chat_id || ""} · msg ${it.message_id} · 任务 #${it.task_id}${it.previewable ? " · 点击预览" : ""}`;
-            return `<div class="history-item" role="button" tabindex="0" data-id="${escapeHtml(String(it.id))}" data-kind="${escapeHtml(kind)}" data-previewable="${previewable}" data-name="${escapeHtml(name)}">
-          ${thumb}
-          <div class="history-item-main">
-            <div class="history-name" title="${escapeHtml(it.file_path || name)}">${escapeHtml(name)}</div>
-            <div class="history-meta" title="${escapeHtml(meta)}">${escapeHtml(meta)}</div>
-            <div class="history-time">${escapeHtml(when)}</div>
-          </div>
-        </div>`;
-          })
-          .join("");
+        listEl.innerHTML = renderHistoryGrouped(items);
+        hydrateHistoryThumbs(listEl);
       }
       const info = $("historyPageInfo");
       if (info) {
@@ -2676,29 +3240,397 @@ async function loadHistory(offset = 0) {
   return state._historyInflight;
 }
 
-function openHistoryPreview(id, kind, name) {
+function renderHistoryGroupBar() {
+  const bar = $("historyGroupBar");
+  if (!bar) return;
+  const groups = state.historyGroups || [];
+  const total = groups.reduce((n, g) => n + (Number(g.count) || 0), 0);
+  const active = state.historyChatId || "";
+  const chips = [
+    `<button type="button" class="history-group-chip${active ? "" : " is-active"}" data-history-chat="">全部<span class="history-group-count">${total}</span></button>`,
+    ...groups.map((g) => {
+      const id = String(g.chat_id || "");
+      const title = g.chat_title || id || "未知群组";
+      const on = active && id === String(active);
+      return `<button type="button" class="history-group-chip${on ? " is-active" : ""}" data-history-chat="${escapeHtml(id)}" title="${escapeHtml(title)}"><span class="history-group-chip-label">${escapeHtml(title)}</span><span class="history-group-count">${Number(g.count) || 0}</span></button>`;
+    }),
+  ];
+  bar.innerHTML = chips.join("");
+  bar.hidden = groups.length === 0;
+}
+
+function historyKindIcon(kind) {
+  if (kind === "video") return "ui-ico-video";
+  if (kind === "audio") return "ui-ico-audio";
+  return "ui-ico-file";
+}
+
+function historyThumbHtml(it) {
+  const kind = it.media_kind || "file";
+  const id = it.id;
+  if (it.file_missing) {
+    return `<div class="history-thumb history-thumb-icon is-missing" aria-hidden="true"><span class="ui-ico ${historyKindIcon(kind)}"></span></div>`;
+  }
+  if (kind === "image" && it.previewable) {
+    return `<div class="history-thumb has-media"><img src="/api/history/${id}/file" alt="" loading="lazy" decoding="async" /></div>`;
+  }
+  if (kind === "video" && it.previewable) {
+    return `<div class="history-thumb has-media history-thumb-video-wrap">
+      <video class="history-thumb-video" src="/api/history/${id}/file#t=0.1" muted playsinline preload="metadata" data-thumb-id="${id}"></video>
+      <span class="history-thumb-play" aria-hidden="true"></span>
+    </div>`;
+  }
+  return `<div class="history-thumb history-thumb-icon" aria-hidden="true"><span class="ui-ico ${historyKindIcon(kind)}"></span></div>`;
+}
+
+function hydrateHistoryThumbs(root) {
+  if (!root) return;
+  const cache = (state._historyThumbCache = state._historyThumbCache || {});
+  const videos = Array.from(root.querySelectorAll("video.history-thumb-video"));
+  if (!videos.length) return;
+
+  const runOne = (video) =>
+    new Promise((resolve) => {
+      const wrap = video.closest(".history-thumb");
+      const id = video.getAttribute("data-thumb-id") || "";
+      if (id && cache[id]) {
+        const img = document.createElement("img");
+        img.src = cache[id];
+        img.alt = "";
+        img.loading = "lazy";
+        video.replaceWith(img);
+        resolve();
+        return;
+      }
+
+      let done = false;
+      let timer = null;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        resolve();
+      };
+      const fail = () => {
+        if (done) return;
+        if (wrap && !wrap.querySelector("img")) {
+          wrap.classList.remove("has-media");
+          wrap.classList.add("history-thumb-icon");
+          wrap.innerHTML = `<span class="ui-ico ui-ico-video"></span>`;
+        }
+        finish();
+      };
+      const paint = () => {
+        if (done) return;
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        if (!vw || !vh) return;
+        try {
+          const size = 128;
+          const canvas = document.createElement("canvas");
+          canvas.width = size;
+          canvas.height = size;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) {
+            fail();
+            return;
+          }
+          const scale = Math.max(size / vw, size / vh);
+          const sw = size / scale;
+          const sh = size / scale;
+          const sx = (vw - sw) / 2;
+          const sy = (vh - sh) / 2;
+          ctx.drawImage(video, sx, sy, sw, sh, 0, 0, size, size);
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+          if (id) cache[id] = dataUrl;
+          const img = document.createElement("img");
+          img.src = dataUrl;
+          img.alt = "";
+          video.replaceWith(img);
+          try {
+            video.removeAttribute("src");
+            video.load();
+          } catch (_) {}
+          finish();
+        } catch (_) {
+          fail();
+        }
+      };
+
+      timer = setTimeout(fail, 12000);
+      video.addEventListener("seeked", paint, { once: true });
+      video.addEventListener(
+        "loadeddata",
+        () => {
+          try {
+            const t = Math.min(0.8, Math.max(0.05, (video.duration || 2) * 0.04));
+            if (Math.abs((video.currentTime || 0) - t) < 0.02) paint();
+            else video.currentTime = t;
+          } catch (_) {
+            paint();
+          }
+        },
+        { once: true }
+      );
+      video.addEventListener("error", fail, { once: true });
+      try {
+        video.load();
+      } catch (_) {}
+    });
+
+  let idx = 0;
+  const workers = Math.min(3, videos.length);
+  const worker = async () => {
+    while (idx < videos.length) {
+      const v = videos[idx++];
+      await runOne(v);
+    }
+  };
+  for (let w = 0; w < workers; w++) worker();
+}
+
+function renderHistoryItem(it, { hideChat } = {}) {
+  const name = it.file_name || (it.file_path || "").split(/[/\\]/).pop() || "—";
+  const when = (it.created_at || "").replace("T", " ").slice(0, 19);
+  const kind = it.media_kind || "file";
+  const previewable = it.previewable ? "1" : "0";
+  const missing = it.file_missing ? "1" : "0";
+  const thumb = historyThumbHtml(it);
+  const metaBits = [];
+  if (!hideChat) metaBits.push(it.chat_title || it.chat_id || "");
+  metaBits.push(`msg ${it.message_id}`, `任务 #${it.task_id}`);
+  if (it.file_missing) metaBits.push("文件缺失");
+  else if (it.previewable) metaBits.push("点击预览");
+  else metaBits.push("点击打开");
+  const meta = metaBits.filter(Boolean).join(" · ");
+  return `<div class="history-item${it.file_missing ? " is-missing" : ""}" role="button" tabindex="0" data-id="${escapeHtml(String(it.id))}" data-kind="${escapeHtml(kind)}" data-previewable="${previewable}" data-missing="${missing}" data-name="${escapeHtml(name)}">
+          ${thumb}
+          <div class="history-item-main">
+            <div class="history-name" title="${escapeHtml(it.file_path || name)}">${escapeHtml(name)}</div>
+            <div class="history-meta" title="${escapeHtml(meta)}">${escapeHtml(meta)}</div>
+            <div class="history-time">${escapeHtml(when)}</div>
+          </div>
+        </div>`;
+}
+
+function renderHistoryGrouped(items) {
+  const filtered = !!state.historyChatId;
+  const parts = [];
+  let lastKey = null;
+  let bucket = [];
+
+  const flush = () => {
+    if (!bucket.length) return;
+    const sample = bucket[0];
+    const title = sample.chat_title || sample.chat_id || "未知群组";
+    const g = (state.historyGroups || []).find(
+      (x) => String(x.chat_id) === String(sample.chat_id || "")
+    );
+    const n = filtered && g ? g.count : bucket.length;
+    parts.push(`<section class="history-group">
+      <header class="history-group-head">
+        <div class="history-group-title">${escapeHtml(title)}</div>
+        <div class="history-group-meta">${n} 个文件</div>
+      </header>
+      <div class="history-group-items">
+        ${bucket.map((it) => renderHistoryItem(it, { hideChat: true })).join("")}
+      </div>
+    </section>`);
+    bucket = [];
+  };
+
+  for (const it of items) {
+    const key = String(it.chat_id || it.chat_title || "");
+    if (lastKey !== null && key !== lastKey) flush();
+    lastKey = key;
+    bucket.push(it);
+  }
+  flush();
+  return parts.join("");
+}
+
+function historyPreviewPlaylist(items) {
+  return (items || [])
+    .filter(
+      (it) =>
+        it &&
+        !it.file_missing &&
+        (it.previewable || ["image", "video", "audio"].includes(it.media_kind))
+    )
+    .map((it) => ({
+      id: Number(it.id),
+      kind: it.media_kind || "file",
+      name: it.file_name || (it.file_path || "").split(/[/\\]/).pop() || "—",
+    }))
+    .filter((it) => it.id);
+}
+
+function syncHistoryPreviewNav() {
+  const btnPrev = $("btnHistoryPreviewPrev");
+  const btnNext = $("btnHistoryPreviewNext");
+  const meta = $("historyPreviewMeta");
+  const list = state._previewPlaylist || [];
+  const idx = Number(state._previewIndex);
+  const n = list.length;
+  const has = n > 0 && idx >= 0 && idx < n;
+  if (btnPrev) {
+    const canPrev = has && (idx > 0 || state.historyOffset > 0);
+    btnPrev.disabled = !canPrev;
+    if (!canPrev) btnPrev.setAttribute("disabled", "");
+    else btnPrev.removeAttribute("disabled");
+  }
+  if (btnNext) {
+    const morePages =
+      state.historyOffset + state.historyLimit < (state.historyTotal || 0);
+    const canNext = has && (idx < n - 1 || morePages);
+    btnNext.disabled = !canNext;
+    if (!canNext) btnNext.setAttribute("disabled", "");
+    else btnNext.removeAttribute("disabled");
+  }
+  if (meta) {
+    if (has) {
+      meta.hidden = false;
+      meta.textContent = `${idx + 1} / ${n}`;
+    } else {
+      meta.hidden = true;
+      meta.textContent = "";
+    }
+  }
+}
+
+function showHistoryPreviewItem(item) {
   const modal = $("historyPreviewModal");
   const body = $("historyPreviewBody");
   const title = $("historyPreviewTitle");
-  const meta = $("historyPreviewMeta");
-  const openLink = $("historyPreviewOpen");
-  if (!modal || !body) return;
+  const kindEl = $("historyPreviewKind");
+  const panel = modal?.querySelector(".history-preview-panel");
+  if (!modal || !body || !item) return;
+  const id = Number(item.id);
+  const name = item.name || "媒体预览";
+  const kindN =
+    item.kind === "image" || item.kind === "video" || item.kind === "audio"
+      ? item.kind
+      : "file";
+  const kindLabel =
+    kindN === "image"
+      ? "图片"
+      : kindN === "video"
+        ? "视频"
+        : kindN === "audio"
+          ? "音频"
+          : "文件";
   const url = `/api/history/${id}/file`;
-  if (title) title.textContent = name || "媒体预览";
-  if (meta) meta.textContent = kind || "";
-  if (openLink) openLink.href = url;
-  body.innerHTML = "";
-  if (kind === "image") {
-    body.innerHTML = `<img class="history-preview-media" src="${url}" alt="${escapeHtml(name || "")}" />`;
-  } else if (kind === "video") {
-    body.innerHTML = `<video class="history-preview-media" src="${url}" controls playsinline></video>`;
-  } else if (kind === "audio") {
-    body.innerHTML = `<audio class="history-preview-media history-preview-audio" src="${url}" controls></audio>`;
-  } else {
-    body.innerHTML = `<p class="muted">无法内嵌预览，请用「新窗口打开」。</p>`;
+  if (panel) panel.setAttribute("data-kind", kindN);
+  if (title) {
+    title.textContent = name;
+    title.title = name;
   }
+  if (kindEl) kindEl.textContent = kindLabel;
+  body.querySelectorAll("video, audio").forEach((el) => {
+    try {
+      el.pause();
+      el.removeAttribute("src");
+      el.load();
+    } catch (_) {}
+  });
+  body.innerHTML = "";
+  body.classList.toggle("is-empty", false);
+  if (kindN === "image") {
+    body.innerHTML = `<img class="history-preview-media" src="${url}" alt="${escapeHtml(name)}" />`;
+  } else if (kindN === "video") {
+    body.innerHTML = `<video class="history-preview-media" src="${url}" controls playsinline webkit-playsinline preload="metadata" autoplay></video>`;
+  } else if (kindN === "audio") {
+    body.innerHTML = `<div class="history-preview-audio-wrap">
+      <div class="history-preview-audio-orb" aria-hidden="true"></div>
+      <audio class="history-preview-media history-preview-audio" src="${url}" controls preload="metadata" autoplay></audio>
+    </div>`;
+  } else {
+    body.classList.add("is-empty");
+    body.innerHTML = `<p class="history-preview-fallback">无法内嵌预览，请用「新窗口打开」。</p>`;
+  }
+  syncHistoryPreviewNav();
+}
+
+function openHistoryPreview(id, kind, name) {
+  const modal = $("historyPreviewModal");
+  if (!modal) return;
+  const playlist = historyPreviewPlaylist(state.historyItems || []);
+  state._previewPlaylist = playlist;
+  let idx = playlist.findIndex((x) => Number(x.id) === Number(id));
+  if (idx < 0) {
+    playlist.unshift({
+      id: Number(id),
+      kind: kind || "file",
+      name: name || "媒体预览",
+    });
+    idx = 0;
+    state._previewPlaylist = playlist;
+  }
+  state._previewIndex = idx;
+  showHistoryPreviewItem(playlist[idx]);
   modal.hidden = false;
   syncBodyModalLock();
+}
+
+async function stepHistoryPreview(dir) {
+  const list = state._previewPlaylist || [];
+  let idx = Number(state._previewIndex);
+  if (!list.length || idx < 0) return;
+  const next = idx + (dir < 0 ? -1 : 1);
+  if (next >= 0 && next < list.length) {
+    state._previewIndex = next;
+    showHistoryPreviewItem(list[next]);
+    return;
+  }
+  if (dir > 0 && state.historyOffset + state.historyLimit < (state.historyTotal || 0)) {
+    const btnNext = $("btnHistoryPreviewNext");
+    if (btnNext) {
+      btnNext.disabled = true;
+      btnNext.classList.add("is-busy");
+    }
+    try {
+      await loadHistory(state.historyOffset + state.historyLimit);
+      const playlist = historyPreviewPlaylist(state.historyItems || []);
+      state._previewPlaylist = playlist;
+      if (!playlist.length) {
+        toast("下一页没有可预览的媒体", "info", 1800);
+        syncHistoryPreviewNav();
+        return;
+      }
+      state._previewIndex = 0;
+      showHistoryPreviewItem(playlist[0]);
+    } catch (e) {
+      if (!isSoftAuthError(e)) toast(e.message || "加载失败", "err");
+      syncHistoryPreviewNav();
+    } finally {
+      if (btnNext) btnNext.classList.remove("is-busy");
+    }
+    return;
+  }
+  if (dir < 0 && state.historyOffset > 0) {
+    const btnPrev = $("btnHistoryPreviewPrev");
+    if (btnPrev) {
+      btnPrev.disabled = true;
+      btnPrev.classList.add("is-busy");
+    }
+    try {
+      await loadHistory(Math.max(0, state.historyOffset - state.historyLimit));
+      const playlist = historyPreviewPlaylist(state.historyItems || []);
+      state._previewPlaylist = playlist;
+      if (!playlist.length) {
+        toast("上一页没有可预览的媒体", "info", 1800);
+        syncHistoryPreviewNav();
+        return;
+      }
+      state._previewIndex = playlist.length - 1;
+      showHistoryPreviewItem(playlist[state._previewIndex]);
+    } catch (e) {
+      if (!isSoftAuthError(e)) toast(e.message || "加载失败", "err");
+      syncHistoryPreviewNav();
+    } finally {
+      if (btnPrev) btnPrev.classList.remove("is-busy");
+    }
+  }
 }
 
 function closeHistoryPreview() {
@@ -2714,6 +3646,7 @@ function closeHistoryPreview() {
     });
     body.innerHTML = "";
   }
+  state._previewIndex = -1;
   if (modal) modal.hidden = true;
   syncBodyModalLock();
 }
@@ -2786,30 +3719,68 @@ function bindTaskActions(root) {
       return;
     }
 
+    // Delete: confirm first (before busy), then call API
+    if (action === "delete") {
+      const task = (state.tasks || []).find((x) => String(x.id) === String(id));
+      const title = (task && (task.chat_title || task.chat_id)) || `#${id}`;
+      const ok = await confirmDialog({
+        title: "删除任务",
+        message: `确定删除「${title}」？\n仅删除任务记录，已下载的文件不会删除。`,
+        confirmText: "确认删除",
+        cancelText: "取消",
+        confirmPhrase: "删除",
+        danger: true,
+      });
+      if (!ok) return;
+      const busyKey = `delete:${id}`;
+      if (!state._taskActionBusy) state._taskActionBusy = new Set();
+      if (state._taskActionBusy.has(busyKey)) return;
+      state._taskActionBusy.add(busyKey);
+      btn.disabled = true;
+      btn.classList.add("is-busy");
+      try {
+        await api(`/api/tasks/${id}`, { method: "DELETE" });
+        toast("任务已删除", "ok", 1800);
+        await loadTasks({ force: true });
+      } catch (e) {
+        if (!isSoftAuthError(e)) {
+          toast("删除失败: " + (e.message || e), "err");
+          console.error(e);
+        }
+      } finally {
+        state._taskActionBusy.delete(busyKey);
+        btn.classList.remove("is-busy");
+        btn.disabled = false;
+        btn.removeAttribute("disabled");
+      }
+      return;
+    }
+
     const busyKey = `${action}:${id}`;
     if (!state._taskActionBusy) state._taskActionBusy = new Set();
     if (state._taskActionBusy.has(busyKey)) return;
     state._taskActionBusy.add(busyKey);
-    btn.disabled = true;
+    const taskForBusy = (state.tasks || []).find((x) => String(x.id) === String(id));
+    const monitorToggle =
+      isMonitorTask(taskForBusy) &&
+      (action === "start" || action === "pause") &&
+      btn.dataset.role === "start-btn";
+    // Monitor toggle: avoid disabled opacity flash (white wash on green)
+    if (!monitorToggle) btn.disabled = true;
     btn.classList.add("is-busy");
     try {
       if (action === "start") {
-        toast("正在启动任务…", "info", 2000);
+        const task = taskForBusy;
+        const mon = isMonitorTask(task);
+        applyOptimisticPauseResume(id, "start");
         const r = await api(`/api/tasks/${id}/start`, { method: "POST", body: "{}" });
         if (!r.ok) throw new Error(r.message || "启动失败");
-        toast("任务已继续", "ok", 2000);
+        toast(mon ? "已恢复监控" : "任务已继续", "ok", 1600);
       } else if (action === "pause") {
-        toast("正在暂停…", "info", 2000);
+        const task = taskForBusy;
+        applyOptimisticPauseResume(id, "pause");
         await api(`/api/tasks/${id}/pause`, { method: "POST", body: "{}" });
-      } else if (action === "delete") {
-        const ok = await confirmDialog({
-          title: "删除任务",
-          message: "确认删除该任务记录？已下载文件不会删除。",
-          confirmText: "删除任务",
-          danger: true,
-        });
-        if (!ok) return;
-        await api(`/api/tasks/${id}`, { method: "DELETE" });
+        toast(isMonitorTask(task) ? "已暂停监控" : "已暂停", "ok", 1600);
       } else if (action === "clear-log") {
         const ok = await confirmDialog({
           title: "清空活动日志",
@@ -2833,11 +3804,38 @@ function bindTaskActions(root) {
       // Disabled state follows next patchTaskCard / render
       const task = (state.tasks || []).find((t) => String(t.id) === String(id));
       if (action === "start") {
-        btn.disabled = task ? task.status === "running" : false;
+        btn.disabled = task ? task.status === "running" && !isMonitorTask(task) : false;
+        if (!btn.disabled) btn.removeAttribute("disabled");
       } else if (action === "pause") {
-        btn.disabled = task ? task.status !== "running" : true;
+        const card = btn.closest(".task");
+        const startBtn = card?.querySelector('[data-role="start-btn"]');
+        const pauseBtn = card?.querySelector('[data-role="pause-btn"]');
+        const mon = isMonitorTask(task);
+        // Monitor toggle uses start-btn as pause — keep it enabled as「恢复监控」
+        if (btn === startBtn || (mon && btn.dataset.role === "start-btn")) {
+          btn.disabled = false;
+          btn.removeAttribute("disabled");
+        } else {
+          const canPause = task && task.status === "running";
+          if (canPause) {
+            if (pauseBtn && !pauseBtn.hidden) {
+              pauseBtn.disabled = false;
+              pauseBtn.removeAttribute("disabled");
+              pauseBtn.classList.add("is-pause-ready");
+            }
+          } else {
+            btn.disabled = true;
+          }
+        }
+        if (mon && pauseBtn) {
+          pauseBtn.hidden = true;
+          pauseBtn.setAttribute("hidden", "");
+          pauseBtn.disabled = true;
+          pauseBtn.classList.remove("is-pause-ready");
+        }
       } else {
         btn.disabled = false;
+        btn.removeAttribute("disabled");
       }
     }
   });
@@ -3199,6 +4197,7 @@ function renderTagsModalSummary() {
     el.classList.add("muted");
     el.classList.remove("has-tags");
     el.title = "";
+    syncTagsModalEmptyHint();
     return;
   }
   const parts = groups.map((g) => g.map((t) => "#" + t).join("+"));
@@ -3210,21 +4209,89 @@ function renderTagsModalSummary() {
   el.title = preview;
   el.classList.remove("muted");
   el.classList.add("has-tags");
+  syncTagsModalEmptyHint();
+}
+
+function syncTagsModalEmptyHint() {
+  const hint = $("tagsModalEmptyHint");
+  if (!hint) return;
+  const draft = state.taskTagsDraft;
+  const isMon = draft && normalizeDownloadMode(draft.downloadMode) === "monitor";
+  const empty = !draft || !(draft.tags || []).some((t) => String(t || "").trim());
+  hint.hidden = !(isMon && empty);
+}
+
+function bytesToMbInput(bytes) {
+  const n = Number(bytes) || 0;
+  if (n <= 0) return "";
+  const mb = n / (1024 * 1024);
+  return Number.isInteger(mb) ? String(mb) : String(Math.round(mb * 10) / 10);
+}
+
+function formatsToInputValue(formats) {
+  if (!formats) return "";
+  if (Array.isArray(formats)) return formats.join(",");
+  if (typeof formats === "object") {
+    const all = [];
+    for (const list of Object.values(formats)) {
+      if (Array.isArray(list)) all.push(...list);
+    }
+    return [...new Set(all)].join(",");
+  }
+  return "";
+}
+
+function dateInputValue(raw) {
+  if (!raw) return "";
+  const s = String(raw).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  return "";
+}
+
+function applySettingsModalMode(mode) {
+  const m = normalizeDownloadMode(mode);
+  const modal = $("tagsModal");
+  if (modal) modal.dataset.settingsMode = m;
+  document.querySelectorAll("#tagsModal [data-settings-for]").forEach((el) => {
+    const forMode = el.getAttribute("data-settings-for") || "both";
+    const show = forMode === "both" || forMode === m;
+    el.hidden = !show;
+  });
+  const badge = $("tagsModalModeBadge");
+  if (badge) {
+    const meta = taskModeMeta({ download_mode: m });
+    badge.hidden = false;
+    badge.textContent = meta.label;
+    badge.dataset.mode = meta.mode;
+    badge.title = meta.tip;
+  }
 }
 
 function fillTaskSettingsFields(task) {
   const tags = Array.isArray(task.include_tags) ? task.include_tags.slice() : [];
+  const downloadMode = normalizeDownloadMode(task.download_mode);
+  const order = String(task.download_order || "added_first");
+  const folderMode = String(task.folder_mode || "caption");
+  const media = Array.isArray(task.media_types) && task.media_types.length
+    ? task.media_types.map(String)
+    : ["photo", "video", "document", "audio"];
+
   state.taskTagsDraft = {
     taskId: String(task.id),
     chatId: task.chat_id,
     tags,
     groups: tags.map((t) => [normalizeTagName(t)]).filter((g) => g[0]),
     mode: "any",
+    downloadMode,
     title: task.chat_title || String(task.chat_id),
     concurrency: Math.max(1, Math.min(5, Number(task.concurrency) || 2)),
     delayMin: Number(task.delay_min != null ? task.delay_min : 0.5),
     delayMax: Number(task.delay_max != null ? task.delay_max : 0.5),
   };
+
+  applySettingsModalMode(downloadMode);
+  syncTagsModalEmptyHint();
+
   if ($("tagsModalTitle")) $("tagsModalTitle").textContent = "任务设置";
   if ($("tagsModalSub")) $("tagsModalSub").textContent = state.taskTagsDraft.title;
   if ($("tagsModalRelated")) $("tagsModalRelated").checked = true;
@@ -3237,6 +4304,45 @@ function fillTaskSettingsFields(task) {
   if ($("tagsModalDelayMax")) {
     $("tagsModalDelayMax").value = String(state.taskTagsDraft.delayMax);
   }
+
+  document.querySelectorAll('input[name="settingsMedia"]').forEach((cb) => {
+    cb.checked = media.includes(cb.value);
+  });
+  if ($("tagsModalFolderMode")) $("tagsModalFolderMode").value = folderMode;
+  if ($("tagsModalDownloadOrder")) {
+    $("tagsModalDownloadOrder").value = [
+      "added_first",
+      "oldest_first",
+      "newest_first",
+    ].includes(order)
+      ? order
+      : "added_first";
+  }
+  if ($("tagsModalDownloadOrderSeq")) {
+    $("tagsModalDownloadOrderSeq").value = $("tagsModalDownloadOrder").value;
+  }
+  if ($("tagsModalStartDate")) {
+    $("tagsModalStartDate").value = dateInputValue(task.start_date);
+  }
+  if ($("tagsModalEndDate")) {
+    $("tagsModalEndDate").value = dateInputValue(task.end_date);
+  }
+  if ($("tagsModalMaxMessages")) {
+    $("tagsModalMaxMessages").value =
+      task.max_messages != null && Number(task.max_messages) > 0
+        ? String(task.max_messages)
+        : "";
+  }
+  if ($("tagsModalFileFormats")) {
+    $("tagsModalFileFormats").value = formatsToInputValue(task.file_formats);
+  }
+  if ($("tagsModalMinFileMb")) {
+    $("tagsModalMinFileMb").value = bytesToMbInput(task.min_file_bytes);
+  }
+  if ($("tagsModalMaxFileMb")) {
+    $("tagsModalMaxFileMb").value = bytesToMbInput(task.max_file_bytes);
+  }
+
   renderTagsModalSummary();
 }
 
@@ -3373,44 +4479,26 @@ function renderTagPickerApplied() {
     $("btnGotoIndexPage")?.addEventListener("click", () => switchTagPickerPage("index"));
     return;
   }
-  const phone = isPhoneTagPicker();
   host.innerHTML = groups
     .map((group, idx) => {
       const isBundle = group.length > 1;
+      // Same chip style for solo and related groups
       const chips = group
         .map(
-          (tag) =>
-            `<span class="tag-chip${isBundle ? " is-in-bundle" : " is-solo-applied"}">#${escapeHtml(
-              tag
-            )}</span>`
+          (tag, i) =>
+            `<span class="tag-chip is-applied-chip${
+              isBundle && i === 0 ? " is-primary" : ""
+            }">#${escapeHtml(tag)}</span>`
         )
-        .join(
-          isBundle && !phone
-            ? `<span class="tag-chip-link" aria-hidden="true">+</span>`
-            : ""
-        );
-      if (phone) {
-        return `<div class="tag-picker-row is-applied${
-          isBundle ? " tag-picker-bundle" : " tag-picker-solo"
-        }" data-gidx="${idx}">
-          <div class="tag-card-head">
-            <span class="tag-bundle-mark">${
-              isBundle ? `${group.length} 关联` : "单标签"
-            }</span>
-            <button type="button" class="tag-remove" data-gidx="${idx}" title="移除" aria-label="移除">×</button>
-          </div>
-          <div class="tag-chip-row">${chips}</div>
-        </div>`;
-      }
+        .join("");
       return `<div class="tag-picker-row is-applied${
         isBundle ? " tag-picker-bundle" : " tag-picker-solo"
       }" data-gidx="${idx}">
-        <div class="tag-chip-row">${
-          isBundle
-            ? `<span class="tag-bundle-mark">${group.length} 关联</span>`
-            : ""
-        }${chips}</div>
-        <button type="button" class="tag-remove" data-gidx="${idx}" title="移除整组" aria-label="移除">×</button>
+        <span class="tag-bundle-mark${isBundle ? "" : " tag-bundle-mark-solo"}">${
+          isBundle ? `${group.length} 关联` : "单标签"
+        }</span>
+        <div class="tag-chip-row">${chips}</div>
+        <button type="button" class="tag-remove" data-gidx="${idx}" title="移除" aria-label="移除"><span aria-hidden="true">×</span></button>
       </div>`;
     })
     .join("");
@@ -3467,38 +4555,70 @@ function buildTagPickerRows(items, bundles) {
   return rows.concat(solos);
 }
 
-function renderTagPickerIndex() {
+function getTagPickerIndexRows(q) {
+  const index = state.tagPickerIndex || [];
+  const bundles = state.tagPickerBundles || [];
+  const key = `${index.length}|${bundles.length}|${q || ""}`;
+  const cache = state._tagPickerRowsCache;
+  if (cache && cache.key === key) return cache.rows;
+  const rows = buildTagPickerRows(index, bundles);
+  const visible = q
+    ? rows.filter((row) =>
+        row.tags.some((t) => String(t.tag || "").toLowerCase().includes(q))
+      )
+    : rows;
+  state._tagPickerRowsCache = { key, rows: visible };
+  return visible;
+}
+
+function syncTagPickerPager(total, page, pageCount) {
+  const pager = $("tagPickerPager");
+  const info = $("tagPickerPagerInfo");
+  const prev = $("btnTagPickerPrev");
+  const next = $("btnTagPickerNext");
+  if (!pager) return;
+  if (total <= 0) {
+    pager.hidden = true;
+    return;
+  }
+  pager.hidden = false;
+  if (info) {
+    info.textContent =
+      pageCount > 1
+        ? `${page} / ${pageCount} · 共 ${total} 条`
+        : `共 ${total} 条`;
+  }
+  if (prev) prev.disabled = page <= 1;
+  if (next) next.disabled = page >= pageCount;
+}
+
+function renderTagPickerIndex(opts = {}) {
   const host = $("tagPickerIndex");
   if (!host) return;
   const q = (($("tagPickerSearch") && $("tagPickerSearch").value) || "")
     .trim()
     .replace(/^#+/, "")
     .toLowerCase();
-  // Cap bundles fed into clustering — keeps mobile main thread responsive
-  const allBundles = state.tagPickerBundles || [];
-  const bundleCap = q ? 800 : 300;
-  const rows = buildTagPickerRows(
-    state.tagPickerIndex || [],
-    allBundles.length > bundleCap ? allBundles.slice(0, bundleCap) : allBundles
-  );
-  let visible = rows;
-  if (q) {
-    visible = rows.filter((row) =>
-      row.tags.some((t) => String(t.tag || "").toLowerCase().includes(q))
-    );
-  }
+  const visible = getTagPickerIndexRows(q);
+  const pageSize = Math.max(10, Number(state.tagPickerIndexPageSize) || 50);
+  const pageCount = Math.max(1, Math.ceil(visible.length / pageSize) || 1);
+  let page = Math.max(1, Number(state.tagPickerIndexPage) || 1);
+  if (page > pageCount) page = pageCount;
+  state.tagPickerIndexPage = page;
+
   if (!visible.length) {
     host.innerHTML = `<div class="tag-picker-empty">${
       (state.tagPickerIndex || []).length
         ? "没有匹配的索引标签"
         : "暂无索引标签<br/><span class=\"muted\">请先在任务设置里更新该群索引</span>"
     }</div>`;
+    syncTagPickerPager(0, 1, 1);
+    syncTagPickerTabCounts();
     return;
   }
-  // Limit DOM nodes; search to find the rest
-  const rowCap = q ? 200 : 120;
-  const truncated = visible.length > rowCap;
-  const shownRows = truncated ? visible.slice(0, rowCap) : visible;
+
+  const start = (page - 1) * pageSize;
+  const shownRows = visible.slice(start, start + pageSize);
   host.innerHTML = shownRows
     .map((row, i) => {
       const group = [...row.tags].sort(
@@ -3511,79 +4631,42 @@ function renderTagPickerIndex() {
         : isTagApplied(names[0]);
       const allApplied = group.every((t) => isTagApplied(t.tag));
       const anyApplied = group.some((t) => isTagApplied(t.tag));
-      // Phone: show every tag in the bundle (no +N truncation)
-      const phone = isPhoneTagPicker();
-      const maxShow = phone ? group.length : Math.min(group.length, 8);
-      const shown = group.slice(0, maxShow);
-      const more = group.length - shown.length;
-      const chips = shown
+      const chips = group
         .map((t, idx) => {
           const hit = q && String(t.tag).toLowerCase().includes(q);
-          return `<span class="tag-chip${idx === 0 && isBundle ? " is-primary" : ""}${
-            hit ? " is-hit" : ""
-          }">#${escapeHtml(t.tag)}</span>`;
+          return `<span class="tag-chip is-applied-chip${
+            idx === 0 && isBundle ? " is-primary" : ""
+          }${hit ? " is-hit" : ""}" title="#${escapeHtml(t.tag)}">#${escapeHtml(
+            t.tag
+          )}</span>`;
         })
-        .join(
-          isBundle && !phone
-            ? `<span class="tag-chip-link" aria-hidden="true">+</span>`
-            : ""
-        );
-      const moreChip =
-        !phone && more > 0
-          ? `<span class="tag-chip is-more" title="${escapeHtml(
-              group
-                .slice(maxShow)
-                .map((t) => "#" + t.tag)
-                .join(" ")
-            )}">+${more}</span>`
-          : "";
+        .join("");
       let meta;
       if (isBundle) {
-        meta = phone
-          ? `<span class="tag-meta-c">${row.count} 次</span>${
-              exactApplied || allApplied
-                ? `<span class="tag-meta-ok">已选</span>`
-                : ""
-            }`
-          : `<span class="tag-meta-n">${group.length}</span><span class="tag-meta-sep">关联</span><span class="tag-meta-c">${row.count}</span>${
-              exactApplied || allApplied
-                ? `<span class="tag-meta-ok">已选</span>`
-                : ""
-            }`;
+        meta = `<span class="tag-meta-c">${row.count}</span>${
+          exactApplied || allApplied
+            ? `<span class="tag-meta-ok">已选</span>`
+            : ""
+        }`;
       } else {
         meta = exactApplied
           ? `<span class="tag-meta-ok">已选</span>`
-          : `<span class="tag-meta-c">${phone ? row.count + " 次" : row.count}</span>`;
-      }
-      if (phone) {
-        return `<button type="button" class="tag-picker-row${
-          isBundle ? " tag-picker-bundle" : " tag-picker-solo"
-        }${exactApplied || allApplied ? " is-applied" : anyApplied ? " is-partial" : ""}" data-gidx="${i}">
-          <div class="tag-card-head">
-            <span class="tag-bundle-mark">${
-              isBundle ? `${group.length} 关联` : "单标签"
-            }</span>
-            <span class="tag-meta">${meta}</span>
-          </div>
-          <div class="tag-chip-row">${chips}</div>
-        </button>`;
+          : `<span class="tag-meta-c">${row.count}</span>`;
       }
       return `<button type="button" class="tag-picker-row${
         isBundle ? " tag-picker-bundle" : " tag-picker-solo"
       }${exactApplied || allApplied ? " is-applied" : anyApplied ? " is-partial" : ""}" data-gidx="${i}">
-        <div class="tag-chip-row">${
-          isBundle
-            ? `<span class="tag-bundle-mark">${group.length} 关联</span>`
-            : ""
-        }${chips}${moreChip}</div>
+        <span class="tag-bundle-mark${isBundle ? "" : " tag-bundle-mark-solo"}">${
+          isBundle ? `${group.length} 关联` : "单标签"
+        }</span>
+        <div class="tag-chip-row">${chips}</div>
         <span class="tag-meta">${meta}</span>
       </button>`;
     })
-    .join("")
-    + (truncated
-      ? `<div class="tag-picker-empty" style="padding:10px">已显示前 ${rowCap} 条，共 ${visible.length} 条<br/><span class="muted">输入关键词可精确筛选</span></div>`
-      : "");
+    .join("");
+  syncTagPickerPager(visible.length, page, pageCount);
   syncTagPickerTabCounts();
+  if (opts.keepScroll === false) host.scrollTop = 0;
   host.querySelectorAll(".tag-picker-row[data-gidx]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const row = shownRows[Number(btn.dataset.gidx)];
@@ -3693,6 +4776,8 @@ async function openTagPicker() {
   if ($("tagPickerSearch")) $("tagPickerSearch").value = "";
   if ($("tagPickerInput")) $("tagPickerInput").value = "";
   closeTagPickerSuggest();
+  state.tagPickerIndexPage = 1;
+  state._tagPickerRowsCache = null;
   // Default to index page (mobile tabs); desktop still shows both columns
   switchTagPickerPage("index");
   renderTagPickerApplied();
@@ -3700,6 +4785,7 @@ async function openTagPicker() {
   if (indexHost) {
     indexHost.innerHTML = `<div class="tag-picker-empty">加载索引标签…</div>`;
   }
+  syncTagPickerPager(0, 1, 1);
   syncTagPickerTabCounts();
 
   let loadOk = true;
@@ -3712,11 +4798,13 @@ async function openTagPicker() {
     state.tagPickerIndex = Array.isArray(r.tags) ? r.tags : [];
     state.tagPickerBundles = Array.isArray(r.bundles) ? r.bundles : [];
     state.tagPickerRelated = {};
+    state._tagPickerRowsCache = null;
   } catch (e) {
     loadOk = false;
     state.tagPickerIndex = [];
     state.tagPickerBundles = [];
     state.tagPickerRelated = {};
+    state._tagPickerRowsCache = null;
     const msg =
       e?.name === "AbortError"
         ? "加载超时，请缩小索引后重试"
@@ -3856,27 +4944,6 @@ function addTagFromPickerInput() {
   }
 }
 
-function syncTaskSettingsPicker(preferredId) {
-  const wrap = $("tagsModalTaskWrap");
-  const sel = $("tagsModalTaskSelect");
-  const tasks = state.tasks || [];
-  if (!wrap || !sel) return;
-  if (tasks.length <= 1) {
-    wrap.hidden = true;
-    return;
-  }
-  wrap.hidden = false;
-  const cur = preferredId != null ? String(preferredId) : String(sel.value || "");
-  sel.innerHTML = tasks
-    .map(
-      (t) =>
-        `<option value="${t.id}">${escapeHtml(t.chat_title || t.chat_id)} (#${t.id})</option>`
-    )
-    .join("");
-  if (cur && [...sel.options].some((o) => o.value === cur)) sel.value = cur;
-  else if (sel.options.length) sel.selectedIndex = 0;
-}
-
 async function openTaskTagsModal(taskId, opts = {}) {
   const modal = $("tagsModal");
   if (!modal) return;
@@ -3901,9 +4968,14 @@ async function openTaskTagsModal(taskId, opts = {}) {
     return;
   }
   fillTaskSettingsFields(task);
-  syncTaskSettingsPicker(task.id);
-  // Load index status for this task's chat (scan buttons live here now)
-  refreshIndexPanel().catch(() => {});
+  const mode = normalizeDownloadMode(task.download_mode);
+  if (mode === "monitor") {
+    // Show last cached index status immediately, then refresh in background
+    paintIndexPanelFromCache(task.chat_id);
+    refreshIndexPanel().catch(() => {});
+  } else {
+    stopIndexPolling();
+  }
 }
 
 function parseKeywordsInput(raw) {
@@ -3916,6 +4988,7 @@ function parseKeywordsInput(raw) {
 async function saveTaskTagsModal() {
   const draft = state.taskTagsDraft;
   if (!draft) return;
+  const downloadMode = normalizeDownloadMode(draft.downloadMode);
   const expand = $("tagsModalRelated")?.checked !== false;
   const concurrency = Math.max(
     1,
@@ -3926,6 +4999,49 @@ async function saveTaskTagsModal() {
   if (!Number.isFinite(delayMin) || delayMin < 0) delayMin = 0.5;
   if (!Number.isFinite(delayMax) || delayMax < 0) delayMax = delayMin;
   if (delayMax < delayMin) delayMax = delayMin;
+
+  let media = [...document.querySelectorAll('input[name="settingsMedia"]:checked')].map(
+    (x) => x.value
+  );
+  if (!media.length) media = ["photo", "video", "document", "audio"];
+  const folderMode = ($("tagsModalFolderMode") && $("tagsModalFolderMode").value) || "caption";
+  const orderEl =
+    downloadMode === "monitor"
+      ? $("tagsModalDownloadOrder")
+      : $("tagsModalDownloadOrderSeq") || $("tagsModalDownloadOrder");
+  const downloadOrder = (orderEl && orderEl.value) || "added_first";
+
+  const body = {
+    concurrency,
+    delay_min: delayMin,
+    delay_max: delayMax,
+    media_types: media,
+    folder_mode: folderMode,
+    use_text_as_folder: folderMode === "caption",
+    download_order: downloadOrder,
+  };
+
+  if (downloadMode === "monitor") {
+    body.include_tags = draft.tags || [];
+    body.tag_match_mode = "any";
+    body.expand_related = expand;
+  } else {
+    const startDate = ($("tagsModalStartDate") && $("tagsModalStartDate").value) || "";
+    const endDate = ($("tagsModalEndDate") && $("tagsModalEndDate").value) || "";
+    if (startDate) body.start_date = startDate;
+    else body.clear_start_date = true;
+    if (endDate) body.end_date = endDate;
+    else body.clear_end_date = true;
+    const maxRaw = ($("tagsModalMaxMessages") && $("tagsModalMaxMessages").value.trim()) || "";
+    if (maxRaw === "") body.clear_max_messages = true;
+    else body.max_messages = Math.max(1, Number(maxRaw) || 1);
+    body.file_formats = parseFileFormats(
+      $("tagsModalFileFormats") && $("tagsModalFileFormats").value
+    );
+    body.min_file_bytes = mbToBytes($("tagsModalMinFileMb") && $("tagsModalMinFileMb").value);
+    body.max_file_bytes = mbToBytes($("tagsModalMaxFileMb") && $("tagsModalMaxFileMb").value);
+  }
+
   const autoEnabled = !!$("tagsModalAutoIndex")?.checked;
   const autoInterval = Math.max(
     5,
@@ -3937,32 +5053,53 @@ async function saveTaskTagsModal() {
   try {
     const r = await api(`/api/tasks/${draft.taskId}/settings`, {
       method: "PATCH",
-      body: JSON.stringify({
-        include_tags: draft.tags || [],
-        tag_match_mode: "any",
-        expand_related: expand,
-        concurrency,
-        delay_min: delayMin,
-        delay_max: delayMax,
-      }),
+      body: JSON.stringify(body),
     });
     if (!r.ok) throw new Error(r.message || "保存失败");
-    // Persist timed incremental index (per chat)
-    await api(`/api/index/${encodeURIComponent(draft.chatId)}/auto-scan`, {
-      method: "PATCH",
-      body: JSON.stringify({
-        enabled: autoEnabled,
-        interval_min: autoInterval,
-        chat_title: draft.title || "",
-      }),
-    });
+
+    if (downloadMode === "monitor") {
+      await api(`/api/index/${encodeURIComponent(draft.chatId)}/auto-scan`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          enabled: autoEnabled,
+          interval_min: autoInterval,
+          chat_title: draft.title || "",
+        }),
+      });
+      if (state.indexMeta && String(state.indexMetaChatId) === String(draft.chatId)) {
+        state.indexMeta = {
+          ...state.indexMeta,
+          auto_incremental: autoEnabled ? 1 : 0,
+          auto_interval_min: autoInterval,
+        };
+        rememberIndexMetaCache(draft.chatId, {
+          meta: state.indexMeta,
+          coverage: state.indexCoverage,
+          scanning: false,
+        });
+      } else {
+        const cached = readIndexMetaCache(draft.chatId);
+        if (cached?.meta) {
+          rememberIndexMetaCache(draft.chatId, {
+            meta: {
+              ...cached.meta,
+              auto_incremental: autoEnabled ? 1 : 0,
+              auto_interval_min: autoInterval,
+            },
+            coverage: cached.coverage,
+            scanning: !!cached.scanning,
+          });
+        }
+      }
+    }
+
     const tagN = (draft.tags || []).length;
-    toast(
-      autoEnabled
-        ? `任务设置已保存${tagN ? " · 开始按标签下载" : ""} · 自动增量每 ${autoInterval} 分钟`
-        : `任务设置已保存${tagN ? " · 开始按标签下载" : ""}`,
-      "ok"
-    );
+    let msg = "任务设置已保存";
+    if (downloadMode === "monitor") {
+      if (tagN) msg += " · 开始按标签下载";
+      if (autoEnabled) msg += ` · 自动增量每 ${autoInterval} 分钟`;
+    }
+    toast(msg, "ok");
     closeTaskTagsModal();
     await loadTasks();
   } catch (e) {
@@ -3972,15 +5109,152 @@ async function saveTaskTagsModal() {
   }
 }
 
+function liveWorkersActive(workers) {
+  return (Array.isArray(workers) ? workers : []).some(
+    (w) =>
+      w &&
+      (w.status === "busy" ||
+        w.status === "paused" ||
+        w.status === "switching" ||
+        (w.file && w.status !== "idle"))
+  );
+}
+
+function livePanelSlotCount(live) {
+  if (!live) return 0;
+  const workers = Array.isArray(live.workers) ? live.workers : [];
+  const files = Array.isArray(live.files) ? live.files : [];
+  return Math.max(
+    Number(live.worker_count) || 0,
+    workers.length,
+    files.length > 0 ? 1 : 0
+  );
+}
+
+/** Fixed W1..N lanes so a finished worker does not remove its row. */
+function panelWorkerLanes(live) {
+  const workers = Array.isArray(live?.workers) ? live.workers : [];
+  const n = Math.max(Number(live?.worker_count) || 0, workers.length);
+  if (n <= 0) return [];
+  const byId = new Map();
+  for (const w of workers) {
+    if (w && w.id != null) byId.set(Number(w.id), w);
+  }
+  const out = [];
+  for (let i = 1; i <= n; i++) {
+    out.push(
+      byId.get(i) || {
+        id: i,
+        status: "idle",
+        file: "",
+        received: 0,
+        total: 0,
+        speed: 0,
+        percent: null,
+      }
+    );
+  }
+  return out;
+}
+
+function liveHasDownloadPanel(live) {
+  if (!live || live.phase === "indexing") return false;
+  if (Number(live.worker_count) > 0) return true;
+  const workers = Array.isArray(live.workers) ? live.workers : [];
+  const files = Array.isArray(live.files) ? live.files : [];
+  if (files.length > 0) return true;
+  if (live.phase === "paused" && (livePanelSlotCount(live) > 0 || live.file)) return true;
+  if (liveWorkersActive(workers)) return true;
+  return workers.some((w) => w && (w.file || w.status === "paused" || w.status === "switching"));
+}
+
+function rememberLivePanelSnap(t) {
+  if (!t || !t.id || !liveHasDownloadPanel(t.live)) return;
+  if (!state._livePanelSnap) state._livePanelSnap = {};
+  const n = Math.max(1, livePanelSlotCount(t.live));
+  state._livePanelSnap[t.id] = {
+    sig: `panel:${n}`,
+    n,
+    live: t.live,
+    at: Date.now(),
+  };
+}
+
 function liveProgressSignature(t) {
   const live = t.live;
   if (live && live.phase === "indexing") return "indexing";
-  if (!live || (!live.file && !(live.files && live.files.length))) {
-    return t.status === "running" ? "idle" : "none";
+  // Same signature for running ↔ paused netdisk panel → patch in place, no remount
+  if (liveHasDownloadPanel(live)) {
+    const n = Math.max(1, livePanelSlotCount(live));
+    rememberLivePanelSnap({ ...t, live });
+    return `panel:${n}`;
   }
-  const files = Array.isArray(live.files) ? live.files : [];
-  if (files.length > 1) return `multi:${files.map((f) => f.id).join(",")}`;
-  return `one:${live.file || (files[0] && files[0].file) || ""}`;
+  // Brief resume gap: reuse last panel so UI does not jump to「监控中」
+  const snap = state._livePanelSnap && state._livePanelSnap[t.id];
+  if (
+    snap &&
+    snap.live &&
+    (t.status === "running" || t.status === "paused") &&
+    Date.now() - (snap.at || 0) < 120000
+  ) {
+    return snap.sig || `panel:${snap.n || 1}`;
+  }
+  const mode = normalizeDownloadMode(t.download_mode);
+  const tags = taskHasMonitorTags(t) ? 1 : 0;
+  return t.status === "running"
+    ? `idle:${mode}:${tags}`
+    : `placeholder:${t.status || "pending"}:${mode}`;
+}
+
+function applyOptimisticPauseResume(id, action) {
+  const tid = Number(id);
+  const t = (state.tasks || []).find((x) => Number(x.id) === tid);
+  if (!t) return;
+  const card = document.querySelector(`.task[data-id="${tid}"]`);
+  if (action === "pause") {
+    t.status = "paused";
+    const base = t.live && typeof t.live === "object" ? { ...t.live } : {};
+    const workers = Array.isArray(base.workers)
+      ? base.workers.map((w) => ({
+          ...w,
+          status: w.status === "busy" ? "paused" : w.status || "idle",
+          speed: 0,
+        }))
+      : [];
+    t.live = {
+      ...base,
+      phase: "paused",
+      speed: 0,
+      workers,
+      files: Array.isArray(base.files)
+        ? base.files.map((f) => ({ ...f, speed: 0 }))
+        : base.files,
+    };
+    rememberLivePanelSnap(t);
+  } else if (action === "start") {
+    t.status = "running";
+    const snap = state._livePanelSnap && state._livePanelSnap[tid];
+    const base =
+      (t.live && liveHasDownloadPanel(t.live) && t.live) ||
+      (snap && snap.live) ||
+      t.live ||
+      {};
+    const workers = Array.isArray(base.workers)
+      ? base.workers.map((w) => ({
+          ...w,
+          // Keep bars; treat paused lanes as busy until real progress arrives
+          status: w.status === "paused" ? "busy" : w.status || "idle",
+        }))
+      : [];
+    t.live = {
+      ...base,
+      phase: "download",
+      workers,
+      files: base.files,
+    };
+    rememberLivePanelSnap(t);
+  }
+  if (card) patchTaskCard(card, t);
 }
 
 function indexProgressPercent(live) {
@@ -3997,42 +5271,53 @@ function indexProgressPercent(live) {
 
 function patchDownloadProgressBox(box, t) {
   const live = t.live || {};
+  if (!box.classList.contains("dl-panel")) return false;
+  const paused = live.phase === "paused" || t.status === "paused";
   const files = Array.isArray(live.files) ? live.files : [];
-  const speedText = formatSpeed(live.speed, { waiting: t.status === "running" });
-  if (box.classList.contains("multi") && files.length > 1) {
-    const title = box.querySelector(".live-summary-title");
-    const speed = box.querySelector(".live-summary-meta .live-speed");
-    const active = live.active_count || files.length || 1;
-    if (title) title.textContent = `并发下载中 · ${active} 路`;
-    if (speed) speed.textContent = `合计 ${speedText}`;
-    const host = box.querySelector(".live-files");
-    if (host) host.innerHTML = files.map(renderFileProgressRow).join("");
-    return true;
+  const laneWorkers = panelWorkerLanes(live);
+  // Only leave netdisk panel when pool is gone
+  if (!paused && laneWorkers.length === 0 && files.length === 0 && !liveHasDownloadPanel(live)) {
+    return false;
   }
-  const name = live.file || (files[0] && files[0].file) || "";
-  const fileEl = box.querySelector(".live-file");
-  const metaSpans = box.querySelectorAll(".live-meta > span");
-  const fill = box.querySelector(".prog-fill");
-  const track = box.querySelector(".prog-track");
-  const pct = live.percent != null ? live.percent : null;
-  const sizeLine = live.total
-    ? `${formatBytes(live.received)} / ${formatBytes(live.total)}${pct != null ? ` (${pct}%)` : ""}`
-    : live.received
-      ? formatBytes(live.received)
-      : "准备中…";
-  if (fileEl) {
-    fileEl.textContent = `正在下载：${name}`;
-    fileEl.title = name;
+  const speedText = paused
+    ? "已暂停"
+    : formatSpeed(live.speed, { waiting: t.status === "running" });
+  const badge = box.querySelector(".dl-status-badge");
+  const speedEl = box.querySelector(".dl-panel-speed");
+  if (badge) badge.textContent = paused ? "暂停中" : "下载中";
+  const multi = laneWorkers.length > 1 || files.length > 1;
+  if (speedEl) {
+    speedEl.textContent = paused
+      ? "已暂停"
+      : multi
+        ? `合计 ${speedText}`
+        : speedText;
   }
-  if (metaSpans[0]) metaSpans[0].textContent = sizeLine;
-  if (metaSpans[1]) metaSpans[1].textContent = speedText;
-  if (track && fill) {
-    if (pct != null) {
-      track.classList.remove("indeterminate");
-      fill.style.width = `${Math.min(100, pct)}%`;
+  box.classList.toggle("is-state-paused", paused);
+  box.classList.toggle("is-state-downloading", !paused);
+  box.dataset.phase = paused ? "paused" : "download";
+  box.dataset.liveState = paused ? "paused" : "downloading";
+  const host = box.querySelector(".dl-list");
+  if (host) {
+    if (laneWorkers.length > 0) {
+      // Patch each lane in place — keep row count stable across file handoff
+      const html = laneWorkers.map((w) => renderDlItemFromWorker(w, paused)).join("");
+      if (host.children.length !== laneWorkers.length) {
+        host.innerHTML = html;
+      } else {
+        laneWorkers.forEach((w, i) => {
+          const row = host.children[i];
+          if (!row) return;
+          const next = document.createElement("div");
+          next.innerHTML = renderDlItemFromWorker(w, paused);
+          const el = next.firstElementChild;
+          if (el) row.replaceWith(el);
+        });
+      }
+    } else if (files.length > 0) {
+      host.innerHTML = files.map((f) => renderDlItemFromFile(f, paused)).join("");
     } else {
-      track.classList.add("indeterminate");
-      fill.style.width = "";
+      host.innerHTML = renderDlItemFromLive(live, paused);
     }
   }
   return true;
@@ -4098,43 +5383,115 @@ function patchTaskCard(el, t) {
     modeBadge.title = modeMeta.tip;
   }
   const body = el.querySelector(".task-body") || el;
+  const matchCount = tagMatchDisplay(t);
   const queueCount = Math.max(
     0,
-    Number(t.tag_match_count ?? 0) - Number(t.tag_processed_count ?? 0)
+    matchCount - Number(t.tag_processed_count ?? 0)
   );
+  const indexCount = indexMediaDisplay(t);
   const statsBox = el.querySelector(".task-stats");
-  if (statsBox && !statsBox.querySelector('[data-role="queue-stat"]')) {
-    statsBox.innerHTML = `
-      <button type="button" class="task-stat-btn" data-role="match-stat" data-action="show-matches" data-id="${escapeHtml(String(t.id))}" title="查看标签命中">
-        <span class="ui-ico ui-ico-tag" aria-hidden="true"></span>
-        <strong data-role="match-count">${t.tag_match_count ?? 0}</strong>
-        <span class="task-stat-label">命中</span>
-      </button>
-      <button type="button" class="task-stat-btn" data-role="done-stat" data-action="show-done" data-id="${escapeHtml(String(t.id))}" title="查看已处理">
-        <span class="ui-ico ui-ico-check" aria-hidden="true"></span>
-        <strong data-role="done-count">${t.tag_processed_count ?? 0}</strong>
-        <span class="task-stat-label">已处理</span>
-      </button>
-      <button type="button" class="task-stat-btn" data-role="queue-stat" data-action="show-queue" data-id="${escapeHtml(String(t.id))}" title="查看待下载队列">
-        <span class="ui-ico ui-ico-queue" aria-hidden="true"></span>
-        <strong data-role="queue-count">${queueCount}</strong>
-        <span class="task-stat-label">队列</span>
-      </button>`;
+  const statTitles = taskStatTitles(t);
+  if (statsBox && !statsBox.querySelector('[data-role="index-stat"]')) {
+    statsBox.innerHTML = renderTaskStatsHtml(
+      t,
+      matchCount,
+      queueCount,
+      indexCount,
+      statTitles
+    );
   } else {
     const mEl = el.querySelector('[data-role="match-count"]');
     const dEl = el.querySelector('[data-role="done-count"]');
     const qEl = el.querySelector('[data-role="queue-count"]');
-    if (mEl) mEl.textContent = String(t.tag_match_count ?? 0);
+    const iEl = el.querySelector('[data-role="index-count"]');
+    if (mEl) mEl.textContent = String(matchCount);
     if (dEl) dEl.textContent = String(t.tag_processed_count ?? 0);
     if (qEl) qEl.textContent = String(queueCount);
+    if (iEl) iEl.textContent = String(indexCount);
     el.querySelectorAll(".task-stat-btn").forEach((btn) => {
       btn.dataset.id = String(t.id);
     });
+    const matchBtn = el.querySelector('[data-role="match-stat"]');
+    const doneBtn = el.querySelector('[data-role="done-stat"]');
+    const queueBtn = el.querySelector('[data-role="queue-stat"]');
+    const indexBtn = el.querySelector('[data-role="index-stat"]');
+    if (matchBtn) matchBtn.title = statTitles.match;
+    if (doneBtn) doneBtn.title = statTitles.done;
+    if (queueBtn) queueBtn.title = statTitles.queue;
+    if (indexBtn) indexBtn.title = statTitles.index;
   }
-  const btnStart = el.querySelector('[data-action="start"]');
-  const btnPause = el.querySelector('[data-action="pause"]');
-  if (btnStart) btnStart.disabled = t.status === "running";
-  if (btnPause) btnPause.disabled = t.status !== "running";
+
+  // monitor empty-tags hint under stats
+  let hintEl = body.querySelector(":scope > .task-monitor-hint");
+  const wantHint = isMonitorTask(t) && !taskHasMonitorTags(t);
+  if (wantHint) {
+    if (!hintEl) {
+      const wrap = document.createElement("div");
+      wrap.innerHTML = renderMonitorTagHint(t);
+      hintEl = wrap.firstElementChild;
+      const actions = body.querySelector(".task-actions");
+      if (hintEl && actions) actions.before(hintEl);
+      else if (hintEl && statsBox) statsBox.after(hintEl);
+    } else {
+      hintEl.dataset.id = String(t.id);
+    }
+  } else if (hintEl) {
+    hintEl.remove();
+  }
+
+  const btnStart = el.querySelector('[data-role="start-btn"]');
+  const btnPause = el.querySelector('[data-role="pause-btn"]');
+  const mon = isMonitorTask(t);
+  const running = t.status === "running";
+  if (btnStart) {
+    // Monitor: one toggle — 恢复监控 / 暂停监控（不再另放「暂停」）
+    const startDisabled = running && !mon;
+    btnStart.disabled = startDisabled;
+    if (startDisabled) btnStart.setAttribute("disabled", "");
+    else btnStart.removeAttribute("disabled");
+    btnStart.dataset.monitorState = startActionState(t);
+    btnStart.dataset.action = mon && running ? "pause" : "start";
+    btnStart.title = mon
+      ? running
+        ? "点击暂停监控"
+        : "点击开始/恢复监控"
+      : running
+        ? "下载进行中"
+        : "继续下载";
+    const label =
+      btnStart.querySelector('[data-role="start-label"]') ||
+      btnStart.querySelector("span:last-child");
+    if (label && !label.classList.contains("ui-ico")) {
+      label.textContent = startActionLabel(t);
+    }
+    const ico = btnStart.querySelector(".ui-ico");
+    if (ico) {
+      ico.classList.toggle("ui-ico-play", !running);
+      ico.classList.toggle("ui-ico-pause", mon && running);
+      ico.classList.toggle("ui-ico-runtime", false);
+      ico.classList.toggle("ui-ico-check", running && !mon);
+    }
+  }
+  if (btnPause) {
+    // Monitor: hide dedicated pause (merged into start-btn)
+    if (mon) {
+      btnPause.hidden = true;
+      btnPause.setAttribute("hidden", "");
+      btnPause.disabled = true;
+      btnPause.classList.remove("is-pause-ready");
+    } else {
+      btnPause.hidden = false;
+      btnPause.removeAttribute("hidden");
+      const pauseDisabled = !running;
+      btnPause.disabled = pauseDisabled;
+      if (pauseDisabled) btnPause.setAttribute("disabled", "");
+      else btnPause.removeAttribute("disabled");
+      btnPause.title = running ? "暂停任务" : "未在运行，无法暂停";
+      btnPause.classList.toggle("is-pause-ready", running);
+    }
+  }
+  const actionsBar = body.querySelector(".task-actions");
+  if (actionsBar) actionsBar.dataset.mode = mon ? "monitor" : "sequential";
 
   // legacy meta / tags summary — remove if still present
   el.querySelectorAll(".task-head .meta").forEach((n) => n.remove());
@@ -4157,33 +5514,101 @@ function patchTaskCard(el, t) {
     errEl.remove();
   }
 
-  // live progress — preserve indexing bar DOM to avoid animation flicker
+  // live progress — preserve bar DOM to avoid animation flicker
+  // Resume gap: reuse last netdisk snapshot so pause/resume stays on one panel
+  if (
+    !liveHasDownloadPanel(t.live) &&
+    state._livePanelSnap &&
+    state._livePanelSnap[t.id] &&
+    (t.status === "running" || t.status === "paused")
+  ) {
+    const snap = state._livePanelSnap[t.id];
+    if (snap.live && Date.now() - (snap.at || 0) < 120000) {
+      t = {
+        ...t,
+        live: {
+          ...snap.live,
+          phase: t.status === "paused" ? "paused" : snap.live.phase || "download",
+        },
+      };
+    }
+  }
   const sig = liveProgressSignature(t);
   let liveHost = body.querySelector(":scope > .live-progress");
   const prevSig = liveHost?.dataset?.sig || "";
+  const isIdleSig = sig === "idle" || String(sig).startsWith("idle:");
+  const isPlaceholderSig = String(sig).startsWith("placeholder");
+  const isPanelSig = String(sig).startsWith("panel:");
   if (sig === "indexing" && liveHost && liveHost.dataset.phase === "indexing") {
     patchIndexProgressBox(liveHost, t);
     liveHost.dataset.sig = sig;
-  } else if (sig !== prevSig || !liveHost) {
-    const html = renderLiveProgress(t);
-    if (!html) {
-      liveHost?.remove();
-    } else {
+  } else if (
+    isPanelSig &&
+    liveHost &&
+    liveHost.classList.contains("dl-panel") &&
+    String(prevSig).startsWith("panel:")
+  ) {
+    // pause ↔ resume: same netdisk shell, patch badge/lanes only
+    const patched = patchDownloadProgressBox(liveHost, t);
+    if (patched) liveHost.dataset.sig = sig;
+    else {
+      const html = renderLiveProgress(t);
       const wrap = document.createElement("div");
       wrap.innerHTML = html;
       const next = wrap.firstElementChild;
-      if (next) next.dataset.sig = sig;
-      if (liveHost) liveHost.replaceWith(next);
-      else {
-        const log = body.querySelector(":scope > .task-log");
-        if (log) log.before(next);
-        else body.appendChild(next);
+      if (next) {
+        next.dataset.sig = sig;
+        liveHost.replaceWith(next);
       }
     }
-  } else if (liveHost && sig !== "indexing" && sig !== "none" && sig !== "idle") {
-    // same download shape — patch numbers in place (no DOM replace / flicker)
-    patchDownloadProgressBox(liveHost, t);
+  } else if (sig !== prevSig || !liveHost) {
+    const html = renderLiveProgress(t);
+    const wrap = document.createElement("div");
+    wrap.innerHTML = html;
+    const next = wrap.firstElementChild;
+    if (next) next.dataset.sig = sig;
+    if (liveHost && next) liveHost.replaceWith(next);
+    else if (next) {
+      const log = body.querySelector(":scope > .task-log");
+      const actions = body.querySelector(".task-actions");
+      const err = body.querySelector(":scope > .msg.err");
+      if (err) err.after(next);
+      else if (actions) actions.after(next);
+      else if (log) log.before(next);
+      else body.appendChild(next);
+    }
+  } else if (liveHost && isIdleSig) {
+    // Keep idle DOM + animation untouched; only refresh copy if needed
+    const tip = liveHost.querySelector(".live-placeholder-text");
+    const kicker = liveHost.querySelector(".live-placeholder-kicker");
+    const nextText = (() => {
+      if (!isMonitorTask(t)) return "正在查找下一条媒体…";
+      return taskHasMonitorTags(t)
+        ? "等索引增量后再补差集（不空转轮询）"
+        : "未选标签；请先设置标签，索引由手动/自动增量更新";
+    })();
+    if (tip && tip.textContent !== nextText) tip.textContent = nextText;
+    if (kicker) {
+      const nextKick = isMonitorTask(t) ? "监控中" : "下载中";
+      if (kicker.textContent !== nextKick) kicker.textContent = nextKick;
+    }
     liveHost.dataset.sig = sig;
+    liveHost.dataset.liveState = isMonitorTask(t) ? "monitoring" : "downloading";
+  } else if (liveHost && !isPlaceholderSig && !isIdleSig && sig !== "indexing") {
+    // same download shape — patch numbers in place (no DOM replace / flicker)
+    const patched = patchDownloadProgressBox(liveHost, t);
+    if (patched) {
+      liveHost.dataset.sig = sig;
+    } else {
+      const html = renderLiveProgress(t);
+      const wrap = document.createElement("div");
+      wrap.innerHTML = html;
+      const next = wrap.firstElementChild;
+      if (next) {
+        next.dataset.sig = sig;
+        liveHost.replaceWith(next);
+      }
+    }
   }
 
   // log — replace when content changes, or UI shell is outdated (e.g. missing 清空)
@@ -4309,24 +5734,155 @@ function formatSpeed(bps, opts = {}) {
   return (bps / (1024 * 1024)).toFixed(2) + " MB/s";
 }
 
-function renderFileProgressRow(f) {
-  const pct = f.percent != null ? f.percent : null;
-  const bar = pct != null
-    ? `<div class="prog-track slim"><div class="prog-fill" style="width:${Math.min(100, pct)}%"></div></div>`
-    : `<div class="prog-track slim indeterminate"><div class="prog-fill"></div></div>`;
-  const sizeLine = f.total
-    ? `${formatBytes(f.received)} / ${formatBytes(f.total)}`
-    : (f.received ? formatBytes(f.received) : "…");
-  const name = (f.file || "").split(/[/\\]/).pop() || f.file || `msg ${f.id}`;
-  return `<div class="live-file-row">
-    <div class="live-file-row-head">
-      <span class="live-file-name" title="${escapeHtml(f.file || "")}">${escapeHtml(name)}</span>
-      <span class="live-file-speed" title="该文件单独速度">${escapeHtml(
-        formatSpeed(f.speed, { waiting: true })
-      )}</span>
+function basenamePath(p) {
+  const s = String(p || "");
+  return s.split(/[/\\]/).pop() || s;
+}
+
+function renderDlItem({
+  name = "",
+  fullPath = "",
+  received = 0,
+  total = 0,
+  percent = null,
+  speed = 0,
+  status = "busy", // busy | paused | idle | switching
+  label = "",
+}) {
+  const busy = status === "busy";
+  const frozen = status === "paused";
+  const switching = status === "switching";
+  const idle = status === "idle";
+  const showBar = busy || frozen || switching;
+  const pct = showBar && percent != null ? Number(percent) : null;
+  const statusText = busy
+    ? "下载中"
+    : frozen
+      ? "暂停中"
+      : switching
+        ? "准备中"
+        : "空闲";
+  const sizeLine = showBar
+    ? total
+      ? `${formatBytes(received)} / ${formatBytes(total)}`
+      : received
+        ? formatBytes(received)
+        : switching
+          ? "即将开始下一个…"
+          : "准备中…"
+    : "等待任务";
+  const speedText = busy
+    ? formatSpeed(speed, { waiting: true })
+    : frozen
+      ? "已暂停"
+      : switching
+        ? "接下一个…"
+        : "—";
+  const bar = showBar
+    ? pct != null
+      ? `<div class="prog-track dl-bar${switching ? " is-handoff" : ""}"><div class="prog-fill" style="width:${Math.min(100, pct)}%"></div></div>`
+      : `<div class="prog-track dl-bar indeterminate"><div class="prog-fill"></div></div>`
+    : `<div class="prog-track dl-bar is-idle"><div class="prog-fill" style="width:0%"></div></div>`;
+  const title = fullPath || name;
+  const display =
+    name || (switching ? "准备下一个…" : idle ? "等待任务" : "下载任务");
+  return `<div class="dl-item is-${status}" data-worker-lane="${escapeHtml(label)}">
+    <div class="dl-item-top">
+      <div class="dl-item-title">
+        ${label ? `<span class="dl-item-lane">${escapeHtml(label)}</span>` : ""}
+        <span class="dl-item-name" title="${escapeHtml(title)}">${escapeHtml(display)}</span>
+      </div>
+      <span class="dl-item-badge">${escapeHtml(statusText)}</span>
     </div>
-    <div class="live-file-row-meta">${escapeHtml(sizeLine)}${pct != null ? ` · ${pct}%` : ""}</div>
+    <div class="dl-item-meta">
+      <span class="dl-item-size">${escapeHtml(sizeLine)}</span>
+      <span class="dl-item-pct">${pct != null ? `${pct}%` : ""}</span>
+      <span class="dl-item-speed">${escapeHtml(speedText)}</span>
+    </div>
     ${bar}
+  </div>`;
+}
+
+function renderDlItemFromWorker(w, forcePaused = false) {
+  let st = String(w.status || "idle");
+  if (forcePaused && (st === "busy" || st === "switching")) st = "paused";
+  const raw = w.file || "";
+  const show =
+    st === "busy" || st === "paused" || st === "switching" || !!raw;
+  let pct = w.percent;
+  // Handoff flash at 100% only while still switching (not when paused)
+  if (
+    st === "switching" &&
+    !forcePaused &&
+    (pct == null || Number(pct) < 100) &&
+    Number(w.total) > 0
+  ) {
+    pct = 100;
+  }
+  const recv =
+    st === "switching" && !forcePaused && Number(w.total) > 0
+      ? w.total
+      : w.received;
+  if (
+    st === "paused" &&
+    (pct == null || Number.isNaN(Number(pct))) &&
+    Number(w.total) > 0
+  ) {
+    pct = Math.min(100, Math.round((1000 * Number(recv || 0)) / Number(w.total)) / 10);
+  }
+  return renderDlItem({
+    name: show
+      ? basenamePath(raw) ||
+        (w.message_id ? `消息 ${w.message_id}` : st === "switching" ? "准备下一个…" : "下载中…")
+      : "等待任务",
+    fullPath: raw,
+    received: recv,
+    total: w.total,
+    percent: pct,
+    speed: w.speed,
+    status: st,
+    label: w.id ? `W${w.id}` : "",
+  });
+}
+
+function renderDlItemFromFile(f, forcePaused = false) {
+  const raw = f.file || "";
+  return renderDlItem({
+    name: basenamePath(raw) || (f.id ? `消息 ${f.id}` : "文件"),
+    fullPath: raw,
+    received: f.received,
+    total: f.total,
+    percent: f.percent,
+    speed: f.speed,
+    status: forcePaused ? "paused" : "busy",
+    label: f.worker ? `W${f.worker}` : "",
+  });
+}
+
+function renderDlItemFromLive(live, forcePaused = false) {
+  const raw = live.file || "";
+  return renderDlItem({
+    name: basenamePath(raw) || "下载中…",
+    fullPath: raw,
+    received: live.received,
+    total: live.total,
+    percent: live.percent,
+    speed: live.speed,
+    status: forcePaused ? "paused" : "busy",
+  });
+}
+
+function renderDlPanel({ paused = false, speedText = "", itemsHtml = "" }) {
+  const state = paused ? "paused" : "downloading";
+  const badge = paused ? "暂停中" : "下载中";
+  return `<div class="live-progress dl-panel is-state-${state}" data-phase="${
+    paused ? "paused" : "download"
+  }" data-live-state="${state}">
+    <div class="dl-panel-head">
+      <span class="dl-status-badge">${badge}</span>
+      <span class="dl-panel-speed">${escapeHtml(speedText)}</span>
+    </div>
+    <div class="dl-list">${itemsHtml}</div>
   </div>`;
 }
 
@@ -4347,7 +5903,7 @@ function renderLiveProgress(t) {
       detail.includes("总进度") || !chatLatest
         ? detail
         : `${detail} · 总进度 ${pct}%`;
-    return `<div class="live-progress indexing index-box" data-phase="indexing">
+    return `<div class="live-progress indexing index-box is-state-indexing" data-phase="indexing" data-live-state="indexing">
       <div class="index-box-kicker">索引进度</div>
       <div class="live-file" data-role="index-title">${escapeHtml(title)}</div>
       <div class="live-meta">
@@ -4361,42 +5917,133 @@ function renderLiveProgress(t) {
       <div class="prog-track index-prog"><div class="prog-fill" style="width:${pct}%"></div></div>
     </div>`;
   }
-  if (!live || (!live.file && !(live.files && live.files.length))) {
-    if (t.status === "running") {
-      return `<div class="live-progress idle">正在查找下一条媒体…</div>`;
-    }
-    return "";
-  }
-  const files = Array.isArray(live.files) ? live.files : [];
-  const speedText = formatSpeed(live.speed, { waiting: t.status === "running" });
-  const active = live.active_count || files.length || 1;
 
-  // Multi-file: show per-file speed + summed total
-  if (files.length > 1) {
-    return `<div class="live-progress multi">
-      <div class="live-summary">
-        <div class="live-summary-title">并发下载中 · ${active} 路</div>
-        <div class="live-summary-meta">
-          <span class="live-speed">合计 ${escapeHtml(speedText)}</span>
-        </div>
+  // 网盘式：暂停中（冻结进度列表）
+  if (live && live.phase === "paused") {
+    const workers = Array.isArray(live.workers) ? live.workers : [];
+    const files = Array.isArray(live.files) ? live.files : [];
+    let itemsHtml = "";
+    if (workers.length > 0) {
+      itemsHtml = workers.map((w) => renderDlItemFromWorker(w, true)).join("");
+    } else if (files.length > 0) {
+      itemsHtml = files.map((f) => renderDlItemFromFile(f, true)).join("");
+    } else {
+      const monitor = isMonitorTask(t);
+      itemsHtml = renderDlItem({
+        name: monitor ? "监控任务已暂停" : "下载任务已暂停",
+        status: "paused",
+        percent: live.percent,
+        received: live.received,
+        total: live.total,
+      });
+    }
+    const multi = workers.length > 1 || files.length > 1;
+    return renderDlPanel({
+      paused: true,
+      speedText: multi ? "已暂停" : "已暂停",
+      itemsHtml,
+    });
+  }
+
+  const workersForIdle = Array.isArray(live?.workers) ? live.workers : [];
+  const filesForIdle = Array.isArray(live?.files) ? live.files : [];
+  const hasActiveDownload =
+    liveWorkersActive(workersForIdle) || filesForIdle.length > 0;
+  if (!live || !hasActiveDownload) {
+    const monitor = isMonitorTask(t);
+    if (t.status === "running") {
+      if (monitor) {
+        const q = Math.max(
+          0,
+          tagMatchDisplay(t) - Number(t.tag_processed_count ?? 0)
+        );
+        const text = !taskHasMonitorTags(t)
+          ? "未选标签；请先设置标签，索引由手动/自动增量更新"
+          : q > 0
+            ? `队列还有 ${q} 条，正在准备补下…`
+            : "空闲 · 等索引增量后再补差集";
+        return `<div class="live-progress idle is-monitor-wait is-state-monitoring" data-phase="idle" data-live-state="monitoring">
+      <div class="dl-panel-head">
+        <span class="dl-status-badge is-monitor">${q > 0 ? "准备中" : "监控中"}</span>
       </div>
-      <div class="live-files">${files.map(renderFileProgressRow).join("")}</div>
+      <div class="live-placeholder-text">${escapeHtml(text)}</div>
+      <div class="prog-track monitor-wait"><div class="prog-fill"></div></div>
+    </div>`;
+      }
+      return `<div class="live-progress idle is-state-downloading is-seeking" data-phase="idle" data-live-state="downloading">
+      <div class="dl-panel-head">
+        <span class="dl-status-badge">下载中</span>
+        <span class="dl-panel-speed">查找文件…</span>
+      </div>
+      <div class="live-placeholder-text">正在查找下一条媒体…</div>
+      <div class="prog-track indeterminate"><div class="prog-fill"></div></div>
+    </div>`;
+    }
+    const status = t.status || "pending";
+    let tip = "下载进度将显示在这里";
+    let badge = "待开始";
+    let stateClass = "is-placeholder is-state-idle";
+    let liveState = "idle";
+    let badgeCls = "";
+    if (status === "paused") {
+      badge = "暂停中";
+      tip = monitor
+        ? "已暂停 · 点击「恢复监控」继续"
+        : "已暂停 · 点击「继续」恢复下载";
+      stateClass = "is-state-paused";
+      liveState = "paused";
+    } else if (status === "completed") {
+      badge = "已完成";
+      tip = monitor ? "监控任务已结束" : "任务已完成";
+      stateClass = "is-placeholder is-state-done";
+      liveState = "done";
+      badgeCls = "is-done";
+    } else if (status === "failed") {
+      badge = "失败";
+      tip = monitor
+        ? "任务失败 · 可点击「恢复监控」重试"
+        : "任务失败 · 可点击「继续」重试";
+      stateClass = "is-placeholder is-state-failed";
+      liveState = "failed";
+      badgeCls = "is-fail";
+    } else if (status === "pending") {
+      badge = "待开始";
+      tip = monitor
+        ? "等待开始 · 点击「恢复监控」开始监控"
+        : "等待开始 · 点击「继续」开始下载";
+      stateClass = "is-placeholder is-state-idle";
+      liveState = "idle";
+    }
+    return `<div class="live-progress idle ${stateClass}" data-phase="placeholder" data-live-state="${liveState}">
+      <div class="dl-panel-head">
+        <span class="dl-status-badge ${badgeCls}">${escapeHtml(badge)}</span>
+      </div>
+      <div class="live-placeholder-text">${escapeHtml(tip)}</div>
+      <div class="prog-track state-bar"><div class="prog-fill"></div></div>
     </div>`;
   }
 
-  const pct = live.percent != null ? live.percent : null;
-  const bar = pct != null
-    ? `<div class="prog-track"><div class="prog-fill" style="width:${Math.min(100, pct)}%"></div></div>`
-    : `<div class="prog-track indeterminate"><div class="prog-fill"></div></div>`;
-  const sizeLine = live.total
-    ? `${formatBytes(live.received)} / ${formatBytes(live.total)}${pct != null ? ` (${pct}%)` : ""}`
-    : (live.received ? formatBytes(live.received) : "准备中…");
-  const name = live.file || (files[0] && files[0].file) || "";
-  return `<div class="live-progress">
-    <div class="live-file" title="${escapeHtml(name)}">正在下载：${escapeHtml(name)}</div>
-    <div class="live-meta"><span>${escapeHtml(sizeLine)}</span><span class="live-speed">${escapeHtml(speedText)}</span></div>
-    ${bar}
-  </div>`;
+  const files = Array.isArray(live.files) ? live.files : [];
+  const paused = live.phase === "paused" || t.status === "paused";
+  const laneWorkers = panelWorkerLanes(live);
+  const speedText = paused
+    ? "已暂停"
+    : formatSpeed(live.speed, { waiting: t.status === "running" });
+  let itemsHtml = "";
+  let panelSpeed = speedText;
+  if (laneWorkers.length > 0) {
+    itemsHtml = laneWorkers.map((w) => renderDlItemFromWorker(w, paused)).join("");
+    if (!paused && laneWorkers.length > 1) panelSpeed = `合计 ${speedText}`;
+    if (paused) panelSpeed = "已暂停";
+  } else if (files.length > 0) {
+    itemsHtml = files.map((f) => renderDlItemFromFile(f, paused)).join("");
+    if (!paused && files.length > 1) panelSpeed = `合计 ${speedText}`;
+    if (paused) panelSpeed = "已暂停";
+  } else {
+    itemsHtml = renderDlItemFromLive(live, paused);
+  }
+  rememberLivePanelSnap(t);
+  return renderDlPanel({ paused, speedText: panelSpeed, itemsHtml });
 }
 
 function parseLogLine(line) {
@@ -4447,6 +6094,40 @@ function humanizeLogText(text) {
     /^索引命中\s+(\d+)\s*条历史媒体，先补下再进入监控$/,
     "索引命中 $1 条 · 先补历史再监控"
   );
+  // Legacy verbose monitor copy → short status
+  t = t.replace(
+    /^进入监控（按标签\/关键词下载新匹配）：从消息\s+\d+\s+之后检查，约每\s*\d+\s*s\s*一轮（暂停可停止）$/,
+    "进入监控"
+  );
+  t = t.replace(/^进入监控[（(][\s\S]*?[）)][\s\S]*$/, "进入监控");
+  t = t.replace(/^进入监控[：:].*从消息\s*\d+\s*之后检查.*$/, "进入监控");
+  t = t.replace(/^进入监控.*约每\s*\d+\s*s\s*一轮.*$/, "进入监控");
+  t = t.replace(/^进入本地监控[（(].*$/, (m) =>
+    /未选标签/.test(m) ? "进入监控 · 未选标签" : "进入监控"
+  );
+  t = t.replace(/^进入本地监控$/, "进入监控");
+  t = t.replace(
+    /^进入本地监控（.+?），约每\s*\d+\s*s\s*检查一轮（不扫群）$/,
+    "进入监控"
+  );
+  t = t.replace(
+    /^索引完成，共\s*(\d+)\s*条媒体。未选标签：仅维护索引[，,].*$/,
+    "本地索引 $1 条 · 未选标签"
+  );
+  t = t.replace(
+    /^本地索引共\s*(\d+)\s*条媒体。未选标签：.*$/,
+    "本地索引 $1 条 · 未选标签"
+  );
+  t = t.replace(/^使用本地文案索引（(\d+)\s*条）.*/, "本地索引 $1 条");
+  t = t.replace(/^已配置标签\/关键词.*/, "标签已配置，开始补下");
+  t = t.replace(/^标签\/关键词已改动.*/, "标签已更新，开始补下");
+  t = t.replace(/^标签\/关键词已清空.*/, "标签已清空，等待配置");
+  t = t.replace(/^检测到标签\/关键词.*/, "标签已更新，开始补下");
+  t = t.replace(/^标签已更新或索引出现差集.*/, "标签已更新，重新补下");
+  t = t.replace(/^本地索引出现未下载项.*/, "发现未下载项，开始补下");
+  t = t.replace(/^索引差集\s*(\d+)\s*条.*/, "待补下 $1 条");
+  t = t.replace(/^索引已更新，重新核对差集.*/, "索引已更新");
+  t = t.replace(/^按本地文件核对，补记已处理\s*(\d+)\s*条$/, "本地已存在，记已处理 $1 条");
   t = t.replace(/^标签\s+(#[^\s]+)\s*已下完$/, "标签 $1 已下完，进入下一标签");
   t = t.replace(/^群组目录:\s*/, "保存目录 ");
   t = t.replace(/^目录:\s*/, "进入目录 ");
@@ -4464,9 +6145,11 @@ function humanizeLogText(text) {
     "关联目录已启用 · $1 个标签"
   );
   t = t.replace(
-    /^已扫描群目录，可按同名同大小跳过\s*(\d+)\s*个文件$/,
-    "扫描群目录 · 可跳过 $1 个已存在文件"
+    /^队列已处理\s*(\d+)\s*条，下载时将跳过（待下\s*(\d+)）$/,
+    "队列已处理 $1 · 待下 $2"
   );
+  t = t.replace(/^队列已处理，跳过:\s*/, "队列已处理，跳过 ");
+  t = t.replace(/^本地文件写入队列已处理\s*(\d+)\s*条$/, "本地同步进队列 · $1 条");
   t = t.replace(/已达上限\s*(\d+)\s*个文件，任务完成/, "已下满 $1 个文件，任务完成");
   t = t.replace(/测试模式时间到，已停止（未下完整文件）/, "测试模式结束（未下完整文件）");
   t = t.replace(/size mismatch:\s*got\s*(\d+),\s*expected\s*(\d+)/i, (_, a, b) => {
@@ -4603,10 +6286,7 @@ function renderTaskLog(raw, taskId) {
 }
 
 function queueRemaining(t) {
-  return Math.max(
-    0,
-    Number(t.tag_match_count ?? 0) - Number(t.tag_processed_count ?? 0)
-  );
+  return Math.max(0, tagMatchDisplay(t) - Number(t.tag_processed_count ?? 0));
 }
 
 function _renderIndexFileRows(items) {
@@ -4752,8 +6432,8 @@ function taskModeMeta(t) {
   if (mode === "monitor") {
     return {
       mode: "monitor",
-      label: "监控下载",
-      tip: "按文案标签索引下载，并持续监控新消息",
+      label: "监控",
+      tip: "对比本地标签索引与已下载；索引手动/自动/全量更新后再补差集（不空转轮询）",
     };
   }
   return {
@@ -4763,12 +6443,38 @@ function taskModeMeta(t) {
   };
 }
 
+function renderMonitorTagHint(t) {
+  if (!isMonitorTask(t) || taskHasMonitorTags(t)) return "";
+  return `<button type="button" class="task-monitor-hint" data-action="open-settings" data-id="${escapeHtml(String(t.id))}">
+    未选标签 · 等待配置 · 去设置添加标签后才会按差集下载
+  </button>`;
+}
+
 function renderTask(t) {
   const status = t.status || "pending";
   const statusClass = `status-${status}`;
   const modeMeta = taskModeMeta(t);
   const q = queueRemaining(t);
   const title = t.chat_title || t.chat_id || "";
+  const startLabel = startActionLabel(t);
+  const startState = startActionState(t);
+  const startRunning = status === "running";
+  const mon = isMonitorTask(t);
+  const startDisabled = startRunning && !mon;
+  const startAction = mon && startRunning ? "pause" : "start";
+  const startTitle = mon
+    ? startRunning
+      ? "点击暂停监控"
+      : "点击开始/恢复监控"
+    : startRunning
+      ? "下载进行中"
+      : "继续下载";
+  const startIco = startRunning
+    ? mon
+      ? "ui-ico-pause"
+      : "ui-ico-check"
+    : "ui-ico-play";
+  const statTitles = taskStatTitles(t);
   return `<div class="task" data-task-id="${t.id}" data-status="${escapeHtml(status)}" data-mode="${modeMeta.mode}">
     <div class="task-head">
       <div class="task-head-main">
@@ -4781,27 +6487,14 @@ function renderTask(t) {
     </div>
     <div class="task-body">
       <div class="task-stats" aria-label="任务进度">
-        <button type="button" class="task-stat-btn" data-role="match-stat" data-action="show-matches" data-id="${t.id}" title="查看标签命中">
-          <span class="ui-ico ui-ico-tag" aria-hidden="true"></span>
-          <strong data-role="match-count">${t.tag_match_count ?? 0}</strong>
-          <span class="task-stat-label">命中</span>
-        </button>
-        <button type="button" class="task-stat-btn" data-role="done-stat" data-action="show-done" data-id="${t.id}" title="查看已处理">
-          <span class="ui-ico ui-ico-check" aria-hidden="true"></span>
-          <strong data-role="done-count">${t.tag_processed_count ?? 0}</strong>
-          <span class="task-stat-label">已处理</span>
-        </button>
-        <button type="button" class="task-stat-btn" data-role="queue-stat" data-action="show-queue" data-id="${t.id}" title="查看待下载队列">
-          <span class="ui-ico ui-ico-queue" aria-hidden="true"></span>
-          <strong data-role="queue-count">${q}</strong>
-          <span class="task-stat-label">队列</span>
-        </button>
+        ${renderTaskStatsHtml(t, tagMatchDisplay(t), q, indexMediaDisplay(t), statTitles)}
       </div>
-      <div class="task-actions">
-        <button data-action="start" data-id="${t.id}" ${t.status === "running" ? "disabled" : ""}>
-          <span class="ui-ico ui-ico-play" aria-hidden="true"></span><span>继续</span>
+      ${renderMonitorTagHint(t)}
+      <div class="task-actions" data-mode="${mon ? "monitor" : "sequential"}">
+        <button type="button" data-role="start-btn" data-action="${startAction}" data-id="${t.id}" data-monitor-state="${escapeHtml(startState)}" title="${escapeHtml(startTitle)}" ${startDisabled ? "disabled" : ""}>
+          <span class="ui-ico ${startIco}" aria-hidden="true"></span><span data-role="start-label">${escapeHtml(startLabel)}</span>
         </button>
-        <button data-action="pause" data-id="${t.id}" ${t.status !== "running" ? "disabled" : ""}>
+        <button type="button" data-role="pause-btn" data-action="pause" data-id="${t.id}" class="${!mon && startRunning ? "is-pause-ready" : ""}" title="${startRunning ? "暂停任务" : "未在运行，无法暂停"}" ${mon ? "hidden disabled" : startRunning ? "" : "disabled"}>
           <span class="ui-ico ui-ico-pause" aria-hidden="true"></span><span>暂停</span>
         </button>
         <button type="button" class="ghost" data-action="open-settings" data-id="${t.id}">

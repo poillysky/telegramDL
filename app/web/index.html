@@ -4,8 +4,15 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#2f7ff0" />
+  <meta name="application-name" content="TG下载" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="TG下载" />
   <title>Telegram 群组下载器</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png" />
+  <link rel="manifest" href="/static/manifest.webmanifest" />
   <script>
     /* First paint: app shell if previously logged in, else blank until session check */
     (function () {
@@ -18,7 +25,7 @@
       }
     })();
   </script>
-  <link rel="stylesheet" href="/static/style.css?v=20260802-logcol" />
+  <link rel="stylesheet" href="/static/style.css?v=20260803-ios-step" />
   <!-- Webfonts: non-blocking + optional (no 3s spinner / no late glyph swap stretch) -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -94,12 +101,18 @@
         <div class="top-actions">
           <button id="btnOpenAccount" class="account-chip is-offline" type="button" title="设置 / 账号">
             <span class="account-avatar-wrap" aria-hidden="true">
-              <span class="account-avatar" id="accountAvatar">TG</span>
+              <span class="account-avatar" id="accountAvatar">?</span>
               <span class="account-status-dot" id="accountStatusDot"></span>
             </span>
             <span class="account-chip-text">
-              <span id="userBadge" class="account-chip-name">未连接</span>
-              <span id="userBadgeSub" class="account-chip-sub">打开设置</span>
+              <span class="account-chip-row">
+                <span class="account-chip-k">Web</span>
+                <span id="userBadgeWeb" class="account-chip-name">未登录</span>
+              </span>
+              <span class="account-chip-row">
+                <span class="account-chip-k">TG</span>
+                <span id="userBadge" class="account-chip-sub">未连接</span>
+              </span>
             </span>
             <span class="account-chip-chevron" aria-hidden="true"></span>
           </button>
@@ -150,6 +163,7 @@
           </div>
           <div class="history-toolbar">
             <input id="historySearch" type="search" placeholder="搜索文件名 / 群名 / 消息 ID…" />
+            <div id="historyGroupBar" class="history-group-bar" aria-label="按群组筛选"></div>
           </div>
           <div id="historyList" class="history-list history-list-page"></div>
           <div class="history-pager">
@@ -220,13 +234,16 @@
                 <div class="index-create-card">
                   <p class="index-create-title">建立文案索引</p>
                   <p class="field-hint index-create-hint">
-                    选群后即可创建。标签筛选在任务「设置」里再配。
+                    选群后创建。标签在「设置」配置；索引用手动/自动/全量更新。
+                  </p>
+                  <p class="field-hint index-create-defaults">
+                    将使用默认媒体类型与保存目录，可在任务设置中修改。
                   </p>
                 </div>
                 <input type="hidden" id="includeTags" value="" />
                 <input type="hidden" id="tagMatchMode" value="any" />
                 <input type="hidden" id="captionKeywords" value="" />
-                <div id="indexPreview" class="index-preview muted"></div>
+                <div id="indexPreview" class="index-preview muted" hidden></div>
                 <div id="monitorTagList" class="monitor-tag-list" hidden aria-hidden="true"></div>
                 <span id="monitorTagCount" hidden>已选 0</span>
                 <span id="monitorTagEmpty" hidden></span>
@@ -504,6 +521,29 @@
         </div>
         <div class="settings-card">
           <div class="settings-card-head">
+            <span class="ui-ico ui-ico-refresh" aria-hidden="true"></span>
+            <div>
+              <h3 class="settings-card-title">自动重试 / 限流</h3>
+              <p class="settings-card-desc">失败文件定时再试、监控心跳、单次 FloodWait 最长等待。保存后对后续等待/重试立即生效。</p>
+            </div>
+          </div>
+          <div class="settings-field-grid">
+            <label class="settings-field">失败重试间隔（秒）
+              <input id="failedRetryIntervalSec" type="number" min="120" max="86400" step="60" value="900" inputmode="numeric" title="FAILED_RETRY_INTERVAL_SEC" />
+              <span class="field-hint">默认 900（15 分钟），范围 120–86400</span>
+            </label>
+            <label class="settings-field">监控心跳（秒）
+              <input id="monitorHeartbeatSec" type="number" min="60" max="86400" step="60" value="600" inputmode="numeric" title="MONITOR_HEARTBEAT_SEC" />
+              <span class="field-hint">默认 600（10 分钟），范围 60–86400</span>
+            </label>
+            <label class="settings-field">限流最多等待（秒）
+              <input id="maxFloodWait" type="number" min="60" max="86400" step="60" value="1800" inputmode="numeric" title="MAX_FLOOD_WAIT" />
+              <span class="field-hint">默认 1800（30 分钟），范围 60–86400</span>
+            </label>
+          </div>
+        </div>
+        <div class="settings-card">
+          <div class="settings-card-head">
             <span class="ui-ico ui-ico-runtime" aria-hidden="true"></span>
             <div>
               <h3 class="settings-card-title">完成 / 限流通知</h3>
@@ -617,6 +657,10 @@
       <div class="confirm-kicker" id="confirmKicker">确认</div>
       <h3 id="confirmTitle" class="confirm-title">请确认</h3>
       <p id="confirmMessage" class="confirm-message"></p>
+      <label id="confirmTypeWrap" class="confirm-type-wrap" hidden>
+        <span class="confirm-type-hint" id="confirmTypeHint">请输入确认文字</span>
+        <input type="text" id="confirmTypeInput" class="confirm-type-input" autocomplete="off" autocorrect="off" spellcheck="false" />
+      </label>
       <div class="confirm-actions">
         <button type="button" class="ghost" id="btnConfirmCancel">取消</button>
         <button type="button" class="primary" id="btnConfirmOk">确定</button>
@@ -630,21 +674,18 @@
     <div class="confirm-panel tags-panel" role="dialog" aria-modal="true" aria-labelledby="tagsModalTitle">
       <div class="tags-modal-head">
         <div class="tags-modal-head-text">
-          <div class="confirm-kicker">任务配置</div>
           <div class="tags-modal-title-row">
             <h3 id="tagsModalTitle" class="confirm-title">任务设置</h3>
             <button type="button" class="ghost icon-btn modal-close-btn" id="btnTagsClose" aria-label="关闭">✕</button>
           </div>
-          <p id="tagsModalSub" class="tags-modal-sub muted"></p>
+          <div class="tags-modal-sub-row">
+            <span id="tagsModalModeBadge" class="settings-mode-badge" hidden></span>
+            <p id="tagsModalSub" class="tags-modal-sub muted"></p>
+          </div>
         </div>
       </div>
 
-      <label id="tagsModalTaskWrap" class="tags-modal-task-pick" hidden>
-        选择任务
-        <select id="tagsModalTaskSelect"></select>
-      </label>
-
-      <div class="tags-modal-section" id="tagsModalIndexSection">
+      <div class="tags-modal-section" id="tagsModalIndexSection" data-settings-for="monitor">
         <div class="tags-modal-section-title">文案索引</div>
         <div class="index-panel index-panel-row">
           <div class="index-meta-block">
@@ -652,46 +693,47 @@
             <div class="index-meta" id="indexMetaText">加载索引状态…</div>
           </div>
           <div class="index-toolbar" role="group" aria-label="索引操作">
-            <button type="button" class="index-btn index-btn-inc" id="btnIndexScan" title="只扫新增消息">增量</button>
-            <button type="button" class="index-btn index-btn-full" id="btnIndexFull" title="清空后重新全量扫描">全量</button>
+            <button type="button" class="index-btn index-btn-inc" id="btnIndexScan" title="只扫新增消息">手动增量</button>
+            <button type="button" class="index-btn index-btn-full" id="btnIndexFull" title="清空后重新全量扫描">手动全量</button>
             <button type="button" class="index-btn index-btn-stop" id="btnIndexStop" hidden>停止</button>
-            <div class="index-auto-seg">
-              <label class="index-auto-toggle" title="按间隔定时补扫新消息">
-                <input type="checkbox" id="tagsModalAutoIndex" />
-                <span class="index-auto-mark" aria-hidden="true"></span>
-                <span class="index-auto-label">自动</span>
-              </label>
-              <div class="auto-index-dd" id="tagsModalAutoIndexDd">
-                <select id="tagsModalAutoIndexInterval" hidden>
-                  <option value="15">15 分</option>
-                  <option value="30">30 分</option>
-                  <option value="60" selected>1 小时</option>
-                  <option value="180">3 小时</option>
-                  <option value="360">6 小时</option>
-                  <option value="720">12 小时</option>
-                  <option value="1440">24 小时</option>
-                </select>
-                <button type="button" class="auto-index-dd-btn" id="tagsModalAutoIndexIntervalBtn" title="自动增量间隔" aria-haspopup="listbox" aria-expanded="false">
-                  <span id="tagsModalAutoIndexIntervalLabel">1 小时</span>
-                  <span class="auto-index-dd-chevron" aria-hidden="true">▾</span>
-                </button>
-                <div class="auto-index-dd-menu" id="tagsModalAutoIndexIntervalMenu" role="listbox" hidden>
-                  <button type="button" role="option" data-value="15">15 分</button>
-                  <button type="button" role="option" data-value="30">30 分</button>
-                  <button type="button" role="option" data-value="60" aria-selected="true">1 小时</button>
-                  <button type="button" role="option" data-value="180">3 小时</button>
-                  <button type="button" role="option" data-value="360">6 小时</button>
-                  <button type="button" role="option" data-value="720">12 小时</button>
-                  <button type="button" role="option" data-value="1440">24 小时</button>
-                </div>
+            <label class="index-auto-toggle" title="按间隔定时补扫新消息">
+              <input type="checkbox" id="tagsModalAutoIndex" />
+              <span class="index-auto-mark" aria-hidden="true"></span>
+              <span class="index-auto-label">自动增量</span>
+            </label>
+            <div class="auto-index-dd" id="tagsModalAutoIndexDd">
+              <select id="tagsModalAutoIndexInterval" hidden>
+                <option value="15">15 分</option>
+                <option value="30">30 分</option>
+                <option value="60" selected>1 小时</option>
+                <option value="180">3 小时</option>
+                <option value="360">6 小时</option>
+                <option value="720">12 小时</option>
+                <option value="1440">24 小时</option>
+              </select>
+              <button type="button" class="auto-index-dd-btn" id="tagsModalAutoIndexIntervalBtn" title="自动增量间隔" aria-haspopup="listbox" aria-expanded="false">
+                <span id="tagsModalAutoIndexIntervalLabel">1 小时</span>
+                <span class="auto-index-dd-chevron" aria-hidden="true">▾</span>
+              </button>
+              <div class="auto-index-dd-menu" id="tagsModalAutoIndexIntervalMenu" role="listbox" hidden>
+                <button type="button" role="option" data-value="15">15 分</button>
+                <button type="button" role="option" data-value="30">30 分</button>
+                <button type="button" role="option" data-value="60" aria-selected="true">1 小时</button>
+                <button type="button" role="option" data-value="180">3 小时</button>
+                <button type="button" role="option" data-value="360">6 小时</button>
+                <button type="button" role="option" data-value="720">12 小时</button>
+                <button type="button" role="option" data-value="1440">24 小时</button>
               </div>
             </div>
           </div>
         </div>
       </div>
 
-      <div class="tags-modal-section">
+      <div class="tags-modal-section" id="tagsModalTagsSection" data-settings-for="monitor">
         <div class="tags-modal-section-title">监控标签</div>
+        <p class="tags-modal-empty-hint" id="tagsModalEmptyHint" hidden>
+          未选标签时不会按索引差集下载。添加标签并保存后，在手动/自动/全量更新索引后会补下缺少的命中文件。
+        </p>
         <button type="button" class="tag-summary-btn" id="btnOpenTagPicker">
           <span class="tag-summary-main">
             <span class="tag-summary-label">已选标签</span>
@@ -703,7 +745,84 @@
         <input type="checkbox" id="tagsModalRelated" checked hidden />
       </div>
 
-      <div class="tags-modal-section">
+      <!-- Sequential-only: date range -->
+      <div class="tags-modal-section" id="tagsModalDateSection" data-settings-for="sequential" hidden>
+        <div class="tags-modal-section-title">日期范围</div>
+        <div class="settings-date-range" role="group" aria-label="日期范围">
+          <label class="settings-date-field">
+            <span class="settings-date-label">起始</span>
+            <input id="tagsModalStartDate" type="date" />
+          </label>
+          <span class="settings-date-sep" aria-hidden="true">至</span>
+          <label class="settings-date-field">
+            <span class="settings-date-label">结束</span>
+            <input id="tagsModalEndDate" type="date" />
+          </label>
+        </div>
+        <p class="field-hint">留空表示不限制该侧边界</p>
+      </div>
+
+      <!-- Both: media types -->
+      <div class="tags-modal-section" id="tagsModalMediaSection" data-settings-for="both">
+        <div class="tags-modal-section-title">媒体类型</div>
+        <div class="types create-types settings-media-types">
+          <label class="chip"><input type="checkbox" name="settingsMedia" value="photo" checked /> 图片</label>
+          <label class="chip"><input type="checkbox" name="settingsMedia" value="video" checked /> 视频</label>
+          <label class="chip"><input type="checkbox" name="settingsMedia" value="document" /> 文档</label>
+          <label class="chip"><input type="checkbox" name="settingsMedia" value="audio" /> 音频</label>
+        </div>
+      </div>
+
+      <!-- Both: folder mode -->
+      <div class="tags-modal-section" id="tagsModalFolderSection" data-settings-for="both">
+        <div class="tags-modal-section-title">保存目录</div>
+        <label class="create-field">
+          <select id="tagsModalFolderMode">
+            <option value="caption" selected>按文案 #标签 + 日期（推荐）</option>
+            <option value="media_type">按媒体类型</option>
+            <option value="flat">扁平（群目录下）</option>
+          </select>
+        </label>
+      </div>
+
+      <!-- Sequential-only: more options -->
+      <details class="tags-modal-more" id="tagsModalMoreOptions" data-settings-for="sequential" hidden>
+        <summary>
+          <span class="tags-modal-more-main">
+            <span class="tags-modal-more-title">更多选项</span>
+            <span class="tags-modal-more-hint">上限 · 方向 · 过滤</span>
+          </span>
+          <span class="tags-modal-more-chevron" aria-hidden="true"></span>
+        </summary>
+        <div class="tags-modal-more-body">
+          <div class="grid2 tags-modal-grid">
+            <label>最多下载
+              <input id="tagsModalMaxMessages" type="number" min="1" placeholder="空=不限" inputmode="numeric" />
+            </label>
+            <label>下载方向
+              <select id="tagsModalDownloadOrderSeq">
+                <option value="added_first" selected>先入库先下载</option>
+                <option value="oldest_first">从旧到新</option>
+                <option value="newest_first">从最近往前</option>
+              </select>
+            </label>
+          </div>
+          <label>扩展名过滤
+            <input id="tagsModalFileFormats" type="text" placeholder="空=全部，如 mp4,jpg" />
+          </label>
+          <div class="grid2 tags-modal-grid">
+            <label>最小 (MB)
+              <input id="tagsModalMinFileMb" type="number" min="0" step="0.1" placeholder="不限" inputmode="decimal" />
+            </label>
+            <label>最大 (MB)
+              <input id="tagsModalMaxFileMb" type="number" min="0" step="0.1" placeholder="不限" inputmode="decimal" />
+            </label>
+          </div>
+        </div>
+      </details>
+
+      <!-- Both: download params; monitor also shows order here -->
+      <div class="tags-modal-section" id="tagsModalParamsSection" data-settings-for="both">
         <div class="tags-modal-section-title">下载参数</div>
         <div class="grid2 tags-modal-grid">
           <label>并发下载
@@ -735,6 +854,14 @@
             </span>
           </label>
         </div>
+        <label class="tags-modal-order-field" id="tagsModalOrderWrap" data-settings-for="monitor" hidden>
+          下载方向
+          <select id="tagsModalDownloadOrder">
+            <option value="added_first" selected>先入库先下载</option>
+            <option value="oldest_first">从旧到新</option>
+            <option value="newest_first">从最近往前</option>
+          </select>
+        </label>
       </div>
 
       <div class="confirm-actions tags-modal-actions">
@@ -789,6 +916,11 @@
             <input id="tagPickerSearch" type="search" placeholder="搜索库内索引标签…" autocomplete="off" />
           </div>
           <div id="tagPickerIndex" class="tag-picker-list tag-picker-index"></div>
+          <div class="tag-picker-pager" id="tagPickerPager" hidden>
+            <button type="button" class="ghost" id="btnTagPickerPrev">上一页</button>
+            <span class="muted" id="tagPickerPagerInfo">共 0 条</span>
+            <button type="button" class="ghost" id="btnTagPickerNext">下一页</button>
+          </div>
         </section>
       </div>
       <div class="confirm-actions tags-modal-actions">
@@ -818,25 +950,29 @@
   </div>
 
   <!-- History media preview -->
-  <div id="historyPreviewModal" class="confirm-modal history-preview-modal" hidden>
-    <div class="confirm-backdrop" id="historyPreviewBackdrop"></div>
-    <div class="confirm-panel history-preview-panel" role="dialog" aria-modal="true" aria-labelledby="historyPreviewTitle">
-      <div class="tags-modal-head">
-        <div>
-          <div class="section-kicker">预览</div>
-          <h3 id="historyPreviewTitle" class="confirm-title">媒体预览</h3>
-          <p class="tags-modal-sub muted" id="historyPreviewMeta"></p>
+  <div id="historyPreviewModal" class="history-preview-modal" hidden>
+    <div class="history-preview-backdrop" id="historyPreviewBackdrop"></div>
+    <div class="history-preview-panel" role="dialog" aria-modal="true" aria-labelledby="historyPreviewTitle" data-kind="file">
+      <header class="history-preview-head">
+        <div class="history-preview-head-text">
+          <span class="history-preview-kind" id="historyPreviewKind">文件</span>
+          <h3 id="historyPreviewTitle" class="history-preview-title">媒体预览</h3>
+          <p class="history-preview-sub" id="historyPreviewMeta" hidden></p>
         </div>
-        <button type="button" class="ghost icon-btn" id="btnHistoryPreviewClose" aria-label="关闭">✕</button>
-      </div>
-      <div class="history-preview-body" id="historyPreviewBody"></div>
-      <div class="confirm-actions tags-modal-actions">
-        <a class="ghost" id="historyPreviewOpen" href="#" target="_blank" rel="noopener">新窗口打开</a>
-        <button type="button" class="primary" id="btnHistoryPreviewDone">关闭</button>
-      </div>
+        <button type="button" class="history-preview-close" id="btnHistoryPreviewClose" aria-label="关闭">
+          <span aria-hidden="true"></span>
+        </button>
+      </header>
+      <div class="history-preview-stage" id="historyPreviewBody"></div>
+      <footer class="history-preview-foot">
+        <div class="history-preview-nav">
+          <button type="button" class="history-preview-step" id="btnHistoryPreviewPrev" aria-label="上一条">上一条</button>
+          <button type="button" class="history-preview-step is-next" id="btnHistoryPreviewNext" aria-label="下一条">下一条</button>
+        </div>
+      </footer>
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260802-logcol"></script>
+  <script src="/static/app.js?v=20260803-queue-dedupe"></script>
 </body>
 </html>

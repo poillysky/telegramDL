@@ -25,6 +25,9 @@ class TagBlacklistItemBody(BaseModel):
 
 class RuntimeSettingsBody(BaseModel):
     max_parallel_chats: int = Field(default=1, ge=1, le=10)
+    failed_retry_interval_sec: int = Field(default=900, ge=120, le=86400)
+    monitor_heartbeat_sec: int = Field(default=600, ge=60, le=86400)
+    max_flood_wait: int = Field(default=1800, ge=60, le=86400)
     notify_enabled: bool = False
     notify_webhook: str = ""
 
@@ -81,11 +84,17 @@ async def reset_tag_blacklist(_user=Depends(require_web_auth)):
 async def get_runtime_settings(_user=Depends(require_web_auth)):
     s = get_settings()
     parallel = await db.get_max_parallel_chats()
+    failed_retry = await db.get_failed_retry_interval_sec()
+    heartbeat = await db.get_monitor_heartbeat_sec()
+    flood_wait = await db.get_max_flood_wait()
     notify = await get_notify_config()
     return {
         "ok": True,
         "max_parallel_chats": parallel,
         "max_parallel_chats_env_default": max(1, int(s.max_parallel_chats or 1)),
+        "failed_retry_interval_sec": failed_retry,
+        "monitor_heartbeat_sec": heartbeat,
+        "max_flood_wait": flood_wait,
         "notify_enabled": bool(notify.get("enabled")),
         "notify_webhook": notify.get("webhook") or "",
         "download_dir": str(s.download_dir),
@@ -96,6 +105,9 @@ async def get_runtime_settings(_user=Depends(require_web_auth)):
 @router.put("/runtime")
 async def put_runtime_settings(body: RuntimeSettingsBody, _user=Depends(require_web_auth)):
     parallel = await db.set_max_parallel_chats(body.max_parallel_chats)
+    failed_retry = await db.set_failed_retry_interval_sec(body.failed_retry_interval_sec)
+    heartbeat = await db.set_monitor_heartbeat_sec(body.monitor_heartbeat_sec)
+    flood_wait = await db.set_max_flood_wait(body.max_flood_wait)
     notify = await save_notify_config(
         enabled=bool(body.notify_enabled),
         webhook=(body.notify_webhook or "").strip(),
@@ -112,6 +124,9 @@ async def put_runtime_settings(body: RuntimeSettingsBody, _user=Depends(require_
     return {
         "ok": True,
         "max_parallel_chats": parallel,
+        "failed_retry_interval_sec": failed_retry,
+        "monitor_heartbeat_sec": heartbeat,
+        "max_flood_wait": flood_wait,
         "notify_enabled": bool(notify.get("enabled")),
         "notify_webhook": notify.get("webhook") or "",
     }

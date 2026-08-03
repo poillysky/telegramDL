@@ -20,11 +20,9 @@ from app.indexer import indexer
 from app.notify import notify_event
 from app.organizer import (
     build_filename,
-    build_identical_file_index,
     detect_media_type,
     extract_tags,
     file_looks_complete,
-    find_identical_file,
     has_media,
     matches_caption_keywords,
     matches_file_formats,
@@ -102,6 +100,105 @@ class DownloadScheduler:
         # Live progress: task_id -> {files: {msg_id: slot}, ...}
         self._progress: dict[int, dict[str, Any]] = {}
         self._progress_lock = threading.Lock()
+        # chat_id -> bumped after index scan so local monitor wakes
+        self._index_bumps: set[str] = set()
+        self._index_wake: dict[str, asyncio.Event] = {}
+        self._index_bump_lock = threading.Lock()
+        # task_id -> pending count when we last returned gap_found (blocks spin loops)
+        self._gap_pending_sticky: dict[int, int] = {}
+        # task_id -> monotonic time sticky was set (cooldown before auto re-try)
+        self._gap_sticky_at: dict[int, float] = {}
+        # task ids that were running across process restart (auto-resume after TG)
+        self._startup_resume_ids: list[int] = []
+        # Delayed auto-retry handles for sequential tasks with leftover failures
+        self._failed_retry_handles: dict[int, asyncio.Task] = {}
+
+    def _chat_wake_event(self, chat_id: str | int) -> asyncio.Event:
+        """Lazy Event for this chat (must run on the asyncio loop)."""
+        key = str(chat_id)
+        with self._index_bump_lock:
+            ev = self._index_wake.get(key)
+            if ev is None:
+                ev = asyncio.Event()
+                self._index_wake[key] = ev
+            return ev
+
+    def wake_local_monitor(self, chat_id: str | int) -> None:
+        """Wake idle local-monitor loops (tag edits, etc.). Event.set is thread-safe."""
+        key = str(chat_id)
+        with self._index_bump_lock:
+            ev = self._index_wake.get(key)
+        if ev is not None:
+            ev.set()
+
+    def notify_index_updated(self, chat_id: str | int) -> None:
+        """After manual/auto/full index scan: mark bump and wake monitor."""
+        key = str(chat_id)
+        with self._index_bump_lock:
+            self._index_bumps.add(key)
+            ev = self._index_wake.get(key)
+        if ev is not None:
+            ev.set()
+
+    def peek_index_bump(self, chat_id: str | int) -> bool:
+        with self._index_bump_lock:
+            return str(chat_id) in self._index_bumps
+
+    def consume_index_bump(self, chat_id: str | int) -> bool:
+        with self._index_bump_lock:
+            key = str(chat_id)
+            if key in self._index_bumps:
+                self._index_bumps.discard(key)
+                return True
+            return False
+
+    async def _wait_monitor_idle(
+        self,
+        *,
+        chat_id: int,
+        stop_event: asyncio.Event,
+        test_deadline: float | None,
+        heartbeat_sec: float,
+    ) -> str:
+        """Sleep until index update, stop, test deadline, or rare heartbeat.
+
+        Does not query the DB. Returns ``bump`` | ``stop`` | ``heartbeat``.
+        """
+        if stop_event.is_set() or self._test_time_up(test_deadline):
+            return "stop"
+        wake = self._chat_wake_event(chat_id)
+        # Avoid lost wake: bump already set → return immediately
+        if self.peek_index_bump(chat_id):
+            return "bump"
+        wake.clear()
+        if self.peek_index_bump(chat_id):
+            return "bump"
+
+        stop_task = asyncio.create_task(stop_event.wait())
+        wake_task = asyncio.create_task(wake.wait())
+        tasks = {stop_task, wake_task}
+        try:
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=max(60.0, float(heartbeat_sec)),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        except Exception:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        if stop_event.is_set() or self._test_time_up(test_deadline):
+            return "stop"
+        if self.peek_index_bump(chat_id) or wake_task in done:
+            return "bump" if self.peek_index_bump(chat_id) else "wake"
+        return "heartbeat"
 
     def _slot_condition(self) -> asyncio.Condition:
         if self._slot_cond is None:
@@ -202,51 +299,121 @@ class DownloadScheduler:
                     "percent": percent,
                     "active_count": 0,
                     "files": [],
+                    "workers": [],
+                    "worker_count": 0,
                 }
+
+            paused_phase = p.get("phase") == "paused"
+            worker_count = int(p.get("worker_count") or 0)
+            workers_map = p.get("workers") or {}
             files_map = p.get("files") or {}
+
+            workers: list[dict[str, Any]] = []
             files: list[dict[str, Any]] = []
             total_speed = 0.0
             total_received = 0
             total_size = 0
-            for mid, slot in files_map.items():
-                received = int(slot.get("received") or 0)
-                total = int(slot.get("total") or 0)
-                speed = float(slot.get("speed") or 0)
-                total_speed += speed
-                total_received += received
-                total_size += total
-                files.append(
-                    {
-                        "id": int(mid),
-                        "file": slot.get("file") or "",
-                        "received": received,
-                        "total": total,
-                        "speed": speed,
-                        "percent": (
-                            round(100.0 * received / total, 1) if total else None
-                        ),
-                    }
-                )
-            files.sort(key=lambda x: x["id"])
-            active = len(files)
-            if active == 0:
+            active = 0
+
+            if worker_count > 0:
+                for wid in range(1, worker_count + 1):
+                    slot = workers_map.get(wid) or {}
+                    status = str(slot.get("status") or "idle")
+                    received = int(slot.get("received") or 0)
+                    total = int(slot.get("total") or 0)
+                    mid = int(slot.get("message_id") or 0)
+                    speed = (
+                        float(slot.get("speed") or 0)
+                        if status == "busy" and not paused_phase
+                        else 0.0
+                    )
+                    # Keep lane visible while switching to the next file
+                    show_bar = status in ("busy", "paused", "switching") or (
+                        status == "idle" and bool(slot.get("file"))
+                    )
+                    if show_bar:
+                        if status in ("busy", "switching"):
+                            active += 1
+                            total_speed += speed
+                        total_received += received
+                        total_size += total
+                        files.append(
+                            {
+                                "id": mid,
+                                "worker": wid,
+                                "file": slot.get("file") or "",
+                                "received": received,
+                                "total": total,
+                                "speed": speed,
+                                "percent": (
+                                    round(100.0 * received / total, 1) if total else None
+                                ),
+                            }
+                        )
+                    workers.append(
+                        {
+                            "id": wid,
+                            "status": status,
+                            "message_id": mid or None,
+                            "file": slot.get("file") or "",
+                            "received": received,
+                            "total": total,
+                            "speed": speed,
+                            "percent": (
+                                round(100.0 * received / total, 1)
+                                if total and show_bar
+                                else None
+                            ),
+                        }
+                    )
+            else:
+                for mid, slot in files_map.items():
+                    received = int(slot.get("received") or 0)
+                    total = int(slot.get("total") or 0)
+                    speed = 0.0 if paused_phase else float(slot.get("speed") or 0)
+                    total_speed += speed
+                    total_received += received
+                    total_size += total
+                    files.append(
+                        {
+                            "id": int(mid),
+                            "file": slot.get("file") or "",
+                            "received": received,
+                            "total": total,
+                            "speed": speed,
+                            "percent": (
+                                round(100.0 * received / total, 1) if total else None
+                            ),
+                        }
+                    )
+                files.sort(key=lambda x: x["id"])
+                active = len(files)
+
+            # Keep showing worker slots while pool is alive / paused snapshot
+            if active == 0 and worker_count <= 0 and not paused_phase:
                 return None
-            if active == 1:
+            if paused_phase:
+                summary_file = p.get("title") or "已暂停"
+            elif active == 0 and worker_count > 0:
+                summary_file = f"{worker_count} 路 Worker 待命"
+            elif active == 1 and files:
                 summary_file = files[0]["file"]
             else:
-                summary_file = f"{active} 个文件并发下载"
+                summary_file = f"{active} 路 Worker 下载中"
             return {
-                "phase": "download",
+                "phase": "paused" if paused_phase else "download",
                 "file": summary_file,
                 "received": total_received,
                 "total": total_size,
-                "speed": total_speed,
+                "speed": 0.0 if paused_phase else total_speed,
                 "percent": (
                     round(100.0 * total_received / total_size, 1)
                     if total_size
                     else None
                 ),
-                "active_count": active,
+                "active_count": 0 if paused_phase else active,
+                "worker_count": worker_count,
+                "workers": workers,
                 "files": files,
             }
 
@@ -291,21 +458,96 @@ class DownloadScheduler:
             if p and p.get("phase") == "indexing":
                 self._progress.pop(task_id, None)
 
+    def _ensure_worker_progress(self, task_id: int, worker_count: int) -> None:
+        """Create fixed Worker 1..N idle slots for live UI."""
+        n = max(1, min(5, int(worker_count or 1)))
+        with self._progress_lock:
+            bucket = self._progress.get(task_id)
+            if bucket and bucket.get("phase") == "indexing":
+                bucket = None
+            # Resume from pause: keep frozen file/bars so UI does not jump
+            if bucket and bucket.get("phase") == "paused":
+                bucket.pop("phase", None)
+                bucket["worker_count"] = max(n, int(bucket.get("worker_count") or 0))
+                workers = bucket.setdefault("workers", {})
+                for wid in range(1, n + 1):
+                    if wid not in workers:
+                        workers[wid] = {
+                            "status": "idle",
+                            "message_id": 0,
+                            "file": "",
+                            "received": 0,
+                            "total": 0,
+                            "speed": 0.0,
+                        }
+                return
+            if not bucket:
+                bucket = {"files": {}, "workers": {}, "worker_count": n}
+                self._progress[task_id] = bucket
+            bucket.pop("phase", None)
+            bucket["worker_count"] = n
+            workers = bucket.setdefault("workers", {})
+            bucket.setdefault("files", {})
+            for wid in range(1, n + 1):
+                if wid not in workers:
+                    workers[wid] = {
+                        "status": "idle",
+                        "message_id": 0,
+                        "file": "",
+                        "received": 0,
+                        "total": 0,
+                        "speed": 0.0,
+                    }
+
+    def _set_worker_idle(self, task_id: int, worker_id: int) -> None:
+        if not worker_id:
+            return
+        with self._progress_lock:
+            bucket = self._progress.get(task_id)
+            if not bucket:
+                return
+            slot = (bucket.get("workers") or {}).get(int(worker_id))
+            if not slot:
+                return
+            # Keep last file/bytes so the lane stays visible until the next job
+            # binds — avoids progress-bar flicker between multi-worker files.
+            # Do NOT inflate received→total here; pause must keep real stop %.
+            if slot.get("file") or int(slot.get("received") or 0) > 0:
+                if bucket.get("phase") == "paused":
+                    slot["status"] = "paused"
+                else:
+                    slot["status"] = "switching"
+            else:
+                slot["status"] = "idle"
+                slot["message_id"] = 0
+                slot["file"] = ""
+                slot["received"] = 0
+                slot["total"] = 0
+            slot["speed"] = 0.0
+
     def _begin_file_progress(
         self,
         task_id: int,
         message_id: int,
         rel_file: str,
         total: int = 0,
+        *,
+        worker_id: int | None = None,
     ) -> None:
         now = time.monotonic()
         with self._progress_lock:
-            bucket = self._progress.setdefault(task_id, {"files": {}})
-            bucket["files"][int(message_id)] = {
+            bucket = self._progress.setdefault(
+                task_id, {"files": {}, "workers": {}, "worker_count": 0}
+            )
+            if bucket.get("phase") == "indexing":
+                bucket = {"files": {}, "workers": {}, "worker_count": 0}
+                self._progress[task_id] = bucket
+            slot = {
                 "file": rel_file,
                 "received": 0,
                 "total": int(total or 0),
                 "speed": 0.0,
+                "worker": int(worker_id or 0),
                 "_t": now,
                 "_bytes": 0,
                 "_started": now,
@@ -313,6 +555,29 @@ class DownloadScheduler:
                 "_seeded": False,
                 "_speed_ready": False,
             }
+            bucket.setdefault("files", {})[int(message_id)] = slot
+            wid = int(worker_id or 0)
+            if wid > 0:
+                workers = bucket.setdefault("workers", {})
+                wslot = workers.setdefault(
+                    wid,
+                    {
+                        "status": "idle",
+                        "message_id": 0,
+                        "file": "",
+                        "received": 0,
+                        "total": 0,
+                        "speed": 0.0,
+                    },
+                )
+                wslot["status"] = "busy"
+                wslot["message_id"] = int(message_id)
+                wslot["file"] = rel_file
+                wslot["received"] = 0
+                wslot["total"] = int(total or 0)
+                wslot["speed"] = 0.0
+                # Mirror speed fields onto worker slot (same object refs via sync in on_bytes)
+                wslot["_file_mid"] = int(message_id)
 
     # Speed meter: ignore the first short burst (Telethon often dumps a large
     # received jump in a few ms → hundreds of MB/s), then EMA with a hard cap.
@@ -335,6 +600,21 @@ class DownloadScheduler:
             p = (bucket.get("files") or {}).get(int(message_id))
             if not p:
                 return
+
+            def _mirror_worker() -> None:
+                wid = int(p.get("worker") or 0)
+                if wid <= 0:
+                    return
+                wslot = (bucket.get("workers") or {}).get(wid)
+                if wslot is None:
+                    return
+                wslot["status"] = "busy"
+                wslot["message_id"] = int(message_id)
+                wslot["file"] = p.get("file") or wslot.get("file") or ""
+                wslot["received"] = int(p.get("received") or 0)
+                wslot["total"] = int(p.get("total") or 0)
+                wslot["speed"] = float(p.get("speed") or 0)
+
             now = time.monotonic()
             recv = int(received or 0)
             # Always remember latest bytes for resume/UI, but skip heavy updates
@@ -375,6 +655,7 @@ class DownloadScheduler:
                         p["total"] = int(total)
                     p["_ui_t"] = now
                     p["_ui_bytes"] = recv
+                    _mirror_worker()
                     return
 
                 elapsed = now - started
@@ -386,6 +667,7 @@ class DownloadScheduler:
                         p["total"] = int(total)
                     p["_ui_t"] = now
                     p["_ui_bytes"] = recv
+                    _mirror_worker()
                     return
 
                 base = int(p.get("_base_bytes") or 0)
@@ -401,6 +683,7 @@ class DownloadScheduler:
                     p["total"] = int(total)
                 p["_ui_t"] = now
                 p["_ui_bytes"] = recv
+                _mirror_worker()
                 return
 
             dt = now - float(p.get("_t") or now)
@@ -423,6 +706,7 @@ class DownloadScheduler:
                 p["total"] = int(total)
             p["_ui_t"] = now
             p["_ui_bytes"] = recv
+            _mirror_worker()
 
     def _finish_file_progress(
         self,
@@ -432,6 +716,8 @@ class DownloadScheduler:
         received: int = 0,
         total: int = 0,
         remove: bool = True,
+        worker_id: int | None = None,
+        completed: bool = False,
     ) -> None:
         with self._progress_lock:
             bucket = self._progress.get(task_id)
@@ -439,21 +725,80 @@ class DownloadScheduler:
                 return
             files = bucket.get("files") or {}
             p = files.get(int(message_id))
+            wid = int(worker_id or 0) or int((p or {}).get("worker") or 0)
             if p:
                 if received or total:
                     p["received"] = int(received or p.get("received") or 0)
                     if total:
                         p["total"] = int(total)
-                    # Keep last EMA speed — don't replace with whole-file average
-                    # (that often jumps when a file finishes just as the next starts).
                 if remove:
                     files.pop(int(message_id), None)
-            if remove and not files:
+            if wid > 0:
+                wslot = (bucket.get("workers") or {}).get(wid)
+                if wslot is not None:
+                    last_file = wslot.get("file") or (p or {}).get("file") or ""
+                    last_total = int(
+                        total
+                        or wslot.get("total")
+                        or (p or {}).get("total")
+                        or 0
+                    )
+                    # Keep real bytes unless the file actually finished
+                    if int(received or 0) > 0:
+                        last_recv = int(received)
+                    else:
+                        last_recv = int(
+                            wslot.get("received")
+                            or (p or {}).get("received")
+                            or 0
+                        )
+                    if completed and last_total > 0:
+                        last_recv = last_total
+                    paused = bucket.get("phase") == "paused"
+                    if last_file or last_recv > 0:
+                        wslot["status"] = "paused" if paused else "switching"
+                        wslot["file"] = last_file
+                        if last_total > 0:
+                            wslot["total"] = last_total
+                        wslot["received"] = last_recv
+                    else:
+                        wslot["status"] = "idle"
+                        wslot["message_id"] = 0
+                        wslot["file"] = ""
+                        wslot["received"] = 0
+                        wslot["total"] = 0
+                    wslot["speed"] = 0.0
+            if remove and not files and not int(bucket.get("worker_count") or 0):
                 self._progress.pop(task_id, None)
 
     def _clear_progress(self, task_id: int) -> None:
         with self._progress_lock:
             self._progress.pop(task_id, None)
+
+    def _freeze_progress_paused(self, task_id: int) -> None:
+        """Keep the live progress box after pause (frozen bars, no speed)."""
+        with self._progress_lock:
+            bucket = self._progress.get(task_id)
+            if not bucket or bucket.get("phase") == "indexing":
+                self._progress[task_id] = {
+                    "phase": "paused",
+                    "title": "已暂停",
+                    "worker_count": 0,
+                    "workers": {},
+                    "files": {},
+                }
+                return
+            bucket["phase"] = "paused"
+            for slot in (bucket.get("workers") or {}).values():
+                st = str(slot.get("status") or "")
+                if st in ("busy", "switching", "paused") or slot.get("file"):
+                    slot["status"] = "paused"
+                    # Never rewrite received/total — freeze true stop-time %
+                else:
+                    slot["status"] = "idle"
+                slot["speed"] = 0.0
+            for slot in (bucket.get("files") or {}).values():
+                slot["speed"] = 0.0
 
     async def _watch_part_file(
         self,
@@ -549,11 +894,13 @@ class DownloadScheduler:
             fl = self._stop_flags.get(task_id)
             if fl is flag:
                 self._stop_flags.pop(task_id, None)
-            self._clear_progress(task_id)
+            # Keep frozen progress box after user pause
+            self._freeze_progress_paused(task_id)
 
     async def start_task(self, task_id: int) -> None:
         """Start or force-restart a task worker."""
         task_id = int(task_id)
+        self._cancel_failed_retry(task_id)
         # Stop any live worker first (bounded wait — must not hang HTTP).
         if self.is_worker_alive(task_id):
             await self._stop_worker(task_id, grace_s=1.5, cancel_s=1.0, detach=True)
@@ -573,6 +920,9 @@ class DownloadScheduler:
         flag = self._stop_flags.get(task_id)
         if flag:
             flag.set()
+        # Freeze live box immediately so pause/resume UI stays on the same panel
+        self._freeze_progress_paused(int(task_id))
+        self._cancel_failed_retry(int(task_id))
         await self.db.update_task(task_id, status="paused")
 
     async def cancel_and_wait(self, task_id: int, timeout: float = 120) -> None:
@@ -605,15 +955,126 @@ class DownloadScheduler:
         self._tasks.clear()
         self._stop_flags.clear()
         self._worker_gen.clear()
+        for h in list(self._failed_retry_handles.values()):
+            if h and not h.done():
+                h.cancel()
+        self._failed_retry_handles.clear()
         # Reset slots so a wedged worker cannot poison shutdown bookkeeping
         self._active_slots = 0
 
     async def resume_running_on_startup(self) -> None:
+        """Park formerly-running tasks; they auto-start after Telegram reconnects."""
         tasks = await self.db.list_tasks()
+        resume_ids: list[int] = []
         for t in tasks:
             if t["status"] == "running":
-                await self.db.update_task(t["id"], status="paused")
-                await self.db.append_log(t["id"], "服务重启，任务已暂停，可手动继续")
+                tid = int(t["id"])
+                resume_ids.append(tid)
+                await self.db.update_task(tid, status="paused")
+                await self.db.append_log(
+                    tid, "服务重启，等待 Telegram 连接后自动恢复…"
+                )
+        self._startup_resume_ids = resume_ids
+
+    async def auto_resume_after_telegram(self) -> int:
+        """Start tasks interrupted by process restart once Telegram is ready."""
+        ids = list(self._startup_resume_ids or [])
+        self._startup_resume_ids = []
+        started = 0
+        for tid in ids:
+            try:
+                t = await self.db.get_task(tid)
+                if not t:
+                    continue
+                # User may have deleted / already continued / completed
+                if str(t.get("status") or "") not in ("paused", "pending"):
+                    continue
+                if self.is_worker_alive(tid):
+                    continue
+                await self.db.append_log(tid, "Telegram 已连接，自动恢复任务")
+                await self.start_task(tid)
+                started += 1
+            except Exception:
+                logger.exception("auto-resume task %s failed", tid)
+                try:
+                    await self.db.append_log(
+                        tid, "自动恢复失败，请手动点继续"
+                    )
+                except Exception:
+                    pass
+        return started
+
+    def abandon_startup_resume(self, reason: str = "") -> None:
+        """If Telegram cannot connect, leave parked tasks for manual continue."""
+        ids = list(self._startup_resume_ids or [])
+        self._startup_resume_ids = []
+        if not ids:
+            return
+
+        async def _note() -> None:
+            msg = "Telegram 未能自动连接，任务保持暂停，请连接后点继续"
+            if reason:
+                msg = f"{msg}（{reason}）"
+            for tid in ids:
+                try:
+                    await self.db.append_log(tid, msg)
+                except Exception:
+                    pass
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_note())
+        except RuntimeError:
+            pass
+
+    def _schedule_failed_retry(self, task_id: int) -> None:
+        """After sequential finish with failures, retry once the cooldown elapses."""
+        task_id = int(task_id)
+        old = self._failed_retry_handles.pop(task_id, None)
+        if old and not old.done():
+            old.cancel()
+
+        async def _run() -> None:
+            try:
+                sec = float(await self.db.get_failed_retry_interval_sec())
+            except Exception:
+                sec = float(get_settings().failed_retry_interval_sec or 900)
+            sec = max(120.0, sec)
+            try:
+                await asyncio.sleep(sec)
+            except asyncio.CancelledError:
+                return
+            try:
+                if self.is_worker_alive(task_id):
+                    return
+                t = await self.db.get_task(task_id)
+                if not t or str(t.get("status") or "") != "paused":
+                    return
+                failed = int(await self.db.count_failed(task_id) or 0)
+                if failed <= 0:
+                    return
+                await self.db.append_log(
+                    task_id, f"定时自动重试 {failed} 条失败项"
+                )
+                await self.start_task(task_id)
+            except Exception:
+                logger.exception("delayed failed-retry task %s", task_id)
+            finally:
+                cur = self._failed_retry_handles.get(task_id)
+                if cur is asyncio.current_task():
+                    self._failed_retry_handles.pop(task_id, None)
+
+        try:
+            self._failed_retry_handles[task_id] = asyncio.create_task(
+                _run(), name=f"failed-retry-{task_id}"
+            )
+        except RuntimeError:
+            pass
+
+    def _cancel_failed_retry(self, task_id: int) -> None:
+        old = self._failed_retry_handles.pop(int(task_id), None)
+        if old and not old.done():
+            old.cancel()
 
     async def _run_task(
         self, task_id: int, stop_event: asyncio.Event, gen: int
@@ -659,7 +1120,14 @@ class DownloadScheduler:
             finally:
                 # Only the current generation may clear registry / UI state
                 if int(self._worker_gen.get(task_id) or 0) == int(gen):
-                    self._clear_progress(task_id)
+                    try:
+                        st = await self.db.get_task(task_id)
+                    except Exception:
+                        st = None
+                    if st and str(st.get("status") or "") == "paused":
+                        self._freeze_progress_paused(task_id)
+                    else:
+                        self._clear_progress(task_id)
                     self._clear_task_filters(task_id)
                     if self._tasks.get(task_id) is me:
                         self._tasks.pop(task_id, None)
@@ -671,25 +1139,26 @@ class DownloadScheduler:
     async def _wait_flood(
         self, task_id: int, seconds: int, stop_event: asyncio.Event
     ) -> bool:
-        """Wait for FloodWait; return False if paused during wait."""
+        """Wait for FloodWait; return False only if user paused during wait."""
         wait_s = max(1, int(seconds) + 1)
-        max_wait = max(60, int(get_settings().max_flood_wait))
+        try:
+            max_wait = max(60, int(await self.db.get_max_flood_wait()))
+        except Exception:
+            max_wait = max(60, int(get_settings().max_flood_wait or 1800))
+        capped = False
         if wait_s > max_wait:
+            capped = True
             await self.db.append_log(
                 task_id,
-                f"限流需等待 {wait_s}s，超过上限 {max_wait}s，任务暂停（可稍后继续）",
+                f"限流需等待 {wait_s}s，先自动等待上限 {max_wait}s 后重试",
             )
-            task = await self.db.get_task(task_id)
-            await notify_event(
-                "flood_wait",
-                task_id=task_id,
-                title=str((task or {}).get("chat_title") or ""),
-                message=f"FloodWait {wait_s}s 超过上限，任务已暂停",
-                extra={"seconds": wait_s, "paused": True},
-            )
-            return False
+            wait_s = max_wait
 
-        await self.db.append_log(task_id, f"触发限流，自动等待 {wait_s}s 后继续")
+        await self.db.append_log(
+            task_id,
+            f"触发限流，自动等待 {wait_s}s 后继续"
+            + ("（已封顶）" if capped else ""),
+        )
         await self.db.update_task(task_id, last_error=f"FloodWait {wait_s}s，自动等待中")
         task = await self.db.get_task(task_id)
         await notify_event(
@@ -697,7 +1166,7 @@ class DownloadScheduler:
             task_id=task_id,
             title=str((task or {}).get("chat_title") or ""),
             message=f"FloodWait {wait_s}s，自动等待中",
-            extra={"seconds": wait_s, "paused": False},
+            extra={"seconds": wait_s, "paused": False, "capped": capped},
         )
         remaining = wait_s
         while remaining > 0:
@@ -900,7 +1369,14 @@ class DownloadScheduler:
                     tag_blacklist=tag_blacklist,
                 )
         finally:
-            self._clear_progress(task_id)
+            try:
+                done = await self.db.get_task(task_id)
+            except Exception:
+                done = None
+            if done and str(done.get("status") or "") == "paused":
+                self._freeze_progress_paused(task_id)
+            else:
+                self._clear_progress(task_id)
             if use_text_as_folder:
                 await self._merge_tag_folders_after(
                     task_id,
@@ -1007,7 +1483,6 @@ class DownloadScheduler:
         caption_keywords = caption_keywords or []
         if tag_blacklist is None:
             tag_blacklist = await self.db.get_tag_relation_blacklist()
-        dup_index = await asyncio.to_thread(build_identical_file_index, group_dir)
         tag_folder_map = {}
         if use_text_as_folder:
             tag_folder_map = await self._load_tag_folder_map(
@@ -1020,102 +1495,44 @@ class DownloadScheduler:
             "skipped": skipped,
             "current_folder": current_folder,
             "last_id": 0,
-            "dup_index": dup_index,
             "tag_folder_map": tag_folder_map,
             "tag_blacklist": tag_blacklist,
             "chat_id": chat_id,
         }
-        if dup_index:
-            await self.db.append_log(
-                task_id, f"已扫描群目录，可按同名同大小跳过 {len(dup_index)} 个文件"
-            )
+        # Filename→message_id local sync only seeds the queue; skip uses queue/DB
+        try:
+            n_local = await self.db.sync_local_completed_from_dir(chat_id, group_dir)
+            if n_local:
+                await self.db.append_log(
+                    task_id, f"本地文件写入队列已处理 {n_local} 条"
+                )
+        except Exception:
+            logger.debug("sync_local_completed_from_dir failed", exc_info=True)
+        await self._log_queue_skip_stats(
+            task_id,
+            chat_id,
+            include_tags=include_tags,
+            caption_keywords=caption_keywords,
+            tag_match_mode=tag_match_mode,
+            media_types=media_types,
+        )
 
         # Empty tags/keywords allowed: build index then index-only monitor;
         # downloads start when tags are added in task settings.
 
-        coverage = await indexer.assess_index_coverage(chat_id)
-        meta0 = await self.db.get_index_meta(chat_id) or {}
-        if not coverage.get("complete"):
-            # Progress only in dedicated UI box — never spam task logs
-            self._set_index_progress(
-                task_id,
-                scanned=int(meta0.get("scanned_count") or 0),
-                media=int(meta0.get("media_count") or coverage.get("media_count") or 0),
-                title="索引未覆盖全群，正在自动补扫",
-                detail=str(coverage.get("reason") or "补扫完成后开始下载"),
-                indexed_last=int(coverage.get("indexed_last") or 0),
-                chat_latest=int(coverage.get("chat_latest") or 0),
-                behind=int(coverage.get("behind") or 0),
-            )
-
-        tip = int(coverage.get("chat_latest") or 0)
-
-        async def _index_progress(meta: dict) -> None:
-            nonlocal tip
-            scanned_n = int(meta.get("scanned_count") or 0)
-            media_n = int(meta.get("media_count") or 0)
-            indexed_last = int(meta.get("last_message_id") or 0)
-            err = str(meta.get("last_error") or "")
-            # Keep tip from coverage; bump if chat grew past our snapshot
-            if tip <= 0:
-                tip = int(coverage.get("chat_latest") or 0)
-            if indexed_last > tip:
-                tip = indexed_last
-            behind = max(0, tip - indexed_last) if tip else 0
-            pct = round(100.0 * indexed_last / tip, 1) if tip else 0.0
-            self._set_index_progress(
-                task_id,
-                scanned=scanned_n,
-                media=media_n,
-                title="文案索引补扫中",
-                detail=(
-                    f"已看 {scanned_n} 条消息 · 已存 {media_n} 条媒体文案"
-                    f" · 总进度 {pct}%"
-                ),
-                indexed_last=indexed_last,
-                chat_latest=tip,
-                behind=behind,
-                error=err,
-            )
-            await self.db.update_task(
-                task_id,
-                status="running",
-                last_error=None,
-            )
-
-        try:
-            ok_index = await indexer.ensure_index(
-                chat_id,
-                chat_title=chat_title,
-                stop_event=stop_event,
-                on_progress=_index_progress,
-            )
-        finally:
-            self._clear_index_progress(task_id)
-        if stop_event.is_set():
-            await self.db.update_task(task_id, status="paused", last_error=None)
-            await self.db.append_log(task_id, "任务已暂停（索引扫描未完成）")
-            return
-        if not ok_index:
-            meta = await self.db.get_index_meta(chat_id)
-            err = (meta or {}).get("last_error") or "索引扫描失败"
-            await self.db.update_task(task_id, status="failed", last_error=err)
-            await self.db.append_log(task_id, f"索引不可用: {err}")
-            return
-
+        # Monitor uses the local caption index only. Index growth is handled by
+        # settings auto/manual incremental scans — do not scan Telegram here.
         media_count = await self.db.count_media_index(chat_id)
+        await self.db.append_log(task_id, f"本地索引 {media_count} 条")
+
         # Reload filters (user may edit tags on the tasks page while indexing)
         fresh = await self.db.get_task(task_id) or {}
         include_tags = normalize_tag_list(fresh.get("include_tags") or [])
         caption_keywords = normalize_keyword_list(fresh.get("caption_keywords") or [])
         tag_match_mode = "any"
         if not include_tags and not caption_keywords:
-            # Index-only: no tags yet — keep watching/indexing; download after tags are set
-            await self.db.append_log(
-                task_id,
-                f"索引完成，共 {media_count} 条媒体。未选标签：仅维护索引，"
-                "请在任务设置中添加标签后再下载",
-            )
+            # Index-only: no tags yet — wait for settings; download after tags are set
+            await self.db.append_log(task_id, "未选标签，等待配置")
             meta = await self.db.get_index_meta(chat_id) or {}
             last_seen = max(
                 int(meta.get("last_message_id") or 0),
@@ -1144,19 +1561,19 @@ class DownloadScheduler:
                 tag_match_mode=tag_match_mode,
                 test_mode=test_mode,
                 test_deadline=test_deadline,
+                newest_first=newest_first,
+                index_order_by=index_order_by,
             )
-            if reason != "filters_ready" or stop_event.is_set():
+            if reason not in ("filters_ready", "gap_found") or stop_event.is_set():
                 return
             fresh = await self.db.get_task(task_id) or {}
             include_tags = normalize_tag_list(fresh.get("include_tags") or [])
             caption_keywords = normalize_keyword_list(
                 fresh.get("caption_keywords") or []
             )
-            if not include_tags and not caption_keywords:
+            if not include_tags and not caption_keywords and reason != "gap_found":
                 return
-            await self.db.append_log(
-                task_id, "已配置标签/关键词，开始按索引补下历史匹配…"
-            )
+            await self.db.append_log(task_id, "标签已配置，开始补下")
             # Fall through to tagged backlog + monitor
         # Expand with direct + indirect related tags from caption co-occurrence
         expanded_tags = await self.db.expand_related_tags(chat_id, include_tags)
@@ -1258,10 +1675,10 @@ class DownloadScheduler:
             )
             return
 
-        pool = self._new_download_pool()
+        pool = self._new_download_pool(concurrency)
 
         async def _pause_and_return(reason: str) -> None:
-            if pool["active"]:
+            if self._pool_busy(pool):
                 await self._pool_drain(
                     pool,
                     task_id=task_id,
@@ -1326,7 +1743,7 @@ class DownloadScheduler:
                 ordered = [by_id[i] for i in chunk if i in by_id]
 
                 for message in ordered:
-                    if pool["active"] and await self._pool_reap(
+                    if self._pool_busy(pool) and await self._pool_reap(
                         pool,
                         task_id=task_id,
                         settings=settings,
@@ -1349,7 +1766,7 @@ class DownloadScheduler:
                         return
 
                     if max_messages and int(counters["downloaded"]) >= max_messages:
-                        if pool["active"]:
+                        if self._pool_busy(pool):
                             await self._pool_drain(
                                 pool,
                                 task_id=task_id,
@@ -1444,8 +1861,6 @@ class DownloadScheduler:
                         target_dir=target_dir,
                         filename=filename,
                         settings=settings,
-                        group_dir=group_dir,
-                        dup_index=counters.get("dup_index"),
                     )
                     if existing is not None:
                         counters["last_id"] = message.id
@@ -1455,7 +1870,7 @@ class DownloadScheduler:
                             rel = existing.relative_to(settings.download_dir)
                         except ValueError:
                             rel = existing
-                        await self.db.append_log(task_id, f"相同文件已存在，跳过: {rel}")
+                        await self.db.append_log(task_id, f"队列已处理，跳过: {rel}")
                         await self.db.update_task(
                             task_id,
                             current_folder=counters["current_folder"],
@@ -1503,7 +1918,7 @@ class DownloadScheduler:
                     counters["last_id"] = message.id
 
             # Finish current tag's in-flight jobs before starting the next tag
-            if pool["active"]:
+            if self._pool_busy(pool):
                 paused = await self._pool_drain(
                     pool,
                     task_id=task_id,
@@ -1589,10 +2004,13 @@ class DownloadScheduler:
             tag_match_mode=tag_match_mode,
             test_mode=test_mode,
             test_deadline=test_deadline,
+            newest_first=newest_first,
+            index_order_by=index_order_by,
         )
-        if reason == "filters_ready" and not stop_event.is_set():
+        if reason in ("filters_ready", "gap_found") and not stop_event.is_set():
             await self.db.append_log(
-                task_id, "标签/关键词已更新，重新按索引补下历史匹配…"
+                task_id,
+                "标签已更新，重新补下" if reason == "filters_ready" else "发现未下载项，开始补下",
             )
             await self._download_by_index_body(
                 task_id=task_id,
@@ -1651,26 +2069,62 @@ class DownloadScheduler:
         tag_match_mode: str = "any",
         test_mode: bool = False,
         test_deadline: float | None = None,
-        poll_sec: float = 30.0,
+        poll_sec: float | None = None,
+        newest_first: bool = False,
+        index_order_by: str = "id",
     ) -> str | None:
-        """Keep watching the chat for new media matching tags/keywords until paused.
+        """Local-only monitor: compare caption index vs downloaded.
 
-        Returns ``filters_ready`` when tags/keywords appear or grow so the caller
-        can run the index backlog; otherwise ``None``.
+        Does not poll Telegram. Idle until index scan notifies a bump (or a
+        rare heartbeat / tag change). Then checks local gaps and returns
+        ``gap_found`` so the caller downloads missing matches.
+
+        Sticky pending queues are re-tried after ``failed_retry_interval_sec``.
+
+        Returns ``filters_ready`` | ``gap_found`` | ``None`` (paused/stopped).
         """
-        file_formats = file_formats or []
+        _ = (
+            client,
+            album_captions,
+            concurrency,
+            file_formats,
+            delay_min,
+            delay_max,
+            folder_mode,
+            use_text_as_folder,
+            group_dir,
+            newest_first,
+            index_order_by,
+        )
         include_tags = include_tags or []
         caption_keywords = caption_keywords or []
         last_seen = max(0, int(last_seen or 0))
-        filt = (
-            "仅维护索引（尚未配置标签）"
+        media_types_list = sorted(media_types) if media_types else None
+        # Ensure Event exists before first wait (also for late notifies)
+        self._chat_wake_event(chat_id)
+        if poll_sec is None:
+            try:
+                poll_sec = float(await self.db.get_monitor_heartbeat_sec())
+            except Exception:
+                poll_sec = float(
+                    getattr(get_settings(), "monitor_heartbeat_sec", 600) or 600
+                )
+        heartbeat_sec = max(60.0, float(poll_sec or 600.0))
+        try:
+            failed_retry_sec = max(
+                120.0, float(await self.db.get_failed_retry_interval_sec())
+            )
+        except Exception:
+            failed_retry_sec = max(
+                120.0,
+                float(getattr(get_settings(), "failed_retry_interval_sec", 900) or 900),
+            )
+        status_line = (
+            "进入监控 · 未选标签"
             if not include_tags and not caption_keywords
-            else "按标签/关键词下载新匹配"
+            else "进入监控"
         )
-        await self.db.append_log(
-            task_id,
-            f"进入监控（{filt}）：从消息 {last_seen} 之后检查，约每 {poll_sec:.0f}s 一轮（暂停可停止）",
-        )
+        await self.db.append_log(task_id, status_line)
         await self.db.update_task(
             task_id,
             status="running",
@@ -1682,6 +2136,9 @@ class DownloadScheduler:
             failed_count=await self.db.count_failed(task_id),
             skipped_count=int(counters["skipped"]),
         )
+
+        # First pass: catch gaps left after backlog / restart without a new bump
+        check_pending = True
 
         while True:
             if stop_event.is_set() or self._test_time_up(test_deadline):
@@ -1703,36 +2160,34 @@ class DownloadScheduler:
                 await self.db.append_log(task_id, reason)
                 return None
 
-            # Pick up tag edits from the tasks page without restart
             fresh = await self.db.get_task(task_id) or {}
             prev_tags = set(include_tags)
             prev_kws = set(caption_keywords)
             include_tags = normalize_tag_list(fresh.get("include_tags") or [])
-            caption_keywords = normalize_keyword_list(fresh.get("caption_keywords") or [])
+            caption_keywords = normalize_keyword_list(
+                fresh.get("caption_keywords") or []
+            )
             tag_match_mode = "any"
-            gained = (set(include_tags) - prev_tags) or (
-                set(caption_keywords) - prev_kws
-            )
-            became_filtered = (not prev_tags and not prev_kws) and (
-                include_tags or caption_keywords
-            )
-            if became_filtered or gained:
-                await self.db.append_log(
-                    task_id,
-                    "检测到标签/关键词更新，退出监控以按索引补下历史匹配…",
-                )
-                await self.db.update_task(
-                    task_id,
-                    status="running",
-                    last_message_id=last_seen,
-                    current_folder=counters.get("current_folder"),
-                    processed_count=int(counters["processed"]),
-                    downloaded_count=int(counters["downloaded"]),
-                    failed_count=await self.db.count_failed(task_id),
-                    skipped_count=int(counters["skipped"]),
-                    last_error=None,
-                )
-                return "filters_ready"
+            filters_changed = set(include_tags) != prev_tags or set(
+                caption_keywords
+            ) != prev_kws
+            if filters_changed:
+                if not include_tags and not caption_keywords:
+                    await self.db.append_log(task_id, "标签已清空，等待配置")
+                else:
+                    await self.db.append_log(task_id, "标签已更新，开始补下")
+                    await self.db.update_task(
+                        task_id,
+                        status="running",
+                        last_message_id=last_seen,
+                        current_folder=counters.get("current_folder"),
+                        processed_count=int(counters["processed"]),
+                        downloaded_count=int(counters["downloaded"]),
+                        failed_count=await self.db.count_failed(task_id),
+                        skipped_count=int(counters["skipped"]),
+                        last_error=None,
+                    )
+                    return "filters_ready"
 
             if max_messages and int(counters["downloaded"]) >= max_messages:
                 await self.db.update_task(
@@ -1749,245 +2204,115 @@ class DownloadScheduler:
                 await self.db.append_log(
                     task_id, f"已达上限 {max_messages} 个文件，监控结束"
                 )
-                return
+                return None
 
-            pool = self._new_download_pool()
-            new_count = 0
-            try:
-                async for message in client.iter_messages(
-                    chat_id, min_id=last_seen, reverse=True
+            bumped = self.peek_index_bump(chat_id)
+            if filters_changed or bumped:
+                self._gap_pending_sticky.pop(task_id, None)
+                self._gap_sticky_at.pop(task_id, None)
+
+            pending = 0
+            failed_n = 0
+            # Count when woken / first pass / bump / heartbeat — not every idle tick
+            if (include_tags or caption_keywords) and (bumped or check_pending):
+                try:
+                    tags_for_q = await self.db.expand_related_tags(
+                        chat_id, include_tags
+                    )
+                except Exception:
+                    tags_for_q = include_tags
+                try:
+                    pending = await self.db.count_index_pending(
+                        task_id,
+                        chat_id,
+                        tags=tags_for_q or None,
+                        tag_match_mode=tag_match_mode,
+                        keywords=caption_keywords or None,
+                        media_types=media_types_list,
+                    )
+                except Exception:
+                    logger.debug("count_index_pending failed", exc_info=True)
+                    pending = 0
+                try:
+                    failed_n = int(await self.db.count_failed(task_id) or 0)
+                except Exception:
+                    failed_n = 0
+
+            if (include_tags or caption_keywords) and (
+                bumped or pending > 0 or failed_n > 0
+            ):
+                sticky = self._gap_pending_sticky.get(task_id)
+                sticky_at = float(self._gap_sticky_at.get(task_id) or 0.0)
+                sticky_age = (
+                    (time.monotonic() - sticky_at) if sticky_at > 0 else 0.0
+                )
+                cooldown_ok = sticky_age >= failed_retry_sec
+                # Same pending after a gap pass → standby, but re-try after cooldown
+                # (covers failed / abnormal files that need another download pass).
+                blocked = (
+                    pending > 0
+                    and sticky is not None
+                    and pending >= int(sticky)
+                    and not bumped
+                    and not filters_changed
+                    and not cooldown_ok
+                    and failed_n <= 0
+                )
+                # Failed rows always get a cooldown-gated retry even if pending sticky
+                if (
+                    failed_n > 0
+                    and sticky is not None
+                    and not bumped
+                    and not filters_changed
+                    and not cooldown_ok
                 ):
-                    if stop_event.is_set():
-                        break
-                    if message.id > last_seen:
-                        last_seen = message.id
-
-                    if pool["active"] and await self._pool_reap(
-                        pool,
-                        task_id=task_id,
-                        settings=settings,
-                        group_dir=group_dir,
-                        use_text_as_folder=use_text_as_folder,
-                        counters=counters,
-                        test_mode=test_mode,
-                        wait=False,
-                    ):
-                        if pool["active"]:
-                            await self._pool_drain(
-                                pool,
-                                task_id=task_id,
-                                settings=settings,
-                                group_dir=group_dir,
-                                use_text_as_folder=use_text_as_folder,
-                                counters=counters,
-                                test_mode=test_mode,
-                            )
-                        await self.db.update_task(
-                            task_id,
-                            status="paused",
-                            last_message_id=last_seen,
-                            current_folder=counters.get("current_folder"),
-                            processed_count=int(counters["processed"]),
-                            downloaded_count=int(counters["downloaded"]),
-                            failed_count=await self.db.count_failed(task_id),
-                            skipped_count=int(counters["skipped"]),
-                        )
-                        return
-
-                    if not has_media(message):
-                        continue
-                    if await self.db.is_message_done(task_id, message.id):
-                        continue
-
-                    media_type = detect_media_type(message)
-                    if media_type == "sticker":
-                        media_type = "document"
-                    if not media_type or media_type not in media_types:
-                        continue
-                    if not self._passes_file_filters(task_id, message, media_type):
-                        continue
-
-                    caption = await self._ensure_caption(
-                        client, chat_id, message, album_captions
-                    )
-                    tags = extract_tags(caption or "")
-                    # Keep index fresh for next runs
-                    try:
-                        await self.db.upsert_media_index_item(
-                            chat_id,
-                            message.id,
-                            caption=caption or "",
-                            tags=tags,
-                            grouped_id=getattr(message, "grouped_id", None),
-                            media_type=media_type,
-                            msg_date=(
-                                message.date.isoformat()
-                                if getattr(message, "date", None)
-                                else None
-                            ),
-                        )
-                        await self.db.commit()
-                    except Exception:
-                        logger.debug("monitor index upsert failed", exc_info=True)
-
-                    # No tags/keywords yet: index-only watch (do not download all media)
-                    if not include_tags and not caption_keywords:
-                        continue
-
-                    if not matches_include_tags(
-                        tags, include_tags, mode=tag_match_mode
-                    ) or not matches_caption_keywords(caption, caption_keywords):
-                        continue
-
-                    if max_messages and int(counters["downloaded"]) >= max_messages:
-                        break
-
-                    subdir = resolve_media_subdir(
-                        message,
-                        album_captions=album_captions,
-                        use_caption_folders=use_text_as_folder,
-                        group_dir=group_dir if use_text_as_folder else None,
-                        folder_mode=folder_mode,
-                        caption_override=caption or None,
-                        tag_folder_map=counters.get("tag_folder_map") or None,
-                        tag_blacklist=counters.get("tag_blacklist") or None,
-                    )
-                    filename = build_filename(
-                        message,
-                        media_type,
-                        album_captions=album_captions,
-                        caption=caption,
-                    )
-                    rel_dir = subdir if subdir is not None else "_未分类"
-                    target_dir = group_dir / rel_dir if rel_dir else group_dir
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    counters["current_folder"] = rel_dir or "."
-
-                    existing = await self._skip_if_already_downloaded(
-                        task_id=task_id,
-                        chat_id=chat_id,
-                        message=message,
-                        target_dir=target_dir,
-                        filename=filename,
-                        settings=settings,
-                        group_dir=group_dir,
-                        dup_index=counters.get("dup_index"),
-                    )
-                    if existing is not None:
-                        counters["processed"] = int(counters["processed"]) + 1
-                        counters["downloaded"] = int(counters["downloaded"]) + 1
-                        new_count += 1
-                        try:
-                            rel = existing.relative_to(settings.download_dir)
-                        except ValueError:
-                            rel = existing
+                    blocked = True
+                if blocked:
+                    if check_pending:
+                        wait_m = max(1, int((failed_retry_sec - sticky_age) / 60))
                         await self.db.append_log(
-                            task_id, f"监控：相同文件已存在，跳过: {rel}"
-                        )
-                        continue
-
-                    target_path, _ = resolve_download_path(
-                        target_dir,
-                        filename,
-                        message.id,
-                        self._expected_size(message),
-                    )
-                    job = DownloadJob(
-                        message=message,
-                        message_id=message.id,
-                        target_path=target_path,
-                        caption=caption or "",
-                        media_type=media_type,
-                        rel_dir=rel_dir or "",
-                        tags=tags,
-                    )
-                    status = await self._pool_submit(
-                        pool,
-                        job,
-                        task_id=task_id,
-                        stop_event=stop_event,
-                        settings=settings,
-                        group_dir=group_dir,
-                        use_text_as_folder=use_text_as_folder,
-                        counters=counters,
-                        concurrency=concurrency,
-                        max_messages=max_messages,
-                        delay_min=delay_min,
-                        delay_max=delay_max,
-                        test_mode=test_mode,
-                        log_prefix="监控下载",
-                    )
-                    if status == "paused":
-                        if pool["active"]:
-                            await self._pool_drain(
-                                pool,
-                                task_id=task_id,
-                                settings=settings,
-                                group_dir=group_dir,
-                                use_text_as_folder=use_text_as_folder,
-                                counters=counters,
-                                test_mode=test_mode,
-                            )
-                        await self.db.update_task(
                             task_id,
-                            status="paused",
-                            last_message_id=last_seen,
-                            current_folder=counters.get("current_folder"),
-                            processed_count=int(counters["processed"]),
-                            downloaded_count=int(counters["downloaded"]),
-                            failed_count=await self.db.count_failed(task_id),
-                            skipped_count=int(counters["skipped"]),
+                            f"队列仍有 {pending} 条"
+                            + (f"·失败 {failed_n}" if failed_n else "")
+                            + f"，待命约 {wait_m} 分钟后自动重试",
                         )
-                        return
-                    new_count += 1
-
-            except FloodWaitError as e:
-                if not await self._wait_flood(task_id, e.seconds, stop_event):
+                else:
+                    if sticky is not None and cooldown_ok and not bumped:
+                        await self.db.append_log(
+                            task_id,
+                            f"定时自动重试失败/待补项"
+                            + (f"（失败 {failed_n}）" if failed_n else ""),
+                        )
+                    if pending > 0 or failed_n > 0:
+                        self._gap_pending_sticky[task_id] = int(pending or failed_n)
+                        self._gap_sticky_at[task_id] = time.monotonic()
+                    else:
+                        self._gap_pending_sticky.pop(task_id, None)
+                        self._gap_sticky_at.pop(task_id, None)
+                    self.consume_index_bump(chat_id)
+                    if pending > 0:
+                        gap_msg = f"待补下 {pending} 条"
+                    elif failed_n > 0:
+                        gap_msg = f"重试失败 {failed_n} 条"
+                    else:
+                        gap_msg = "索引已更新"
+                    await self.db.append_log(task_id, gap_msg)
                     await self.db.update_task(
                         task_id,
-                        status="paused",
+                        status="running",
                         last_message_id=last_seen,
                         current_folder=counters.get("current_folder"),
                         processed_count=int(counters["processed"]),
                         downloaded_count=int(counters["downloaded"]),
                         failed_count=await self.db.count_failed(task_id),
                         skipped_count=int(counters["skipped"]),
+                        last_error=None,
                     )
-                    return
+                    return "gap_found"
 
-            if pool["active"]:
-                paused = await self._pool_drain(
-                    pool,
-                    task_id=task_id,
-                    settings=settings,
-                    group_dir=group_dir,
-                    use_text_as_folder=use_text_as_folder,
-                    counters=counters,
-                    test_mode=test_mode,
-                )
-                if paused:
-                    await self.db.update_task(
-                        task_id,
-                        status="paused",
-                        last_message_id=last_seen,
-                        current_folder=counters.get("current_folder"),
-                        processed_count=int(counters["processed"]),
-                        downloaded_count=int(counters["downloaded"]),
-                        failed_count=await self.db.count_failed(task_id),
-                        skipped_count=int(counters["skipped"]),
-                    )
-                    return
-
-            try:
-                await self.db.upsert_index_meta(
-                    chat_id,
-                    last_message_id=last_seen,
-                    media_count=await self.db.count_media_index(chat_id),
-                    status="idle",
-                )
-            except Exception:
-                pass
-
+            check_pending = False
+            # True idle: drop worker shell so UI shows「监控中」not empty lanes
+            self._clear_progress(task_id)
             await self.db.update_task(
                 task_id,
                 status="running",
@@ -1999,20 +2324,16 @@ class DownloadScheduler:
                 skipped_count=int(counters["skipped"]),
                 last_error=None,
             )
-            if new_count:
-                await self.db.append_log(
-                    task_id, f"本轮监控处理 {new_count} 条，继续等待新消息…"
-                )
 
-            # Interruptible sleep until next poll (coarser steps = less wakeups)
-            remaining = float(poll_sec)
-            while remaining > 0:
-                if stop_event.is_set() or self._test_time_up(test_deadline):
-                    break
-                step = min(2.0, remaining)
-                await asyncio.sleep(step)
-                remaining -= step
-
+            reason = await self._wait_monitor_idle(
+                chat_id=chat_id,
+                stop_event=stop_event,
+                test_deadline=test_deadline,
+                heartbeat_sec=heartbeat_sec,
+            )
+            # Heartbeat / external wake: light recheck; index bump handled above
+            if reason in ("heartbeat", "wake"):
+                check_pending = True
     async def _load_tag_folder_map(
         self, task_id: int, chat_id: int, group_dir: Path, *, folder_mode: str
     ) -> dict[str, str]:
@@ -2112,7 +2433,6 @@ class DownloadScheduler:
         caption_keywords = caption_keywords or []
         if tag_blacklist is None:
             tag_blacklist = await self.db.get_tag_relation_blacklist()
-        dup_index = await asyncio.to_thread(build_identical_file_index, group_dir)
         tag_folder_map = {}
         if use_text_as_folder:
             tag_folder_map = await self._load_tag_folder_map(
@@ -2125,15 +2445,26 @@ class DownloadScheduler:
             "skipped": skipped,
             "current_folder": current_folder,
             "last_id": last_id,
-            "dup_index": dup_index,
             "tag_folder_map": tag_folder_map,
             "tag_blacklist": tag_blacklist,
             "chat_id": chat_id,
         }
-        if dup_index:
-            await self.db.append_log(
-                task_id, f"已扫描群目录，可按同名同大小跳过 {len(dup_index)} 个文件"
-            )
+        try:
+            n_local = await self.db.sync_local_completed_from_dir(chat_id, group_dir)
+            if n_local:
+                await self.db.append_log(
+                    task_id, f"本地文件写入队列已处理 {n_local} 条"
+                )
+        except Exception:
+            logger.debug("sync_local_completed_from_dir failed", exc_info=True)
+        await self._log_queue_skip_stats(
+            task_id,
+            chat_id,
+            include_tags=include_tags,
+            caption_keywords=caption_keywords,
+            tag_match_mode=tag_match_mode,
+            media_types=media_types,
+        )
         ok = await self._retry_failed_messages(
             task_id=task_id,
             chat_id=chat_id,
@@ -2193,7 +2524,7 @@ class DownloadScheduler:
             return
 
         # Phase 2: scan from checkpoint; sliding-window concurrency (free slot → next)
-        pool = self._new_download_pool()
+        pool = self._new_download_pool(concurrency)
         counters = {
             "processed": processed,
             "downloaded": downloaded,
@@ -2201,7 +2532,6 @@ class DownloadScheduler:
             "skipped": skipped,
             "current_folder": current_folder,
             "last_id": last_id,
-            "dup_index": dup_index,
             "tag_folder_map": tag_folder_map,
             "tag_blacklist": tag_blacklist,
             "chat_id": chat_id,
@@ -2218,7 +2548,7 @@ class DownloadScheduler:
 
         async def _pause_and_return(reason: str) -> None:
             await _sync_from_counters()
-            if pool["active"]:
+            if self._pool_busy(pool):
                 await self._pool_drain(
                     pool,
                     task_id=task_id,
@@ -2244,7 +2574,7 @@ class DownloadScheduler:
 
         async def _complete_limit() -> None:
             await _sync_from_counters()
-            if pool["active"]:
+            if self._pool_busy(pool):
                 await self._pool_drain(
                     pool,
                     task_id=task_id,
@@ -2295,7 +2625,7 @@ class DownloadScheduler:
             try:
                 async for message in client.iter_messages(chat_id, **iter_kwargs):
                     # Opportunistically reap finished downloads while scanning
-                    if pool["active"] and await self._pool_reap(
+                    if self._pool_busy(pool) and await self._pool_reap(
                         pool,
                         task_id=task_id,
                         settings=settings,
@@ -2435,8 +2765,6 @@ class DownloadScheduler:
                         target_dir=target_dir,
                         filename=filename,
                         settings=settings,
-                        group_dir=group_dir,
-                        dup_index=counters.get("dup_index"),
                     )
                     if existing is not None:
                         last_id = message.id
@@ -2449,7 +2777,7 @@ class DownloadScheduler:
                             rel = existing.relative_to(settings.download_dir)
                         except ValueError:
                             rel = existing
-                        await self.db.append_log(task_id, f"相同文件已存在，跳过: {rel}")
+                        await self.db.append_log(task_id, f"队列已处理，跳过: {rel}")
                         await self.db.update_task(
                             task_id,
                             current_folder=current_folder,
@@ -2522,7 +2850,7 @@ class DownloadScheduler:
                 break  # finished iteration without FloodWait
 
             except FloodWaitError as e:
-                if pool["active"]:
+                if self._pool_busy(pool):
                     await self._pool_drain(
                         pool,
                         task_id=task_id,
@@ -2559,23 +2887,37 @@ class DownloadScheduler:
                 continue
 
         failed = await self.db.count_failed(task_id)
-        note = (
-            "任务完成"
-            if failed == 0
-            else f"任务完成（仍有 {failed} 条失败，可点继续重试）"
-        )
-        await self.db.update_task(
-            task_id,
-            status="completed",
-            current_folder=current_folder,
-            last_message_id=last_id,
-            processed_count=processed,
-            downloaded_count=downloaded,
-            failed_count=failed,
-            skipped_count=skipped,
-            last_error=None if failed == 0 else f"{failed} 条失败待重试",
-        )
-        await self.db.append_log(task_id, note)
+        if failed == 0:
+            await self.db.update_task(
+                task_id,
+                status="completed",
+                current_folder=current_folder,
+                last_message_id=last_id,
+                processed_count=processed,
+                downloaded_count=downloaded,
+                failed_count=0,
+                skipped_count=skipped,
+                last_error=None,
+            )
+            await self.db.append_log(task_id, "任务完成")
+        else:
+            # Keep paused so「继续」can retry; also schedule a delayed auto-retry
+            await self.db.update_task(
+                task_id,
+                status="paused",
+                current_folder=current_folder,
+                last_message_id=last_id,
+                processed_count=processed,
+                downloaded_count=downloaded,
+                failed_count=failed,
+                skipped_count=skipped,
+                last_error=f"{failed} 条失败待重试",
+            )
+            await self.db.append_log(
+                task_id,
+                f"仍有 {failed} 条失败，已暂停；将定时自动重试，也可手动继续",
+            )
+            self._schedule_failed_retry(int(task_id))
 
     def _test_time_up(self, test_deadline: float | None) -> bool:
         if test_deadline is None:
@@ -2633,6 +2975,52 @@ class DownloadScheduler:
             logger.debug("salvage part failed for %s", target_path, exc_info=True)
         return False
 
+    async def _log_queue_skip_stats(
+        self,
+        task_id: int,
+        chat_id,
+        *,
+        include_tags: list | None,
+        caption_keywords: list | None,
+        tag_match_mode: str,
+        media_types: set[str] | list[str] | None,
+    ) -> None:
+        """Log how many matched items are already done in the queue (not disk scan)."""
+        include_tags = include_tags or []
+        caption_keywords = caption_keywords or []
+        if not include_tags and not caption_keywords:
+            return
+        media_list = sorted(media_types) if media_types else None
+        try:
+            tags_for_q = await self.db.expand_related_tags(chat_id, include_tags)
+        except Exception:
+            tags_for_q = include_tags
+        try:
+            done_n = await self.db.count_index_done(
+                task_id,
+                chat_id,
+                tags=tags_for_q or None,
+                tag_match_mode=tag_match_mode or "any",
+                keywords=caption_keywords or None,
+                media_types=media_list,
+            )
+            pending_n = await self.db.count_index_pending(
+                task_id,
+                chat_id,
+                tags=tags_for_q or None,
+                tag_match_mode=tag_match_mode or "any",
+                keywords=caption_keywords or None,
+                media_types=media_list,
+            )
+        except Exception:
+            logger.debug("queue skip stats failed", exc_info=True)
+            return
+        if done_n > 0:
+            await self.db.append_log(
+                task_id,
+                f"队列已处理 {done_n} 条，下载时将跳过（待下 {pending_n}）",
+            )
+
     async def _skip_if_already_downloaded(
         self,
         *,
@@ -2645,44 +3033,41 @@ class DownloadScheduler:
         group_dir: Optional[Path] = None,
         dup_index: Optional[dict] = None,
     ) -> Optional[Path]:
+        """Skip when this message_id is already done in the queue.
+
+        Uses chat_completed / downloaded by message_id. Also skips if the exact
+        target path is already complete. Does not scan for same-name/size dupes.
         """
-        If this message was already saved (this/other task), or an identical file
-        (same name + size) already exists under the group dir, mark done and skip.
-        """
+        _ = (group_dir, dup_index)  # legacy kwargs ignored
         mid = int(message.id)
         expected = self._expected_size(message)
 
-        reused = await self.db.find_chat_completed_file(chat_id, mid)
-        if reused:
-            p = Path(reused)
-            if not p.is_absolute():
-                p = settings.download_dir / p
-            if file_looks_complete(p, expected):
-                await self.db.mark_message(
-                    task_id, mid, status="done", file_path=str(p)
-                )
-                return p
-
-        # 一模一样：群目录内任意子文件夹已有同名且同大小的文件
-        identical = find_identical_file(
-            filename,
-            expected,
-            dup_index=dup_index,
-            group_dir=group_dir,
-        )
-        if identical is not None:
+        if await self.db.is_message_done(task_id, mid, chat_id=chat_id):
+            reused = await self.db.find_chat_completed_file(chat_id, mid)
+            p: Optional[Path] = None
+            if reused:
+                p = Path(reused)
+                if not p.is_absolute():
+                    p = settings.download_dir / p
+                if not file_looks_complete(p, expected):
+                    p = None
+            if p is None:
+                await self.db.mark_message(task_id, mid, status="done", file_path=None)
+                return target_dir / filename
             await self.db.mark_message(
-                task_id, mid, status="done", file_path=str(identical)
+                task_id, mid, status="done", file_path=str(p)
             )
-            return identical
+            return p
 
         path, done = resolve_download_path(target_dir, filename, mid, expected)
         if done:
             await self.db.mark_message(
                 task_id, mid, status="done", file_path=str(path)
             )
-            if dup_index is not None and expected > 0:
-                dup_index[(filename.lower(), int(expected))] = path
+            try:
+                await self.db.mark_chat_completed(chat_id, mid, file_path=str(path))
+            except Exception:
+                pass
             return path
         return None
 
@@ -2702,18 +3087,140 @@ class DownloadScheduler:
             await asyncio.sleep(step)
             remaining -= step
 
-    def _new_download_pool(self) -> dict[str, Any]:
-        """Sliding-window pool: free a slot → start next immediately."""
+    def _new_download_pool(self, concurrency: int = 1) -> dict[str, Any]:
+        """Tangyoha-style pool: N resident workers pull from a shared queue."""
+        n = max(1, min(5, int(concurrency or 1)))
         return {
-            "active": {},  # Task -> DownloadJob
+            "concurrency": n,
+            "queue": asyncio.Queue(),
+            "workers": [],  # asyncio.Task list
+            "started": False,
+            "in_flight": 0,
+            "blocked": False,
+            "done_event": asyncio.Event(),
+            "lock": asyncio.Lock(),
             "order": [],  # scan order for checkpoint
-            "settled": {},  # message_id -> True(ok to advance) | False(blocked)
+            "settled": {},  # message_id -> True(ok) | False(blocked)
             "order_idx": 0,
+            # settle kwargs filled by _ensure_pool_workers
+            "_ctx": None,
         }
 
-    async def _pool_reap(
+    def _pool_busy(self, pool: dict[str, Any]) -> bool:
+        return bool(pool.get("started")) and (
+            int(pool.get("in_flight") or 0) > 0
+            or not pool["queue"].empty()
+            or bool(pool.get("workers"))
+        )
+
+    def _pool_signal_done(self, pool: dict[str, Any]) -> None:
+        ev = pool.get("done_event")
+        if ev is not None:
+            ev.set()
+
+    async def _ensure_pool_workers(
         self,
         pool: dict[str, Any],
+        *,
+        task_id: int,
+        stop_event: asyncio.Event,
+        settings,
+        group_dir: Path,
+        use_text_as_folder: bool,
+        counters: dict[str, Any],
+        test_mode: bool = False,
+        log_prefix: str = "",
+    ) -> None:
+        if pool.get("started"):
+            return
+        n = max(1, min(5, int(pool.get("concurrency") or 1)))
+        pool["concurrency"] = n
+        pool["started"] = True
+        pool["blocked"] = False
+        pool["_ctx"] = {
+            "task_id": task_id,
+            "stop_event": stop_event,
+            "settings": settings,
+            "group_dir": group_dir,
+            "use_text_as_folder": use_text_as_folder,
+            "counters": counters,
+            "test_mode": test_mode,
+            "log_prefix": log_prefix,
+        }
+        self._ensure_worker_progress(task_id, n)
+        workers = []
+        for wid in range(1, n + 1):
+            workers.append(
+                asyncio.create_task(
+                    self._download_worker_loop(wid, pool),
+                    name=f"dl-worker-{task_id}-{wid}",
+                )
+            )
+        pool["workers"] = workers
+
+    async def _download_worker_loop(self, worker_id: int, pool: dict[str, Any]) -> None:
+        """Resident worker: pull jobs until sentinel None."""
+        q: asyncio.Queue = pool["queue"]
+        while True:
+            job = await q.get()
+            try:
+                if job is None:
+                    return
+                ctx = pool.get("_ctx") or {}
+                task_id = int(ctx["task_id"])
+                stop_event: asyncio.Event = ctx["stop_event"]
+                async with pool["lock"]:
+                    pool["in_flight"] = int(pool.get("in_flight") or 0) + 1
+                result: bool | str = False
+                try:
+                    result = await self._download_with_retry(
+                        task_id,
+                        job.message,
+                        job.target_path,
+                        stop_event,
+                        test_mode=bool(ctx.get("test_mode")),
+                        caption=job.caption,
+                        message_id=job.message_id,
+                        worker_id=worker_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "download worker %s crashed: msg %s", worker_id, job.message_id
+                    )
+                    result = False
+                    pool["blocked"] = True
+                finally:
+                    self._set_worker_idle(task_id, worker_id)
+                    async with pool["lock"]:
+                        pool["in_flight"] = max(0, int(pool.get("in_flight") or 0) - 1)
+                    self._pool_signal_done(pool)
+
+                try:
+                    await self._settle_pool_job(
+                        pool,
+                        job,
+                        result,
+                        task_id=task_id,
+                        settings=ctx["settings"],
+                        group_dir=ctx["group_dir"],
+                        use_text_as_folder=bool(ctx.get("use_text_as_folder")),
+                        counters=ctx["counters"],
+                        test_mode=bool(ctx.get("test_mode")),
+                        log_prefix=str(ctx.get("log_prefix") or ""),
+                    )
+                except Exception:
+                    logger.exception("settle failed msg %s", job.message_id)
+                    pool["settled"][job.message_id] = False
+                    pool["blocked"] = True
+                    self._pool_signal_done(pool)
+            finally:
+                q.task_done()
+
+    async def _settle_pool_job(
+        self,
+        pool: dict[str, Any],
+        job: DownloadJob,
+        result: bool | str,
         *,
         task_id: int,
         settings,
@@ -2722,41 +3229,11 @@ class DownloadScheduler:
         counters: dict[str, Any],
         test_mode: bool = False,
         log_prefix: str = "",
-        wait: bool = True,
-    ) -> bool:
-        """
-        Reap finished downloads. If wait=True, block until at least one finishes.
-        Returns True if a pause/error blocked the pool.
-        """
-        active: dict = pool["active"]
-        if not active:
-            return False
-        if wait:
-            done, _ = await asyncio.wait(
-                set(active.keys()), return_when=asyncio.FIRST_COMPLETED
-            )
-        else:
-            done = {t for t in active if t.done()}
-            if not done:
-                return False
-
-        paused = False
+    ) -> None:
+        """Apply one finished job to counters / checkpoint (worker-safe)."""
         merge_groups: list[list[str]] = []
-        downloaded = int(counters["downloaded"])
-        failed = int(counters["failed"])
-        current_folder = counters.get("current_folder")
-
-        for t in done:
-            job: DownloadJob = active.pop(t)
-            try:
-                result = t.result()
-            except Exception:
-                logger.exception("download worker crashed: msg %s", job.message_id)
-                pool["settled"][job.message_id] = False
-                paused = True
-                continue
+        async with pool["lock"]:
             if result == "paused":
-                # File may already be complete on disk — claim it so resume won't redo
                 if await self._salvage_complete_file(
                     task_id=task_id,
                     message_id=job.message_id,
@@ -2766,10 +3243,14 @@ class DownloadScheduler:
                     result = True
                 else:
                     pool["settled"][job.message_id] = False
-                    paused = True
-                    continue
+                    pool["blocked"] = True
+                    return
 
             pool["settled"][job.message_id] = True
+            downloaded = int(counters["downloaded"])
+            failed = int(counters["failed"])
+            current_folder = counters.get("current_folder")
+
             if result is True:
                 downloaded += 1
                 await self.db.mark_message(
@@ -2778,16 +3259,6 @@ class DownloadScheduler:
                     status="done",
                     file_path=str(job.target_path),
                 )
-                dup_index = counters.get("dup_index")
-                if isinstance(dup_index, dict) and job.target_path:
-                    try:
-                        sz = job.target_path.stat().st_size
-                        if sz > 0:
-                            dup_index[(job.target_path.name.lower(), int(sz))] = (
-                                job.target_path
-                            )
-                    except OSError:
-                        pass
                 label = "测试占位" if test_mode else (log_prefix or "已下载")
                 try:
                     rel = job.target_path.relative_to(settings.download_dir)
@@ -2810,22 +3281,42 @@ class DownloadScheduler:
                 )
             current_folder = job.rel_dir or current_folder
 
-        # Advance checkpoint through consecutive settled jobs in scan order
-        processed = int(counters["processed"])
-        last_id = int(counters.get("last_id") or 0)
-        order: list[DownloadJob] = pool["order"]
-        idx = int(pool["order_idx"])
-        settled: dict = pool["settled"]
-        while idx < len(order):
-            mid = order[idx].message_id
-            if mid not in settled:
-                break
-            if not settled[mid]:
-                break
-            last_id = mid
-            processed += 1
-            idx += 1
-        pool["order_idx"] = idx
+            processed = int(counters["processed"])
+            last_id = int(counters.get("last_id") or 0)
+            order: list[DownloadJob] = pool["order"]
+            idx = int(pool["order_idx"])
+            settled: dict = pool["settled"]
+            while idx < len(order):
+                mid = order[idx].message_id
+                if mid not in settled:
+                    break
+                if not settled[mid]:
+                    break
+                last_id = mid
+                processed += 1
+                idx += 1
+            pool["order_idx"] = idx
+
+            counters["processed"] = processed
+            counters["downloaded"] = downloaded
+            counters["failed"] = failed
+            counters["current_folder"] = current_folder
+            counters["last_id"] = last_id
+
+            now_m = time.monotonic()
+            last_flush = float(counters.get("_db_flush_t") or 0)
+            force_flush = bool(pool.get("blocked")) or int(pool.get("in_flight") or 0) == 0
+            if force_flush or (now_m - last_flush) >= 0.8:
+                counters["_db_flush_t"] = now_m
+                await self.db.update_task(
+                    task_id,
+                    current_folder=current_folder,
+                    last_message_id=last_id,
+                    processed_count=processed,
+                    downloaded_count=downloaded,
+                    failed_count=failed,
+                    skipped_count=int(counters.get("skipped") or 0),
+                )
 
         if merge_groups:
             cid = counters.get("chat_id")
@@ -2837,28 +3328,43 @@ class DownloadScheduler:
                 quiet=True,
             )
 
-        # Prefer in-memory failed counter; COUNT(*) every reap is expensive under load
-        counters["processed"] = processed
-        counters["downloaded"] = downloaded
-        counters["failed"] = failed
-        counters["current_folder"] = current_folder
-        counters["last_id"] = last_id
-        # Throttle task-row updates while many files finish quickly
-        now_m = time.monotonic()
-        last_flush = float(counters.get("_db_flush_t") or 0)
-        force_flush = paused or not active
-        if force_flush or (now_m - last_flush) >= 0.8:
-            counters["_db_flush_t"] = now_m
-            await self.db.update_task(
-                task_id,
-                current_folder=current_folder,
-                last_message_id=last_id,
-                processed_count=processed,
-                downloaded_count=downloaded,
-                failed_count=failed,
-                skipped_count=int(counters.get("skipped") or 0),
-            )
-        return paused
+    async def _pool_reap(
+        self,
+        pool: dict[str, Any],
+        *,
+        task_id: int,
+        settings,
+        group_dir: Path,
+        use_text_as_folder: bool,
+        counters: dict[str, Any],
+        test_mode: bool = False,
+        log_prefix: str = "",
+        wait: bool = True,
+    ) -> bool:
+        """
+        Wait for progress from resident workers.
+        Returns True if the pool is blocked (pause/error).
+        """
+        if pool.get("blocked"):
+            return True
+        if not pool.get("started"):
+            return False
+        if not wait:
+            return bool(pool.get("blocked"))
+        if int(pool.get("in_flight") or 0) <= 0 and pool["queue"].empty():
+            return bool(pool.get("blocked"))
+        ev: asyncio.Event = pool["done_event"]
+        while True:
+            if pool.get("blocked"):
+                return True
+            if int(pool.get("in_flight") or 0) <= 0 and pool["queue"].empty():
+                return bool(pool.get("blocked"))
+            ev.clear()
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            return bool(pool.get("blocked"))
 
     async def _pool_drain(
         self,
@@ -2872,10 +3378,17 @@ class DownloadScheduler:
         test_mode: bool = False,
         log_prefix: str = "",
     ) -> bool:
-        """Wait until all in-flight downloads finish. Returns True if paused."""
-        paused = False
-        while pool["active"]:
-            if await self._pool_reap(
+        """Finish queued+in-flight work, then stop workers. Returns True if paused/blocked."""
+        if not pool.get("started"):
+            return bool(pool.get("blocked"))
+
+        # Normal path: let workers drain the queue. Pause/error: stop waiting early.
+        while True:
+            if pool.get("blocked"):
+                break
+            if int(pool.get("in_flight") or 0) <= 0 and pool["queue"].empty():
+                break
+            await self._pool_reap(
                 pool,
                 task_id=task_id,
                 settings=settings,
@@ -2885,9 +3398,77 @@ class DownloadScheduler:
                 test_mode=test_mode,
                 log_prefix=log_prefix,
                 wait=True,
-            ):
-                paused = True
-        return paused
+            )
+
+        # On pause/error, discard jobs that never started
+        if pool.get("blocked"):
+            while True:
+                try:
+                    job = pool["queue"].get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                try:
+                    if job is not None:
+                        pool["settled"][job.message_id] = False
+                finally:
+                    pool["queue"].task_done()
+            # Wait for the file currently inside each worker (bounded)
+            wait_rounds = 0
+            while int(pool.get("in_flight") or 0) > 0:
+                wait_rounds += 1
+                if wait_rounds > 40:  # ~20s at 0.5s reap timeout
+                    logger.warning(
+                        "pool drain: in_flight=%s after timeout — forcing stop",
+                        pool.get("in_flight"),
+                    )
+                    break
+                await self._pool_reap(
+                    pool,
+                    task_id=task_id,
+                    settings=settings,
+                    group_dir=group_dir,
+                    use_text_as_folder=use_text_as_folder,
+                    counters=counters,
+                    test_mode=test_mode,
+                    log_prefix=log_prefix,
+                    wait=True,
+                )
+
+        # Stop resident workers with sentinels
+        n = max(1, int(pool.get("concurrency") or 1))
+        for _ in range(n):
+            await pool["queue"].put(None)
+        workers = list(pool.get("workers") or [])
+        if workers:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*workers, return_exceptions=True),
+                    timeout=8.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("pool drain: workers did not stop within 8s")
+                for w in workers:
+                    if not w.done():
+                        w.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+        pool["workers"] = []
+        pool["started"] = False
+        pool["_ctx"] = None
+        blocked = bool(pool.get("blocked"))
+        if blocked:
+            # Pause: keep frozen progress on the live box
+            self._freeze_progress_paused(task_id)
+        else:
+            # Normal drain between batches: clear worker shell
+            with self._progress_lock:
+                bucket = self._progress.get(task_id)
+                if bucket and int(bucket.get("worker_count") or 0):
+                    if not (bucket.get("files") or {}):
+                        self._progress.pop(task_id, None)
+                    else:
+                        bucket["worker_count"] = 0
+                        bucket["workers"] = {}
+        return blocked
 
     async def _pool_submit(
         self,
@@ -2908,25 +3489,37 @@ class DownloadScheduler:
         log_prefix: str = "",
     ) -> str:
         """
-        Submit a job into the sliding window.
+        Enqueue a job for a resident worker.
         Returns: 'ok' | 'paused' | 'limit'
         """
-        concurrency = max(1, min(5, int(concurrency or 1)))
+        conc = max(1, min(5, int(concurrency or pool.get("concurrency") or 1)))
+        pool["concurrency"] = conc
+        await self._ensure_pool_workers(
+            pool,
+            task_id=task_id,
+            stop_event=stop_event,
+            settings=settings,
+            group_dir=group_dir,
+            use_text_as_folder=use_text_as_folder,
+            counters=counters,
+            test_mode=test_mode,
+            log_prefix=log_prefix,
+        )
         waited_for_slot = False
         while True:
-            if stop_event.is_set():
+            if stop_event.is_set() or pool.get("blocked"):
                 return "paused"
             downloaded = int(counters["downloaded"])
             if max_messages and downloaded >= max_messages:
                 return "limit"
-            in_flight = len(pool["active"])
-            # Cap in-flight so we never exceed max_messages
-            limit_cap = concurrency
+            limit_cap = conc
             if max_messages is not None:
                 limit_cap = min(limit_cap, max(0, max_messages - downloaded))
             if limit_cap <= 0:
                 return "limit"
-            if in_flight < limit_cap:
+            in_flight = int(pool.get("in_flight") or 0)
+            queued = pool["queue"].qsize()
+            if in_flight + queued < limit_cap:
                 break
             waited_for_slot = True
             if await self._pool_reap(
@@ -2944,23 +3537,11 @@ class DownloadScheduler:
 
         if waited_for_slot:
             await self._sleep_delay(delay_min, delay_max, stop_event)
-            if stop_event.is_set():
+            if stop_event.is_set() or pool.get("blocked"):
                 return "paused"
 
-        async def _one():
-            return await self._download_with_retry(
-                task_id,
-                job.message,
-                job.target_path,
-                stop_event,
-                test_mode=test_mode,
-                caption=job.caption,
-                message_id=job.message_id,
-            )
-
-        task = asyncio.create_task(_one())
-        pool["active"][task] = job
         pool["order"].append(job)
+        await pool["queue"].put(job)
         return "ok"
 
     async def _flush_download_batch(
@@ -2980,11 +3561,11 @@ class DownloadScheduler:
         delay_max: float = 0,
         max_messages: int | None = None,
     ) -> dict[str, Any]:
-        """Run jobs with sliding-window concurrency (slot frees → next starts)."""
+        """Run jobs via N resident workers (queue)."""
         if not batch:
             return {**counters, "paused": False}
-        pool = self._new_download_pool()
         conc = concurrency or len(batch)
+        pool = self._new_download_pool(conc)
         for job in batch:
             status = await self._pool_submit(
                 pool,
@@ -3082,9 +3663,9 @@ class DownloadScheduler:
             if not isinstance(messages, list):
                 messages = [messages]
 
-            pool = self._new_download_pool()
+            pool = self._new_download_pool(concurrency)
             for message in messages:
-                if pool["active"] and await self._pool_reap(
+                if self._pool_busy(pool) and await self._pool_reap(
                     pool,
                     task_id=task_id,
                     settings=settings,
@@ -3107,7 +3688,7 @@ class DownloadScheduler:
                     )
                     return False
                 if stop_event.is_set() or self._test_time_up(test_deadline):
-                    if pool["active"]:
+                    if self._pool_busy(pool):
                         await self._pool_drain(
                             pool,
                             task_id=task_id,
@@ -3120,7 +3701,7 @@ class DownloadScheduler:
                         )
                     return False
                 if max_messages and int(counters.get("downloaded") or 0) >= max_messages:
-                    if pool["active"]:
+                    if self._pool_busy(pool):
                         await self._pool_drain(
                             pool,
                             task_id=task_id,
@@ -3186,8 +3767,6 @@ class DownloadScheduler:
                     target_dir=target_dir,
                     filename=filename,
                     settings=settings,
-                    group_dir=group_dir,
-                    dup_index=counters.get("dup_index"),
                 )
                 if existing is not None:
                     counters["downloaded"] = int(counters.get("downloaded") or 0) + 1
@@ -3196,7 +3775,7 @@ class DownloadScheduler:
                         rel = existing.relative_to(settings.download_dir)
                     except ValueError:
                         rel = existing
-                    await self.db.append_log(task_id, f"相同文件已存在，跳过: {rel}")
+                    await self.db.append_log(task_id, f"队列已处理，跳过: {rel}")
                     continue
                 target_path, _ = resolve_download_path(
                     target_dir,
@@ -3278,6 +3857,7 @@ class DownloadScheduler:
         test_mode: bool = False,
         caption: str = "",
         message_id: Optional[int] = None,
+        worker_id: int | None = None,
     ) -> bool | str:
         """Return True/False, or 'paused' if stop requested / long flood wait."""
         settings = get_settings()
@@ -3296,7 +3876,7 @@ class DownloadScheduler:
                 return "paused"
             try:
                 self._begin_file_progress(
-                    task_id, mid, rel, total=len(caption or "") or 1
+                    task_id, mid, rel, total=len(caption or "") or 1, worker_id=worker_id
                 )
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 body = (
@@ -3309,7 +3889,13 @@ class DownloadScheduler:
                 self._on_bytes_progress(task_id, mid, len(data), len(data))
                 await asyncio.sleep(0.05)
                 self._finish_file_progress(
-                    task_id, mid, received=len(data), total=len(data), remove=True
+                    task_id,
+                    mid,
+                    received=len(data),
+                    total=len(data),
+                    remove=True,
+                    worker_id=worker_id,
+                    completed=True,
                 )
                 return True
             except Exception as e:
@@ -3339,7 +3925,7 @@ class DownloadScheduler:
             watch_stop = asyncio.Event()
             watch_task: asyncio.Task | None = None
             try:
-                self._begin_file_progress(task_id, mid, rel, total=expected_size)
+                self._begin_file_progress(task_id, mid, rel, total=expected_size, worker_id=worker_id)
                 # No "正在下载"/"断点续传" logs — live progress already shows that.
 
                 def _cb(
@@ -3370,6 +3956,7 @@ class DownloadScheduler:
                             received=expected_size,
                             total=expected_size,
                             remove=True,
+                            completed=True,
                         )
                         return True
                     if psz == 0:
@@ -3433,13 +4020,15 @@ class DownloadScheduler:
                     received=actual_size,
                     total=expected_size or actual_size,
                     remove=True,
+                    completed=True,
                 )
                 return True
             except DownloadPaused:
                 watch_stop.set()
                 if watch_task:
                     watch_task.cancel()
-                self._finish_file_progress(task_id, mid, remove=True)
+                # Preserve real stop-time bytes (do not bump bar to 100%)
+                self._finish_file_progress(task_id, mid, remove=True, completed=False)
                 if await self._salvage_complete_file(
                     task_id=task_id,
                     message_id=mid,
@@ -3457,7 +4046,7 @@ class DownloadScheduler:
                 watch_stop.set()
                 if watch_task:
                     watch_task.cancel()
-                self._finish_file_progress(task_id, mid, remove=True)
+                self._finish_file_progress(task_id, mid, remove=True, completed=False)
                 if await self._salvage_complete_file(
                     task_id=task_id,
                     message_id=mid,
@@ -3472,7 +4061,7 @@ class DownloadScheduler:
                 watch_stop.set()
                 if watch_task:
                     watch_task.cancel()
-                self._finish_file_progress(task_id, mid, remove=True)
+                self._finish_file_progress(task_id, mid, remove=True, completed=False)
                 if not await self._wait_flood(task_id, e.seconds, stop_event):
                     if await self._salvage_complete_file(
                         task_id=task_id,
@@ -3487,12 +4076,12 @@ class DownloadScheduler:
                 watch_stop.set()
                 if watch_task:
                     watch_task.cancel()
-                self._finish_file_progress(task_id, mid, remove=True)
+                self._finish_file_progress(task_id, mid, remove=True, completed=False)
                 await self.db.append_log(
                     task_id, f"下载重试 {attempt}/{retries} (msg {mid}): {e}"
                 )
                 await asyncio.sleep(min(30, 2**attempt))
-        self._finish_file_progress(task_id, mid, remove=True)
+        self._finish_file_progress(task_id, mid, remove=True, completed=False)
         return False
 
 
