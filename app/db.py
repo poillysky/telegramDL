@@ -640,11 +640,10 @@ class Database:
         cleaned = normalize_blacklist_tags(tags)
         await self.set_meta(_TAG_BL_META_KEY, json.dumps(cleaned, ensure_ascii=False))
         self._tag_bl_cache = frozenset(cleaned)
-        # Related map depends on blacklist — drop durable graph for all chats
-        try:
-            await self.invalidate_tag_graph_cache()
-        except Exception:
-            self.invalidate_tag_groups_cache()
+        # groups_json is blacklist-agnostic; only related_json must refresh.
+        # Full invalidate wiped every chat's groups cache → each tag-picker open
+        # re-scanned chat_media_index and felt frozen.
+        await self.invalidate_tag_related_cache()
         return cleaned
 
     async def add_tag_relation_blacklist(self, tag: str) -> list[str]:
@@ -732,10 +731,7 @@ class Database:
             self._manual_tag_links_meta_key(chat_id),
             json.dumps(cleaned, ensure_ascii=False),
         )
-        try:
-            await self.invalidate_tag_graph_cache(chat_id)
-        except Exception:
-            self.invalidate_tag_groups_cache(chat_id)
+        # Manual links are read live; durable groups_json is media-only — keep it.
         return cleaned
 
     async def add_manual_tag_link(
@@ -2046,6 +2042,32 @@ class Database:
             return
         self._tag_groups_cache.pop(str(chat_id), None)
 
+    async def invalidate_tag_related_cache(
+        self, chat_id: str | int | None = None
+    ) -> None:
+        """
+        Mark related_json dirty (empty string). Keep groups_json / memory groups —
+        they do not depend on the relation blacklist. Used when blacklist changes.
+
+        related_json is NOT NULL in schema; '' is the dirty sentinel (falsy in
+        get_tag_relations → rebuild on next use).
+        """
+        if chat_id is None:
+            await self.conn.execute(
+                "UPDATE chat_tag_graph_cache SET related_json = '', updated_at = ?",
+                (_utcnow(),),
+            )
+        else:
+            await self.conn.execute(
+                """
+                UPDATE chat_tag_graph_cache
+                SET related_json = '', updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (_utcnow(), str(chat_id)),
+            )
+        await self.conn.commit()
+
     async def invalidate_tag_graph_cache(self, chat_id: str | int | None = None) -> None:
         """Drop durable + memory tag graph (call after index scan / before rebuild)."""
         self.invalidate_tag_groups_cache(chat_id)
@@ -2083,16 +2105,27 @@ class Database:
                 groups.append(cleaned)
         return groups
 
-    async def rebuild_tag_graph_cache(self, chat_id: str | int) -> None:
-        """Precompute groups + related map after index scan (avoids cold full-table expand)."""
+    async def rebuild_tag_graph_cache(
+        self, chat_id: str | int, *, reload_groups: bool = False
+    ) -> None:
+        """
+        Precompute groups + related map (avoids cold full-table expand).
+
+        By default reuses cached groups (memory / groups_json) so blacklist
+        changes do not re-scan chat_media_index. Pass reload_groups=True after
+        an index scan when caption tags may have changed.
+        """
         import time
         from collections import defaultdict
 
         from app.organizer import strip_relation_blacklist
 
         key = str(chat_id)
-        groups = await self._load_tag_groups_raw(key)
-        self._tag_groups_cache[key] = (time.monotonic(), groups)
+        if reload_groups:
+            groups = await self._load_tag_groups_raw(key)
+            self._tag_groups_cache[key] = (time.monotonic(), groups)
+        else:
+            groups = await self.list_index_tag_groups(key)
 
         blacklist = await self.get_tag_relation_blacklist()
         weight: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -2166,6 +2199,22 @@ class Database:
 
         groups = await self._load_tag_groups_raw(key)
         self._tag_groups_cache[key] = (now, groups)
+        # Persist groups immediately so the next picker open skips the full scan
+        # even if related_json is still dirty / being rebuilt.
+        try:
+            await self.conn.execute(
+                """
+                INSERT INTO chat_tag_graph_cache(chat_id, groups_json, related_json, updated_at)
+                VALUES (?, ?, '', ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    groups_json = excluded.groups_json,
+                    updated_at = excluded.updated_at
+                """,
+                (key, json.dumps(groups, ensure_ascii=False), _utcnow()),
+            )
+            await self.conn.commit()
+        except Exception:
+            pass
         return groups
 
     async def list_tag_cooccur_bundles(
@@ -2323,6 +2372,12 @@ class Database:
         q = (q or "").strip().lstrip("#").lower()
         limit = max(1, min(50, int(limit or 20)))
         tags = await self.list_index_tags(chat_id)
+        bl = {t.lower() for t in await self.get_tag_relation_blacklist()}
+        tags = [
+            t
+            for t in tags
+            if str(t.get("tag") or "").strip().lstrip("#").lower() not in bl
+        ]
         related_map = await self.get_tag_relations(chat_id)
         if q:
             tags = [
@@ -2346,6 +2401,11 @@ class Database:
                     if k.lower() == str(t["tag"]).lower():
                         rel = v
                         break
+            rel = [
+                x
+                for x in (rel or [])
+                if str(x or "").strip().lstrip("#").lower() not in bl
+            ]
             out.append(
                 {
                     "tag": t["tag"],

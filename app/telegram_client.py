@@ -23,7 +23,7 @@ from app.config import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 # Same meta style as dineshkarthik_ref/utils/meta.py
-APP_VERSION = "Telegram Media Downloader 1.0.27"
+APP_VERSION = "Telegram Media Downloader 1.0.28"
 DEVICE_MODEL = f"{platform.python_implementation()} {platform.python_version()}"
 SYSTEM_VERSION = f"{platform.system()} {platform.release()}"
 LANG_CODE = "en"

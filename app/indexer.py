@@ -600,7 +600,7 @@ class ChatIndexer:
                 logger.debug("invalidate_index_count_cache failed", exc_info=True)
             # Precompute tag groups + related map for fast expand / picker
             try:
-                await db.rebuild_tag_graph_cache(chat_id)
+                await db.rebuild_tag_graph_cache(chat_id, reload_groups=True)
             except Exception:
                 logger.debug("rebuild_tag_graph_cache failed", exc_info=True)
         except Exception as e:

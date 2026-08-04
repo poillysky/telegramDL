@@ -2313,7 +2313,12 @@ function addMonitorTag(raw, opts = {}) {
     toast("请输入标签名", "err");
     return false;
   }
+  if (isBlacklistedTag(name)) {
+    toast(`#${name} 在关联黑名单中，不能添加`, "err");
+    return false;
+  }
   let relatedList = withRelated ? lookupRelatedTags(name) : [];
+  relatedList = stripBlacklistedTags(relatedList);
   // local map miss → fetch API expand (async)
   if (
     withRelated &&
@@ -2325,7 +2330,7 @@ function addMonitorTag(raw, opts = {}) {
       `/api/index/${encodeURIComponent(chat.id)}/tags/related?tag=${encodeURIComponent(name)}`
     )
       .then((r) => {
-        const rel = r.related || [];
+        const rel = stripBlacklistedTags(r.related || []);
         if (rel.length) {
           state.tagRelated = state.tagRelated || {};
           state.tagRelated[name] = rel;
@@ -2352,13 +2357,15 @@ async function refreshTagSuggest() {
     const r = await api(
       `/api/index/${encodeURIComponent(chat.id)}/tags/suggest?q=${encodeURIComponent(q)}&limit=12`
     );
-    state.tagSuggestItems = r.items || [];
+    state.tagSuggestItems = (r.items || []).filter(
+      (it) => it && it.tag && !isBlacklistedTag(it.tag)
+    );
     state.tagSuggestIndex = state.tagSuggestItems.length ? 0 : -1;
     // merge related into local map for offline expand
     for (const it of state.tagSuggestItems) {
       if (it.tag && Array.isArray(it.related) && it.related.length) {
         state.tagRelated = state.tagRelated || {};
-        state.tagRelated[it.tag] = it.related;
+        state.tagRelated[it.tag] = stripBlacklistedTags(it.related);
       }
     }
     renderTagSuggest();
@@ -2366,13 +2373,14 @@ async function refreshTagSuggest() {
     // local fallback filter
     const qq = q.toLowerCase();
     state.tagSuggestItems = (state.indexTags || [])
+      .filter((t) => t && t.tag && !isBlacklistedTag(t.tag))
       .filter((t) => !qq || String(t.tag).toLowerCase().includes(qq))
       .slice(0, 12)
       .map((t) => ({
         tag: t.tag,
         count: t.count,
-        related: lookupRelatedTags(t.tag),
-        related_count: lookupRelatedTags(t.tag).length,
+        related: stripBlacklistedTags(lookupRelatedTags(t.tag)),
+        related_count: stripBlacklistedTags(lookupRelatedTags(t.tag)).length,
       }));
     state.tagSuggestIndex = state.tagSuggestItems.length ? 0 : -1;
     renderTagSuggest();
@@ -5092,8 +5100,8 @@ function isDraftGroupApplied(names) {
 function resolveRelatedTagGroup(name) {
   const tag = normalizeTagName(name);
   if (!tag) return [];
-  // Blacklisted seed: never auto-expand partners
-  if (isBlacklistedTag(tag)) return [tag];
+  // Blacklisted tags cannot be applied / auto-expanded
+  if (isBlacklistedTag(tag)) return [];
 
   const key = tag.toLowerCase();
   const { clusters, isHub } = clusterRelatedBundles(state.tagPickerBundles || []);
@@ -5133,6 +5141,10 @@ function addDraftTag(name) {
   const draft = state.taskTagsDraft;
   const tag = normalizeTagName(name);
   if (!draft || !tag) return false;
+  if (isBlacklistedTag(tag)) {
+    toast(`#${tag} 在关联黑名单中，不能添加`, "err");
+    return false;
+  }
   ensureDraftGroups();
   const group = resolveRelatedTagGroup(tag);
   if (!group.length) return false;
@@ -5790,7 +5802,7 @@ function matchTagPickerSuggestions(query) {
   for (const item of state.tagPickerIndex || []) {
     const name = String(item.tag || "");
     const key = name.toLowerCase();
-    if (!key) continue;
+    if (!key || isBlacklistedTag(name)) continue;
     let score = -1;
     if (key === q) score = 300;
     else if (key.startsWith(q)) score = 200;

@@ -413,6 +413,18 @@ async def get_settings_defaults(_: None = Depends(require_web_auth)):
     }
 
 
+async def _filter_include_tags(tags: list) -> list:
+    """Drop relation-blacklist hubs so they cannot be applied as download filters."""
+    clean = normalize_tag_list(tags or [])
+    if not clean:
+        return []
+    try:
+        bl = {t.lower() for t in await db.get_tag_relation_blacklist()}
+    except Exception:
+        return clean
+    return [t for t in clean if t.lower() not in bl]
+
+
 def _task_payload_from_body(body: CreateTaskBody | BatchCreateBody, chat_id, title: str) -> dict:
     media = [m for m in body.media_types if m in DEFAULT_MEDIA]
     if not media:
@@ -469,6 +481,10 @@ async def create_task(body: CreateTaskBody, _: None = Depends(require_web_auth))
             title = str(body.chat_id)
 
     task = await db.create_task(_task_payload_from_body(body, body.chat_id, title))
+    filtered = await _filter_include_tags(task.get("include_tags") or [])
+    if filtered != normalize_tag_list(task.get("include_tags") or []):
+        await db.update_task(task["id"], include_tags=filtered)
+        task = await db.get_task(task["id"])
     if body.auto_start:
         await scheduler.start_task(task["id"])
         task = await db.get_task(task["id"])
@@ -491,6 +507,10 @@ async def create_tasks_batch(body: BatchCreateBody, _: None = Depends(require_we
             except Exception:
                 title = str(chat_id)
         task = await db.create_task(_task_payload_from_body(body, chat_id, title))
+        filtered = await _filter_include_tags(task.get("include_tags") or [])
+        if filtered != normalize_tag_list(task.get("include_tags") or []):
+            await db.update_task(task["id"], include_tags=filtered)
+            task = await db.get_task(task["id"])
         if body.auto_start:
             await scheduler.start_task(task["id"])
             task = await db.get_task(task["id"])
@@ -571,7 +591,7 @@ async def update_task_settings(
     log_bits: list[str] = []
 
     if body.include_tags is not None:
-        tags = normalize_tag_list(body.include_tags)
+        tags = await _filter_include_tags(body.include_tags)
         mode = "any"
         # Skip write when unchanged (common: only concurrency / delay / media).
         # Do NOT expand related into stored tags — worker expands at query time.
