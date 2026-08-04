@@ -1814,62 +1814,6 @@ class DownloadScheduler:
             ),
         )
 
-        # Retry failed first (same as sequential mode)
-        ok = await self._retry_failed_messages(
-            task_id=task_id,
-            chat_id=chat_id,
-            group_dir=group_dir,
-            media_types=media_types,
-            current_folder=current_folder,
-            use_text_as_folder=use_text_as_folder,
-            min_len=2,
-            album_captions=album_captions,
-            stop_event=stop_event,
-            counters=counters,
-            test_mode=test_mode,
-            test_deadline=test_deadline,
-            concurrency=concurrency,
-            file_formats=file_formats,
-            folder_mode=folder_mode,
-            delay_min=delay_min,
-            delay_max=delay_max,
-            max_messages=max_messages,
-            include_tags=include_tags,
-            caption_keywords=caption_keywords,
-            tag_match_mode=tag_match_mode,
-        )
-        processed = int(counters["processed"])
-        downloaded = int(counters["downloaded"])
-        failed = await self.db.count_failed(task_id)
-        skipped = int(counters["skipped"])
-        current_folder = counters.get("current_folder") or current_folder
-        if not ok:
-            await self.db.update_task(
-                task_id,
-                status="paused",
-                current_folder=current_folder,
-                processed_count=processed,
-                downloaded_count=downloaded,
-                failed_count=failed,
-                skipped_count=skipped,
-            )
-            return
-
-        if max_messages and downloaded >= max_messages:
-            await self.db.update_task(
-                task_id,
-                status="completed",
-                current_folder=current_folder,
-                processed_count=processed,
-                downloaded_count=downloaded,
-                failed_count=failed,
-                skipped_count=skipped,
-            )
-            await self.db.append_log(
-                task_id, f"已达上限 {max_messages} 个文件，任务完成"
-            )
-            return
-
         pool = self._new_download_pool(concurrency)
 
         async def _pause_and_return(reason: str) -> None:
@@ -1897,12 +1841,75 @@ class DownloadScheduler:
             if reason and reason not in ("任务已暂停", "监控已暂停"):
                 await self.db.append_log(task_id, reason)
 
+        # Enqueue .part/failed onto the SAME pool — do not drain before tag work,
+        # so idle lanes can take new-tag jobs while a resume is still running.
+        ok = await self._retry_failed_messages(
+            task_id=task_id,
+            chat_id=chat_id,
+            group_dir=group_dir,
+            media_types=media_types,
+            current_folder=current_folder,
+            use_text_as_folder=use_text_as_folder,
+            min_len=2,
+            album_captions=album_captions,
+            stop_event=stop_event,
+            counters=counters,
+            test_mode=test_mode,
+            test_deadline=test_deadline,
+            concurrency=concurrency,
+            file_formats=file_formats,
+            folder_mode=folder_mode,
+            delay_min=delay_min,
+            delay_max=delay_max,
+            max_messages=max_messages,
+            include_tags=include_tags,
+            caption_keywords=caption_keywords,
+            tag_match_mode=tag_match_mode,
+            pool=pool,
+        )
+        processed = int(counters["processed"])
+        downloaded = int(counters["downloaded"])
+        failed = await self.db.count_failed(task_id)
+        skipped = int(counters["skipped"])
+        current_folder = counters.get("current_folder") or current_folder
+        if not ok:
+            await _pause_and_return("任务已暂停")
+            return
+
+        if max_messages and downloaded >= max_messages:
+            if self._pool_busy(pool):
+                await self._pool_drain(
+                    pool,
+                    task_id=task_id,
+                    settings=settings,
+                    group_dir=group_dir,
+                    use_text_as_folder=use_text_as_folder,
+                    counters=counters,
+                    test_mode=test_mode,
+                )
+            await self.db.update_task(
+                task_id,
+                status="completed",
+                current_folder=current_folder,
+                processed_count=processed,
+                downloaded_count=downloaded,
+                failed_count=failed,
+                skipped_count=skipped,
+            )
+            await self.db.append_log(
+                task_id, f"已达上限 {max_messages} 个文件，任务完成"
+            )
+            return
+
         # Soft-reload loop: new tags mid-download keep the pool (and in-flight
         # file) alive so idle lanes can start the new tag immediately.
         reload_pass = 0
         while True:
             reload_pass += 1
-            if reload_pass > 1:
+            rebuilt_filters = False
+            # Rebuild when soft-reloading, or when tags changed during priority resume
+            if reload_pass > 1 or self.peek_filter_dirty(chat_id):
+                rebuilt_filters = True
                 fresh = await self.db.get_task(task_id) or {}
                 include_tags = normalize_tag_list(fresh.get("include_tags") or [])
                 caption_keywords = normalize_keyword_list(
@@ -2244,7 +2251,7 @@ class DownloadScheduler:
                 # After a soft-reload, leftover in-flight from the previous pass must
                 # not block feeding the newly added tag to idle lanes.
                 only_leftover = (
-                    reload_pass > 1
+                    rebuilt_filters
                     and self._pool_pending_count(pool) <= 0
                     and self._pool_active_message_ids(pool).issubset(skip_active)
                 )
@@ -4836,8 +4843,17 @@ class DownloadScheduler:
         include_tags: list | None = None,
         caption_keywords: list | None = None,
         tag_match_mode: str = "any",
+        pool: dict[str, Any] | None = None,
     ) -> bool:
-        """Return False if paused during retry."""
+        """Enqueue .part/failed resumes.
+
+        When ``pool`` is provided (monitor mode), jobs join that pool and this
+        method does **not** wait for them to finish — so new-tag work can fill
+        idle lanes immediately. Own-pool mode (sequential) still drains.
+
+        Return False if paused during retry.
+        """
+        _ = min_len
         settings = get_settings()
         file_formats = file_formats or []
         include_tags = include_tags or []
@@ -4852,25 +4868,60 @@ class DownloadScheduler:
             f"优先续传未完成消息 {len(failed_ids)} 条（.part/未完成 · 并发 {concurrency}）",
         )
         concurrency = max(1, min(5, int(concurrency or 1)))
+        shared = pool is not None
+        if pool is None:
+            pool = self._new_download_pool(concurrency)
 
         for chunk in _chunked(failed_ids, 80):
+            # Tag/settings changed → stop enqueueing resumes; caller feeds new work
+            if self.peek_filter_dirty(chat_id):
+                self._pool_drop_queued(pool)
+                await self.db.append_log(task_id, "设置已更新，跳过剩余续传排队")
+                break
+
             while True:
                 if stop_event.is_set():
+                    if not shared and self._pool_busy(pool):
+                        await self._pool_drain(
+                            pool,
+                            task_id=task_id,
+                            settings=settings,
+                            group_dir=group_dir,
+                            use_text_as_folder=use_text_as_folder,
+                            counters=counters,
+                            test_mode=test_mode,
+                            log_prefix="重试成功",
+                        )
                     return False
                 try:
                     messages = await client.get_messages(chat_id, ids=chunk)
                     break
                 except FloodWaitError as e:
                     if not await self._wait_flood(task_id, e.seconds, stop_event):
+                        if not shared and self._pool_busy(pool):
+                            await self._pool_drain(
+                                pool,
+                                task_id=task_id,
+                                settings=settings,
+                                group_dir=group_dir,
+                                use_text_as_folder=use_text_as_folder,
+                                counters=counters,
+                                test_mode=test_mode,
+                                log_prefix="重试成功",
+                            )
                         return False
 
             if not isinstance(messages, list):
                 messages = [messages]
 
-            pool = self._new_download_pool(concurrency)
             # Keep ids aligned — Telethon returns None for deleted messages
             for mid, message in zip(chunk, messages):
                 mid = int(mid)
+                if self.peek_filter_dirty(chat_id):
+                    self._pool_drop_queued(pool)
+                    await self.db.append_log(task_id, "设置已更新，跳过剩余续传排队")
+                    break
+
                 if self._pool_busy(pool) and await self._pool_reap(
                     pool,
                     task_id=task_id,
@@ -4882,19 +4933,20 @@ class DownloadScheduler:
                     log_prefix="重试成功",
                     wait=False,
                 ):
-                    await self._pool_drain(
-                        pool,
-                        task_id=task_id,
-                        settings=settings,
-                        group_dir=group_dir,
-                        use_text_as_folder=use_text_as_folder,
-                        counters=counters,
-                        test_mode=test_mode,
-                        log_prefix="重试成功",
-                    )
+                    if not shared:
+                        await self._pool_drain(
+                            pool,
+                            task_id=task_id,
+                            settings=settings,
+                            group_dir=group_dir,
+                            use_text_as_folder=use_text_as_folder,
+                            counters=counters,
+                            test_mode=test_mode,
+                            log_prefix="重试成功",
+                        )
                     return False
                 if stop_event.is_set() or self._test_time_up(test_deadline):
-                    if self._pool_busy(pool):
+                    if not shared and self._pool_busy(pool):
                         await self._pool_drain(
                             pool,
                             task_id=task_id,
@@ -4907,7 +4959,7 @@ class DownloadScheduler:
                         )
                     return False
                 if max_messages and int(counters.get("downloaded") or 0) >= max_messages:
-                    if self._pool_busy(pool):
+                    if not shared and self._pool_busy(pool):
                         await self._pool_drain(
                             pool,
                             task_id=task_id,
@@ -5030,49 +5082,62 @@ class DownloadScheduler:
                     delay_max=delay_max,
                     test_mode=test_mode,
                     log_prefix="重试成功",
+                    chat_id=chat_id,
                 )
                 if status == "paused":
-                    await self._pool_drain(
-                        pool,
-                        task_id=task_id,
-                        settings=settings,
-                        group_dir=group_dir,
-                        use_text_as_folder=use_text_as_folder,
-                        counters=counters,
-                        test_mode=test_mode,
-                        log_prefix="重试成功",
-                    )
+                    if not shared:
+                        await self._pool_drain(
+                            pool,
+                            task_id=task_id,
+                            settings=settings,
+                            group_dir=group_dir,
+                            use_text_as_folder=use_text_as_folder,
+                            counters=counters,
+                            test_mode=test_mode,
+                            log_prefix="重试成功",
+                        )
                     return False
+                if status == "reload":
+                    self._pool_drop_queued(pool)
+                    await self.db.append_log(task_id, "设置已更新，跳过剩余续传排队")
+                    break
                 if status == "limit":
-                    await self._pool_drain(
-                        pool,
-                        task_id=task_id,
-                        settings=settings,
-                        group_dir=group_dir,
-                        use_text_as_folder=use_text_as_folder,
-                        counters=counters,
-                        test_mode=test_mode,
-                        log_prefix="重试成功",
-                    )
+                    if not shared:
+                        await self._pool_drain(
+                            pool,
+                            task_id=task_id,
+                            settings=settings,
+                            group_dir=group_dir,
+                            use_text_as_folder=use_text_as_folder,
+                            counters=counters,
+                            test_mode=test_mode,
+                            log_prefix="重试成功",
+                        )
                     return True
+            else:
+                # shared pool: do not drain between chunks — tag backlog fills idle lanes
+                if shared:
+                    continue
+                if await self._pool_drain(
+                    pool,
+                    task_id=task_id,
+                    settings=settings,
+                    group_dir=group_dir,
+                    use_text_as_folder=use_text_as_folder,
+                    counters=counters,
+                    test_mode=test_mode,
+                    log_prefix="重试成功",
+                ):
+                    return False
+                continue
+            # inner break from filter/reload
+            break
 
-            if await self._pool_drain(
-                pool,
-                task_id=task_id,
-                settings=settings,
-                group_dir=group_dir,
-                use_text_as_folder=use_text_as_folder,
-                counters=counters,
-                test_mode=test_mode,
-                log_prefix="重试成功",
-            ):
-                return False
-
-        # Drop leftovers that became done / unmapped during this retry pass
-        try:
-            await self._cleanup_temp_for_group(task_id, chat_id, group_dir, quiet=True)
-        except Exception:
-            logger.debug("temp cleanup after retry failed", exc_info=True)
+        if not shared:
+            try:
+                await self._cleanup_temp_for_group(task_id, chat_id, group_dir, quiet=True)
+            except Exception:
+                logger.debug("temp cleanup after retry failed", exc_info=True)
         return True
 
     async def _download_with_retry(
