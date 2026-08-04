@@ -1136,7 +1136,7 @@ class DownloadScheduler:
                 if failed <= 0:
                     return
                 await self.db.append_log(
-                    task_id, f"定时自动重试 {failed} 条失败项"
+                    task_id, f"定时自动重试 {failed} 条未完成项"
                 )
                 await self.start_task(task_id)
             except Exception:
@@ -2508,15 +2508,15 @@ class DownloadScheduler:
                         await self.db.append_log(
                             task_id,
                             f"队列仍有 {pending} 条"
-                            + (f"·失败 {failed_n}" if failed_n else "")
+                            + (f"·未完成 {failed_n}" if failed_n else "")
                             + f"，待命约 {wait_m} 分钟后自动重试",
                         )
                 else:
                     if sticky is not None and cooldown_ok and not bumped:
                         await self.db.append_log(
                             task_id,
-                            f"定时自动重试失败/待补项"
-                            + (f"（失败 {failed_n}）" if failed_n else ""),
+                            f"定时自动重试未完成/待补项"
+                            + (f"（未完成 {failed_n}）" if failed_n else ""),
                         )
                     if pending > 0 or failed_n > 0:
                         self._gap_pending_sticky[task_id] = int(pending or failed_n)
@@ -2528,7 +2528,7 @@ class DownloadScheduler:
                     if pending > 0:
                         gap_msg = f"待补下 {pending} 条"
                     elif failed_n > 0:
-                        gap_msg = f"重试失败 {failed_n} 条"
+                        gap_msg = f"重试未完成 {failed_n} 条"
                     else:
                         gap_msg = "索引已更新"
                     await self.db.append_log(task_id, gap_msg)
@@ -3248,11 +3248,11 @@ class DownloadScheduler:
                 downloaded_count=downloaded,
                 failed_count=failed,
                 skipped_count=skipped,
-                last_error=f"{failed} 条失败待重试",
+                last_error=f"{failed} 条未完成待重试",
             )
             await self.db.append_log(
                 task_id,
-                f"仍有 {failed} 条失败，已暂停；将定时自动重试，也可手动继续",
+                f"仍有 {failed} 条未完成，已暂停；将定时自动重试，也可手动继续",
             )
             self._schedule_failed_retry(int(task_id))
 
@@ -4306,7 +4306,7 @@ class DownloadScheduler:
             return True
 
         await self.db.append_log(
-            task_id, f"优先重试失败消息 {len(failed_ids)} 条（并发 {concurrency}）"
+            task_id, f"优先重试未完成消息 {len(failed_ids)} 条（并发 {concurrency}）"
         )
         concurrency = max(1, min(5, int(concurrency or 1)))
 
