@@ -2436,6 +2436,61 @@ class Database:
             rows = await cur.fetchall()
         return [str(r["caption"] or "") for r in rows if r["caption"]]
 
+    async def infer_nearby_year(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        *,
+        window: int = 120,
+        limit: int = 40,
+    ) -> tuple[Optional[int], list[str]]:
+        """
+        Infer calendar year from nearby index rows when filenames have no year.
+
+        Returns (year, nearby_caption_texts) — year from msg_date / caption text
+        of the closest messages by message_id.
+        """
+        from app.organizer import extract_years_from_text
+
+        chat_id = str(chat_id)
+        mid = int(message_id)
+        lo = max(0, mid - int(window))
+        hi = mid + int(window)
+        async with self.conn.execute(
+            """
+            SELECT message_id, caption, msg_date
+            FROM chat_media_index
+            WHERE chat_id = ? AND message_id BETWEEN ? AND ?
+            ORDER BY ABS(message_id - ?) ASC
+            LIMIT ?
+            """,
+            (chat_id, lo, hi, mid, max(1, int(limit))),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        nearby_texts: list[str] = []
+        best_year: Optional[int] = None
+        for r in rows:
+            cap = str(r["caption"] or "")
+            if cap.strip():
+                nearby_texts.append(cap)
+            # Prefer explicit year in caption
+            ys = extract_years_from_text(cap)
+            if ys and best_year is None:
+                best_year = ys[0]
+                continue
+            raw = r["msg_date"]
+            if best_year is None and raw:
+                try:
+                    s = str(raw).replace("Z", "+00:00")
+                    # 2026-04-11T... or date-only
+                    y = int(s[:4])
+                    if 2000 <= y <= 2100:
+                        best_year = y
+                except (TypeError, ValueError):
+                    pass
+        return best_year, nearby_texts
+
     async def rewrite_file_paths_dir_move(
         self, src_dir: Path | str, dst_dir: Path | str
     ) -> int:

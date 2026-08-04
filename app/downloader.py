@@ -1987,6 +1987,14 @@ class DownloadScheduler:
                         album_batches=album_batches,
                         caption_batches=caption_batches,
                     )
+                    hint_year = None
+                    nearby_texts: list[str] = []
+                    try:
+                        hint_year, nearby_texts = await self.db.infer_nearby_year(
+                            chat_id, message.id
+                        )
+                    except Exception:
+                        logger.debug("infer_nearby_year failed", exc_info=True)
                     subdir = resolve_media_subdir(
                         message,
                         album_captions=album_captions,
@@ -1997,6 +2005,8 @@ class DownloadScheduler:
                         tag_folder_map=counters.get("tag_folder_map") or None,
                         tag_blacklist=counters.get("tag_blacklist") or None,
                         batch_filenames=batch_names,
+                        hint_year=hint_year,
+                        nearby_texts=nearby_texts,
                     )
                     filename = build_filename(
                         message,

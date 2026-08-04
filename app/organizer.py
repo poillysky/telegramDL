@@ -255,6 +255,11 @@ def extract_date_token(text: str) -> Optional[str]:
 _FILENAME_YMD_RE = re.compile(
     r"(?<!\d)(20\d{2})[._\- ]?(0[1-9]|1[0-2])[._\- ]?(0[1-9]|[12]\d|3[01])(?!\d)"
 )
+_FILENAME_YEAR_CN_RE = re.compile(r"(?<!\d)(20\d{2})\s*年")
+_FILENAME_YEAR_RE = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
+# Year already on a folder/token part: 2026.7.11
+_YEAR_MD_PART_RE = re.compile(r"^(20\d{2})\.(\d{1,2})\.(\d{1,2})$")
+_MD_PART_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})$")
 
 
 def extract_ymd_from_filename(name: Optional[str]) -> Optional[tuple[int, int, int]]:
@@ -270,31 +275,42 @@ def extract_ymd_from_filename(name: Optional[str]) -> Optional[tuple[int, int, i
     return None
 
 
-def format_ymd_token(year: int, month: int, day: int) -> str:
-    return f"{int(year)}.{int(month)}.{int(day)}"
+def extract_years_from_filename(name: Optional[str]) -> list[int]:
+    """Years found in a filename (YMD first, then 年 / bare 20xx)."""
+    if not name:
+        return []
+    stem = str(name).strip()
+    out: list[int] = []
+    seen: set[int] = set()
+
+    def _add(y: int) -> None:
+        if 2000 <= y <= 2100 and y not in seen:
+            seen.add(y)
+            out.append(y)
+
+    ymd = extract_ymd_from_filename(stem)
+    if ymd:
+        _add(ymd[0])
+    for m in _FILENAME_YEAR_CN_RE.finditer(stem):
+        _add(int(m.group(1)))
+    for m in _FILENAME_YEAR_RE.finditer(stem):
+        y = int(m.group(1))
+        if 2010 <= y <= 2039:
+            _add(y)
+    return out
 
 
-def date_token_from_filenames(names: Iterable[Optional[str]]) -> Optional[str]:
-    """
-    Earliest~latest YMD from filenames.
-    One day →「2025.7.11」; span →「2025.7.11-2025.7.14」.
-    """
-    dates: list[tuple[int, int, int]] = []
+def years_from_filenames(names: Iterable[Optional[str]]) -> list[int]:
+    from collections import Counter
+
+    c: Counter[int] = Counter()
     for n in names or []:
-        ymd = extract_ymd_from_filename(n)
-        if ymd:
-            dates.append(ymd)
-    if not dates:
-        return None
-    dates.sort()
-    lo, hi = dates[0], dates[-1]
-    if lo == hi:
-        return format_ymd_token(*lo)
-    return f"{format_ymd_token(*lo)}-{format_ymd_token(*hi)}"
+        for y in extract_years_from_filename(n):
+            c[y] += 1
+    return [y for y, _ in c.most_common()]
 
 
-def date_token_from_dir(dir_path: Path, *, sample: int = 80) -> Optional[str]:
-    """YMD range from file names inside a folder."""
+def years_from_dir(dir_path: Path, *, sample: int = 80) -> list[int]:
     names: list[str] = []
     try:
         for p in dir_path.iterdir():
@@ -303,8 +319,163 @@ def date_token_from_dir(dir_path: Path, *, sample: int = 80) -> Optional[str]:
             if len(names) >= sample:
                 break
     except OSError:
+        return []
+    return years_from_filenames(names)
+
+
+def extract_years_from_text(text: Optional[str]) -> list[int]:
+    """Years mentioned in caption / nearby 文案 (2026年 / 2026.7.11 / bare 20xx)."""
+    if not text:
+        return []
+    s = str(text)
+    out: list[int] = []
+    seen: set[int] = set()
+
+    def _add(y: int) -> None:
+        if 2000 <= y <= 2100 and y not in seen:
+            seen.add(y)
+            out.append(y)
+
+    for m in re.finditer(r"(?<!\d)(20\d{2})\s*年", s):
+        _add(int(m.group(1)))
+    for m in re.finditer(
+        r"(?<!\d)(20\d{2})\.(\d{1,2})\.(\d{1,2})(?!\d)", s
+    ):
+        _add(int(m.group(1)))
+    for m in re.finditer(r"(?<!\d)(20\d{2})(?!\d)", s):
+        y = int(m.group(1))
+        if 2010 <= y <= 2039:
+            _add(y)
+    return out
+
+
+def parse_md_part(part: str) -> Optional[tuple[Optional[int], int, int]]:
+    """Parse「2026.7.11」or「7.11」→ (year|None, month, day)."""
+    part = (part or "").strip()
+    m = _YEAR_MD_PART_RE.match(part)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if _valid_month_day(mo, d):
+            return y, mo, d
         return None
-    return date_token_from_filenames(names)
+    m = _MD_PART_RE.match(part)
+    if m:
+        mo, d = int(m.group(1)), int(m.group(2))
+        if _valid_month_day(mo, d):
+            return None, mo, d
+    return None
+
+
+def strip_years_from_date_token(token: Optional[str]) -> Optional[str]:
+    """2026.7.11-2026.7.14 → 7.11-7.14；2026.7.11 → 7.11."""
+    if not token:
+        return token
+    if "-" in token:
+        left, right = token.split("-", 1)
+        pl, pr = parse_md_part(left), parse_md_part(right)
+        if not pl or not pr:
+            return token
+        return f"{pl[1]}.{pl[2]}-{pr[1]}.{pr[2]}"
+    p = parse_md_part(token)
+    if not p:
+        return token
+    return f"{p[1]}.{p[2]}"
+
+
+def apply_years_to_caption_date(
+    token: Optional[str],
+    years: Optional[Iterable[int]] = None,
+    *,
+    fallback_year: Optional[int] = None,
+) -> Optional[str]:
+    """
+    Month/day from caption token; year(s) from files / hint.
+
+    Cross-year caption「12.20-1.5」+ year 2025 →「2025.12.20-2026.1.5」.
+    Multi-year files on a cross-year span use min→max.
+    """
+    if not token:
+        return None
+    bare = strip_years_from_date_token(token) or token
+    ys = sorted(
+        {
+            int(y)
+            for y in (years or [])
+            if y is not None and 2000 <= int(y) <= 2100
+        }
+    )
+    if not ys and fallback_year is not None and 2000 <= int(fallback_year) <= 2100:
+        ys = [int(fallback_year)]
+    if not ys:
+        return bare
+
+    if "-" not in bare:
+        p = parse_md_part(bare)
+        if not p:
+            return bare
+        _y0, mo, d = p
+        return f"{ys[0]}.{mo}.{d}"
+
+    left, right = bare.split("-", 1)
+    pl, pr = parse_md_part(left), parse_md_part(right)
+    if not pl or not pr:
+        return bare
+    _a, lm, ld = pl
+    _b, rm, rd = pr
+    cross = (rm, rd) < (lm, ld)
+    if cross:
+        if len(ys) >= 2:
+            y1, y2 = ys[0], ys[-1]
+            if y2 <= y1:
+                y2 = y1 + 1
+        else:
+            y1 = ys[0]
+            y2 = y1 + 1
+    else:
+        y1 = y2 = ys[0]
+    return f"{y1}.{lm}.{ld}-{y2}.{rm}.{rd}"
+
+
+def resolve_caption_date_token(
+    caption: str,
+    filenames: Optional[Iterable[Optional[str]]] = None,
+    *,
+    hint_year: Optional[int] = None,
+    nearby_texts: Optional[Iterable[str]] = None,
+) -> Optional[str]:
+    """
+    月日 ← 文案；年 ← 文件名；无年则附近文案 / hint 推算。
+    """
+    md = extract_date_token(caption or "")
+    if not md:
+        return None
+    years = years_from_filenames(filenames or [])
+    # Caption itself may carry a year
+    years = list(dict.fromkeys(years + extract_years_from_text(caption)))
+    fallback = hint_year
+    if not years and not fallback:
+        for t in nearby_texts or []:
+            near = extract_years_from_text(t)
+            if near:
+                fallback = near[0]
+                break
+    return apply_years_to_caption_date(md, years, fallback_year=fallback)
+
+
+def date_token_from_dir(
+    dir_path: Path,
+    *,
+    caption_hint: Optional[str] = None,
+    sample: int = 80,
+) -> Optional[str]:
+    """Rebuild folder date: MD from dir name/caption mapping hint + years from files."""
+    md = strip_years_from_date_token(dir_path.name)
+    if caption_hint:
+        cap_md = extract_date_token(caption_hint)
+        if cap_md:
+            md = strip_years_from_date_token(cap_md) or cap_md
+    years = years_from_dir(dir_path, sample=sample)
+    return apply_years_to_caption_date(md, years)
 
 
 def build_caption_batch_filenames(
@@ -1122,8 +1293,12 @@ def migrate_legacy_date_dirs(
             continue
         pull = child.name in aliases
         if not pull and looks_like_date_folder(child.name):
-            # Same batch already partially under a different date name
-            pull = date_token_from_dir(child) == canonical
+            # Same MD (ignoring year) or rebuilt token equals canonical
+            rebuilt = date_token_from_dir(child, caption_hint=caption)
+            pull = rebuilt == canonical or (
+                strip_years_from_date_token(child.name)
+                == strip_years_from_date_token(canonical)
+            )
         if not pull:
             continue
         try:
@@ -1172,13 +1347,27 @@ def repair_date_folders(
         if not date_dirs:
             continue
 
-        # preferred target per dir
+        # preferred: 月日←文案映射/夹名，年←夹内文件名
         preferred: dict[Path, str] = {}
+        sibling_years: list[int] = []
         for child in date_dirs:
-            file_token = date_token_from_dir(child)
-            preferred[child] = (
-                file_token or mapping.get(child.name) or child.name
+            sibling_years.extend(extract_years_from_text(child.name))
+            sibling_years.extend(years_from_dir(child, sample=20))
+        sibling_year = sibling_years[0] if sibling_years else None
+        for child in date_dirs:
+            md = mapping.get(child.name) or strip_years_from_date_token(child.name)
+            if not md:
+                md = child.name
+            # If mapping expands start-only → range, prefer that MD
+            md = mapping.get(child.name) or mapping.get(
+                strip_years_from_date_token(child.name) or ""
+            ) or md
+            years = years_from_dir(child)
+            token = apply_years_to_caption_date(
+                md, years, fallback_year=sibling_year
             )
+            preferred[child] = token or child.name
+
 
         # Group sources by canonical target; pull caption/file aliases too
         from collections import defaultdict
@@ -1204,13 +1393,14 @@ def repair_date_folders(
                     target_name,
                     preferred.get(child),
                 ):
-                    # If child prefers a different *file* YMD span, don't steal it
                     child_pref = preferred.get(child) or child.name
-                    child_file = date_token_from_dir(child)
-                    if child_file and child_file != target_name:
-                        # unless child's name is explicit alias of target
-                        if child.name not in aliases:
-                            continue
+                    if (
+                        child_pref != target_name
+                        and child.name not in aliases
+                        and strip_years_from_date_token(child_pref)
+                        != strip_years_from_date_token(target_name)
+                    ):
+                        continue
                     sources.append(child)
                     aliases |= date_folder_legacy_aliases(child_pref)
                     aliases.add(child.name)
@@ -1218,11 +1408,16 @@ def repair_date_folders(
             # Include any remaining alias-named dirs under parent
             for child in date_dirs:
                 if child not in sources and child.name in aliases:
-                    child_file = date_token_from_dir(child)
-                    if child_file and child_file != target_name:
-                        if child.name not in date_folder_legacy_aliases(target_name):
-                            continue
+                    child_pref = preferred.get(child) or child.name
+                    if (
+                        child_pref != target_name
+                        and strip_years_from_date_token(child_pref)
+                        != strip_years_from_date_token(target_name)
+                        and child.name not in date_folder_legacy_aliases(target_name)
+                    ):
+                        continue
                     sources.append(child)
+
 
             dst = parent / target_name
             # Dedupe sources
@@ -1329,12 +1524,14 @@ def resolve_media_subdir(
     caption_override: Optional[str] = None,
     tag_blacklist: Optional[Iterable[str]] = None,
     batch_filenames: Optional[Iterable[str]] = None,
+    hint_year: Optional[int] = None,
+    nearby_texts: Optional[Iterable[str]] = None,
 ) -> str:
     """
     Resolve relative folder under group dir.
 
     folder_mode:
-      - caption: #tags + date (file YMD range first, else 文案)
+      - caption: #tags + date（月日←文案，年←文件名 / 附近文案）
       - media_type: photo/video/...
       - flat: no subfolder (files directly under group dir)
     """
@@ -1358,15 +1555,31 @@ def resolve_media_subdir(
         caption_override=caption_override,
     )
     tags = extract_tags(combined)
-    # 1) 这批文件名有年月日 → 最早~最晚；2) 否则回退文案日期
     names = list(batch_filenames) if batch_filenames is not None else []
     if not names:
         fn = _original_filename(message)
         if fn:
             names = [fn]
-    date_token = date_token_from_filenames(names)
-    if not date_token:
-        date_token = extract_date_token(combined)
+    # Also peek sibling year-prefixed date folders under the tag dir
+    disk_hint = hint_year
+    if disk_hint is None and group_dir and group_dir.is_dir() and tags:
+        try:
+            for p in group_dir.iterdir():
+                if not p.is_dir() or not looks_like_date_folder(p.name):
+                    # tag folders — look one level down later via nearby
+                    continue
+                ys = extract_years_from_text(p.name)
+                if ys:
+                    disk_hint = ys[0]
+                    break
+        except OSError:
+            pass
+    date_token = resolve_caption_date_token(
+        combined,
+        names,
+        hint_year=disk_hint if hint_year is None else hint_year,
+        nearby_texts=nearby_texts,
+    )
     if date_token:
         date_token = sanitize_name(date_token, max_len=40)
 
