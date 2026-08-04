@@ -89,6 +89,21 @@ def _chunked(items: list[int], size: int = 80):
         yield items[i : i + size]
 
 
+def _interleave_tag_message_ids(
+    per_tag_ids: list[tuple[str | None, list[int]]],
+) -> list[int]:
+    """Round-robin merge so selected tags share the download pool together."""
+    queues = [list(ids) for _, ids in per_tag_ids if ids]
+    if len(queues) <= 1:
+        return list(queues[0]) if queues else []
+    out: list[int] = []
+    while any(queues):
+        for q in queues:
+            if q:
+                out.append(q.pop(0))
+    return out
+
+
 class DownloadScheduler:
     def __init__(self, database: Database | None = None):
         self.db = database or db
@@ -1783,8 +1798,8 @@ class DownloadScheduler:
             # Related expansion is OR-semantics
             include_tags = expanded_tags
 
-        # Per-tag backlog: finish one tag completely before the next.
-        # Order within a tag follows index_order_by (default: 先入库先下载).
+        # All selected tags share one backlog (round-robin) — not one-tag-at-a-time.
+        # Order within each tag still follows index_order_by (default: 先入库先下载).
         tag_passes: list[str | None] = (
             list(include_tags) if include_tags else [None]
         )
@@ -1803,12 +1818,12 @@ class DownloadScheduler:
             for mid in ids:
                 seen_ids.add(mid)
             per_tag_ids.append((tag, ids))
-        message_ids = [mid for _, ids in per_tag_ids for mid in ids]
-        tag_n = len([t for t, _ in per_tag_ids if t])
+        message_ids = _interleave_tag_message_ids(per_tag_ids)
+        tag_n = len([t for t, ids in per_tag_ids if t and ids])
         await self.db.append_log(
             task_id,
             (
-                f"索引命中 {len(message_ids)} 条 · 按 {tag_n} 个标签依次下载"
+                f"索引命中 {len(message_ids)} 条 · {tag_n} 个标签并行补下"
                 if include_tags
                 else f"索引命中 {len(message_ids)} 条 · 先补历史再监控"
             ),
@@ -1906,10 +1921,8 @@ class DownloadScheduler:
         reload_pass = 0
         while True:
             reload_pass += 1
-            rebuilt_filters = False
             # Rebuild when soft-reloading, or when tags changed during priority resume
             if reload_pass > 1 or self.peek_filter_dirty(chat_id):
-                rebuilt_filters = True
                 fresh = await self.db.get_task(task_id) or {}
                 include_tags = normalize_tag_list(fresh.get("include_tags") or [])
                 caption_keywords = normalize_keyword_list(
@@ -1958,27 +1971,74 @@ class DownloadScheduler:
                     for mid in ids:
                         seen_ids.add(mid)
                     per_tag_ids.append((tag, ids))
-                message_ids = [mid for _, ids in per_tag_ids for mid in ids]
+                message_ids = _interleave_tag_message_ids(per_tag_ids)
                 self.consume_filter_dirty(chat_id)
+                tag_n = len([t for t, ids in per_tag_ids if t and ids])
                 await self.db.append_log(
                     task_id,
-                    f"按新标签补下 · 索引命中 {len(message_ids)} 条",
+                    f"按新标签并行补下 · 索引命中 {len(message_ids)} 条"
+                    + (f" · {tag_n} 个标签" if tag_n else ""),
                 )
 
             soft_reload = False
             skip_active = self._pool_active_message_ids(pool)
-            for tag, tag_message_ids in per_tag_ids:
-                if soft_reload:
-                    break
-                if not tag_message_ids:
-                    continue
-                if tag:
-                    await self.db.append_log(
-                        task_id,
-                        f"下载标签 #{tag} · {len(tag_message_ids)} 条",
+            for chunk in _chunked(message_ids, 80):
+                if stop_event.is_set() or self._test_time_up(test_deadline):
+                    reason = (
+                        "测试模式时间到，已停止（未下完整文件）"
+                        if self._test_time_up(test_deadline)
+                        and not stop_event.is_set()
+                        else "任务已暂停"
                     )
+                    await _pause_and_return(reason)
+                    return
 
-                for chunk in _chunked(tag_message_ids, 80):
+                # New tags/settings: keep in-flight file; idle lanes take new work
+                if self.peek_filter_dirty(chat_id):
+                    self.consume_filter_dirty(chat_id)
+                    self._pool_drop_queued(pool)
+                    await self.db.append_log(task_id, "设置已更新，切换补下")
+                    soft_reload = True
+                    break
+
+                captions_map = await self.db.get_index_captions(chat_id, chunk)
+
+                while True:
+                    if stop_event.is_set():
+                        await _pause_and_return("任务已暂停")
+                        return
+                    try:
+                        messages = await client.get_messages(chat_id, ids=chunk)
+                        break
+                    except FloodWaitError as e:
+                        if not await self._wait_flood(task_id, e.seconds, stop_event):
+                            await _pause_and_return("任务已暂停")
+                            return
+
+                if not isinstance(messages, list):
+                    messages = [messages]
+
+                # Preserve order of chunk (get_messages may reorder)
+                by_id = {m.id: m for m in messages if m}
+                ordered = [by_id[i] for i in chunk if i in by_id]
+                album_batches, caption_batches = build_caption_batch_filenames(
+                    ordered, captions_map
+                )
+
+                for message in ordered:
+                    if self._pool_busy(pool) and await self._pool_reap(
+                        pool,
+                        task_id=task_id,
+                        settings=settings,
+                        group_dir=group_dir,
+                        use_text_as_folder=use_text_as_folder,
+                        counters=counters,
+                        test_mode=test_mode,
+                        wait=False,
+                    ):
+                        await _pause_and_return("任务已暂停")
+                        return
+
                     if stop_event.is_set() or self._test_time_up(test_deadline):
                         reason = (
                             "测试模式时间到，已停止（未下完整文件）"
@@ -1989,287 +2049,20 @@ class DownloadScheduler:
                         await _pause_and_return(reason)
                         return
 
-                    # New tags/settings: keep in-flight file; idle lanes take new work
-                    if self.peek_filter_dirty(chat_id):
-                        self.consume_filter_dirty(chat_id)
-                        self._pool_drop_queued(pool)
-                        await self.db.append_log(task_id, "设置已更新，切换补下")
-                        soft_reload = True
-                        break
-
-                    captions_map = await self.db.get_index_captions(chat_id, chunk)
-
-                    while True:
-                        if stop_event.is_set():
-                            await _pause_and_return("任务已暂停")
-                            return
-                        try:
-                            messages = await client.get_messages(chat_id, ids=chunk)
-                            break
-                        except FloodWaitError as e:
-                            if not await self._wait_flood(task_id, e.seconds, stop_event):
-                                await _pause_and_return("任务已暂停")
-                                return
-
-                    if not isinstance(messages, list):
-                        messages = [messages]
-
-                    # Preserve order of chunk (get_messages may reorder)
-                    by_id = {m.id: m for m in messages if m}
-                    ordered = [by_id[i] for i in chunk if i in by_id]
-                    album_batches, caption_batches = build_caption_batch_filenames(
-                        ordered, captions_map
-                    )
-
-                    for message in ordered:
-                        if self._pool_busy(pool) and await self._pool_reap(
-                            pool,
-                            task_id=task_id,
-                            settings=settings,
-                            group_dir=group_dir,
-                            use_text_as_folder=use_text_as_folder,
-                            counters=counters,
-                            test_mode=test_mode,
-                            wait=False,
-                        ):
-                            await _pause_and_return("任务已暂停")
-                            return
-
-                        if stop_event.is_set() or self._test_time_up(test_deadline):
-                            reason = (
-                                "测试模式时间到，已停止（未下完整文件）"
-                                if self._test_time_up(test_deadline)
-                                and not stop_event.is_set()
-                                else "任务已暂停"
+                    if max_messages and int(counters["downloaded"]) >= max_messages:
+                        if self._pool_busy(pool):
+                            await self._pool_drain(
+                                pool,
+                                task_id=task_id,
+                                settings=settings,
+                                group_dir=group_dir,
+                                use_text_as_folder=use_text_as_folder,
+                                counters=counters,
+                                test_mode=test_mode,
                             )
-                            await _pause_and_return(reason)
-                            return
-
-                        if max_messages and int(counters["downloaded"]) >= max_messages:
-                            if self._pool_busy(pool):
-                                await self._pool_drain(
-                                    pool,
-                                    task_id=task_id,
-                                    settings=settings,
-                                    group_dir=group_dir,
-                                    use_text_as_folder=use_text_as_folder,
-                                    counters=counters,
-                                    test_mode=test_mode,
-                                )
-                            await self.db.update_task(
-                                task_id,
-                                status="completed",
-                                current_folder=counters.get("current_folder")
-                                or current_folder,
-                                last_message_id=int(counters.get("last_id") or 0),
-                                processed_count=int(counters["processed"]),
-                                downloaded_count=int(counters["downloaded"]),
-                                failed_count=await self.db.count_failed(task_id),
-                                skipped_count=int(counters["skipped"]),
-                            )
-                            await self.db.append_log(
-                                task_id, f"已达上限 {max_messages} 个文件，任务完成"
-                            )
-                            return
-
-                        if await self.db.is_message_done(task_id, message.id):
-                            # Already counted on first pass — don't inflate 跳过 on pause/续跑
-                            counters["last_id"] = message.id
-                            continue
-
-                        # Already downloading on another lane after soft-reload
-                        if int(message.id) in skip_active:
-                            counters["last_id"] = message.id
-                            continue
-
-                        if not has_media(message):
-                            await self.db.mark_message(
-                                task_id, message.id, status="done"
-                            )
-                            counters["last_id"] = message.id
-                            counters["processed"] = int(counters["processed"]) + 1
-                            counters["skipped"] = int(counters["skipped"]) + 1
-                            continue
-
-                        media_type = detect_media_type(message)
-                        if media_type == "sticker":
-                            media_type = "document"
-                        if not media_type or media_type not in media_types:
-                            await self.db.mark_message(
-                                task_id, message.id, status="done"
-                            )
-                            counters["last_id"] = message.id
-                            counters["processed"] = int(counters["processed"]) + 1
-                            counters["skipped"] = int(counters["skipped"]) + 1
-                            continue
-
-                        if not self._passes_file_filters(
-                            task_id, message, media_type
-                        ):
-                            await self.db.mark_message(
-                                task_id, message.id, status="done"
-                            )
-                            counters["last_id"] = message.id
-                            counters["processed"] = int(counters["processed"]) + 1
-                            counters["skipped"] = int(counters["skipped"]) + 1
-                            continue
-
-                        indexed_caption = captions_map.get(message.id, "")
-                        caption = await self._ensure_caption(
-                            client,
-                            chat_id,
-                            message,
-                            album_captions,
-                            caption_override=indexed_caption or None,
-                        )
-                        tags = extract_tags(caption or "")
-                        batch_names = batch_filenames_for_message(
-                            message,
-                            caption=caption or "",
-                            album_batches=album_batches,
-                            caption_batches=caption_batches,
-                        )
-                        hint_year = None
-                        nearby_texts: list[str] = []
-                        try:
-                            hint_year, nearby_texts = await self.db.infer_nearby_year(
-                                chat_id, message.id
-                            )
-                        except Exception:
-                            logger.debug("infer_nearby_year failed", exc_info=True)
-                        subdir = resolve_media_subdir(
-                            message,
-                            album_captions=album_captions,
-                            use_caption_folders=use_text_as_folder,
-                            group_dir=group_dir if use_text_as_folder else None,
-                            folder_mode=folder_mode,
-                            caption_override=caption or None,
-                            tag_folder_map=counters.get("tag_folder_map") or None,
-                            tag_blacklist=counters.get("tag_blacklist") or None,
-                            batch_filenames=batch_names,
-                            hint_year=hint_year,
-                            nearby_texts=nearby_texts,
-                        )
-                        filename = build_filename(
-                            message,
-                            media_type,
-                            album_captions=album_captions,
-                            caption=caption,
-                        )
-                        rel_dir = subdir if subdir is not None else "_未分类"
-                        target_dir = group_dir / rel_dir if rel_dir else group_dir
-                        target_dir.mkdir(parents=True, exist_ok=True)
-                        # New date folder name → pull leftover files from old date dirs
-                        await self._sync_legacy_date_dir(
-                            task_id, target_dir, caption=caption or ""
-                        )
-                        if counters.get("current_folder") != (rel_dir or "."):
-                            await self.db.append_log(
-                                task_id, f"目录: {rel_dir or '（群根目录）'}"
-                            )
-                        counters["current_folder"] = rel_dir or "."
-
-                        existing = await self._skip_if_already_downloaded(
-                            task_id=task_id,
-                            chat_id=chat_id,
-                            message=message,
-                            target_dir=target_dir,
-                            filename=filename,
-                            settings=settings,
-                        )
-                        if existing is not None:
-                            counters["last_id"] = message.id
-                            counters["processed"] = int(counters["processed"]) + 1
-                            counters["downloaded"] = int(counters["downloaded"]) + 1
-                            try:
-                                rel = existing.relative_to(settings.download_dir)
-                            except ValueError:
-                                rel = existing
-                            await self.db.append_log(
-                                task_id, f"队列已处理，跳过: {rel}"
-                            )
-                            await self.db.update_task(
-                                task_id,
-                                current_folder=counters["current_folder"],
-                                last_message_id=message.id,
-                                processed_count=int(counters["processed"]),
-                                downloaded_count=int(counters["downloaded"]),
-                                failed_count=await self.db.count_failed(task_id),
-                                skipped_count=int(counters["skipped"]),
-                            )
-                            continue
-
-                        target_path, _ = resolve_download_path(
-                            target_dir,
-                            filename,
-                            message.id,
-                            self._expected_size(message),
-                        )
-                        job = DownloadJob(
-                            message=message,
-                            message_id=message.id,
-                            target_path=target_path,
-                            caption=caption or "",
-                            media_type=media_type,
-                            rel_dir=rel_dir or "",
-                            tags=tags,
-                        )
-                        status = await self._pool_submit(
-                            pool,
-                            job,
-                            task_id=task_id,
-                            stop_event=stop_event,
-                            settings=settings,
-                            group_dir=group_dir,
-                            use_text_as_folder=use_text_as_folder,
-                            counters=counters,
-                            concurrency=concurrency,
-                            max_messages=max_messages,
-                            delay_min=delay_min,
-                            delay_max=delay_max,
-                            test_mode=test_mode,
-                            chat_id=chat_id,
-                        )
-                        if status == "paused":
-                            await _pause_and_return("任务已暂停")
-                            return
-                        if status == "reload":
-                            self.consume_filter_dirty(chat_id)
-                            self._pool_drop_queued(pool)
-                            await self.db.append_log(task_id, "设置已更新，切换补下")
-                            soft_reload = True
-                            break
-                        counters["last_id"] = message.id
-
-                    if soft_reload:
-                        break
-
-                if soft_reload:
-                    break
-
-                # Finish current tag work before next tag; interrupt if tags change.
-                # After a soft-reload, leftover in-flight from the previous pass must
-                # not block feeding the newly added tag to idle lanes.
-                only_leftover = (
-                    rebuilt_filters
-                    and self._pool_pending_count(pool) <= 0
-                    and self._pool_active_message_ids(pool).issubset(skip_active)
-                )
-                if self._pool_has_download_work(pool) and not only_leftover:
-                    outcome = await self._pool_wait_work_done(
-                        pool,
-                        task_id=task_id,
-                        settings=settings,
-                        group_dir=group_dir,
-                        use_text_as_folder=use_text_as_folder,
-                        counters=counters,
-                        test_mode=test_mode,
-                        chat_id=chat_id,
-                    )
-                    if outcome == "paused":
                         await self.db.update_task(
                             task_id,
-                            status="paused",
+                            status="completed",
                             current_folder=counters.get("current_folder")
                             or current_folder,
                             last_message_id=int(counters.get("last_id") or 0),
@@ -2278,17 +2071,183 @@ class DownloadScheduler:
                             failed_count=await self.db.count_failed(task_id),
                             skipped_count=int(counters["skipped"]),
                         )
+                        await self.db.append_log(
+                            task_id, f"已达上限 {max_messages} 个文件，任务完成"
+                        )
                         return
-                    if outcome == "filter":
+
+                    if await self.db.is_message_done(task_id, message.id):
+                        # Already counted on first pass — don't inflate 跳过 on pause/续跑
+                        counters["last_id"] = message.id
+                        continue
+
+                    # Already downloading on another lane after soft-reload
+                    if int(message.id) in skip_active:
+                        counters["last_id"] = message.id
+                        continue
+
+                    if not has_media(message):
+                        await self.db.mark_message(
+                            task_id, message.id, status="done"
+                        )
+                        counters["last_id"] = message.id
+                        counters["processed"] = int(counters["processed"]) + 1
+                        counters["skipped"] = int(counters["skipped"]) + 1
+                        continue
+
+                    media_type = detect_media_type(message)
+                    if media_type == "sticker":
+                        media_type = "document"
+                    if not media_type or media_type not in media_types:
+                        await self.db.mark_message(
+                            task_id, message.id, status="done"
+                        )
+                        counters["last_id"] = message.id
+                        counters["processed"] = int(counters["processed"]) + 1
+                        counters["skipped"] = int(counters["skipped"]) + 1
+                        continue
+
+                    if not self._passes_file_filters(
+                        task_id, message, media_type
+                    ):
+                        await self.db.mark_message(
+                            task_id, message.id, status="done"
+                        )
+                        counters["last_id"] = message.id
+                        counters["processed"] = int(counters["processed"]) + 1
+                        counters["skipped"] = int(counters["skipped"]) + 1
+                        continue
+
+                    indexed_caption = captions_map.get(message.id, "")
+                    caption = await self._ensure_caption(
+                        client,
+                        chat_id,
+                        message,
+                        album_captions,
+                        caption_override=indexed_caption or None,
+                    )
+                    tags = extract_tags(caption or "")
+                    batch_names = batch_filenames_for_message(
+                        message,
+                        caption=caption or "",
+                        album_batches=album_batches,
+                        caption_batches=caption_batches,
+                    )
+                    hint_year = None
+                    nearby_texts: list[str] = []
+                    try:
+                        hint_year, nearby_texts = await self.db.infer_nearby_year(
+                            chat_id, message.id
+                        )
+                    except Exception:
+                        logger.debug("infer_nearby_year failed", exc_info=True)
+                    subdir = resolve_media_subdir(
+                        message,
+                        album_captions=album_captions,
+                        use_caption_folders=use_text_as_folder,
+                        group_dir=group_dir if use_text_as_folder else None,
+                        folder_mode=folder_mode,
+                        caption_override=caption or None,
+                        tag_folder_map=counters.get("tag_folder_map") or None,
+                        tag_blacklist=counters.get("tag_blacklist") or None,
+                        batch_filenames=batch_names,
+                        hint_year=hint_year,
+                        nearby_texts=nearby_texts,
+                    )
+                    filename = build_filename(
+                        message,
+                        media_type,
+                        album_captions=album_captions,
+                        caption=caption,
+                    )
+                    rel_dir = subdir if subdir is not None else "_未分类"
+                    target_dir = group_dir / rel_dir if rel_dir else group_dir
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    # New date folder name → pull leftover files from old date dirs
+                    await self._sync_legacy_date_dir(
+                        task_id, target_dir, caption=caption or ""
+                    )
+                    if counters.get("current_folder") != (rel_dir or "."):
+                        await self.db.append_log(
+                            task_id, f"目录: {rel_dir or '（群根目录）'}"
+                        )
+                    counters["current_folder"] = rel_dir or "."
+
+                    existing = await self._skip_if_already_downloaded(
+                        task_id=task_id,
+                        chat_id=chat_id,
+                        message=message,
+                        target_dir=target_dir,
+                        filename=filename,
+                        settings=settings,
+                    )
+                    if existing is not None:
+                        counters["last_id"] = message.id
+                        counters["processed"] = int(counters["processed"]) + 1
+                        counters["downloaded"] = int(counters["downloaded"]) + 1
+                        try:
+                            rel = existing.relative_to(settings.download_dir)
+                        except ValueError:
+                            rel = existing
+                        await self.db.append_log(
+                            task_id, f"队列已处理，跳过: {rel}"
+                        )
+                        await self.db.update_task(
+                            task_id,
+                            current_folder=counters["current_folder"],
+                            last_message_id=message.id,
+                            processed_count=int(counters["processed"]),
+                            downloaded_count=int(counters["downloaded"]),
+                            failed_count=await self.db.count_failed(task_id),
+                            skipped_count=int(counters["skipped"]),
+                        )
+                        continue
+
+                    target_path, _ = resolve_download_path(
+                        target_dir,
+                        filename,
+                        message.id,
+                        self._expected_size(message),
+                    )
+                    job = DownloadJob(
+                        message=message,
+                        message_id=message.id,
+                        target_path=target_path,
+                        caption=caption or "",
+                        media_type=media_type,
+                        rel_dir=rel_dir or "",
+                        tags=tags,
+                    )
+                    status = await self._pool_submit(
+                        pool,
+                        job,
+                        task_id=task_id,
+                        stop_event=stop_event,
+                        settings=settings,
+                        group_dir=group_dir,
+                        use_text_as_folder=use_text_as_folder,
+                        counters=counters,
+                        concurrency=concurrency,
+                        max_messages=max_messages,
+                        delay_min=delay_min,
+                        delay_max=delay_max,
+                        test_mode=test_mode,
+                        chat_id=chat_id,
+                    )
+                    if status == "paused":
+                        await _pause_and_return("任务已暂停")
+                        return
+                    if status == "reload":
                         self.consume_filter_dirty(chat_id)
                         self._pool_drop_queued(pool)
                         await self.db.append_log(task_id, "设置已更新，切换补下")
                         soft_reload = True
                         break
-                if tag:
-                    await self.db.append_log(
-                        task_id, f"标签 #{tag} 已下完，进入下一标签"
-                    )
+                    counters["last_id"] = message.id
+
+                if soft_reload:
+                    break
+
 
             if soft_reload:
                 continue
