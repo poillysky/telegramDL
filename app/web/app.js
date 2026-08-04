@@ -34,6 +34,7 @@ const state = {
   tagSuggestItems: [],
   tagSuggestIndex: -1,
   tasks: [],
+  taskTabs: {}, // taskId -> "progress" | "log"
   taskTagsDraft: null, // { taskId, chatId, tags, groups: string[][], ... }
   tagPickerIndex: [], // [{tag, count}]
   tagPickerBundles: [], // [{tags: string[], count, manual?}] same-caption groups
@@ -61,20 +62,72 @@ const state = {
 const STATUS_LABELS = {
   pending: "等待中",
   running: "下载中",
-  paused: "已暂停",
+  paused: "暂停中",
   completed: "已完成",
   failed: "失败",
 };
 
+/** progress/status visual kind: monitoring | downloading | paused | starting | idle | done | failed | indexing */
+function taskLiveKind(t) {
+  if (!t) return "idle";
+  if (isTaskBooting(t) || (t.live && t.live.phase === "starting")) return "starting";
+  if (isTaskPausing(t)) return "paused";
+  if (t.live && t.live.phase === "indexing") return "indexing";
+  const status = String(t.status || "pending");
+  if (status === "paused" || (t.live && t.live.phase === "paused")) return "paused";
+  if (status === "completed") return "done";
+  if (status === "failed") return "failed";
+  if (status === "running") {
+    const workers = Array.isArray(t.live?.workers) ? t.live.workers : [];
+    const files = Array.isArray(t.live?.files) ? t.live.files : [];
+    if (
+      liveHasRealDownloadBars(t.live) ||
+      liveWorkersActive(workers) ||
+      files.length > 0
+    ) {
+      return "downloading";
+    }
+    if (isMonitorTask(t)) return "monitoring";
+    return "downloading";
+  }
+  return "idle";
+}
+
 function statusLabel(status, task) {
-  if (
-    status === "running" &&
-    task &&
-    normalizeDownloadMode(task.download_mode) === "monitor"
-  ) {
-    return "监控中";
+  if (task) {
+    const kind = taskLiveKind({ ...task, status: status || task.status });
+    if (kind === "starting") return "启动中";
+    if (kind === "paused") return "暂停中";
+    if (kind === "monitoring") return "监控中";
+    if (kind === "downloading") return "下载中";
   }
   return STATUS_LABELS[status] || status || "未知";
+}
+
+function statusPillClass(t) {
+  const kind = taskLiveKind(t);
+  if (kind === "monitoring" || kind === "starting") return "status-monitoring";
+  if (kind === "downloading") return "status-running";
+  if (kind === "paused") return "status-paused";
+  if (kind === "done") return "status-completed";
+  if (kind === "failed") return "status-failed";
+  return `status-${t && t.status ? t.status : "pending"}`;
+}
+
+function progressBadgeHtml(kind, label) {
+  const cls =
+    kind === "monitoring" || kind === "starting"
+      ? "is-monitor"
+      : kind === "downloading"
+        ? "is-download"
+        : kind === "paused"
+          ? "is-paused"
+          : kind === "done"
+            ? "is-done"
+            : kind === "failed"
+              ? "is-fail"
+              : "";
+  return `<span class="dl-status-badge ${cls}">${escapeHtml(label)}</span>`;
 }
 
 /** Server stores UTC ISO; display as Beijing time (Asia/Shanghai). */
@@ -133,7 +186,46 @@ function tagMatchDisplay(t) {
   return Number(t.tag_match_count ?? 0);
 }
 
+function taskIdNum(tOrId) {
+  if (tOrId && typeof tOrId === "object") return Number(tOrId.id);
+  return Number(tOrId);
+}
+
+function isTaskBooting(tOrId) {
+  const id = taskIdNum(tOrId);
+  return !!(id && state._taskBooting && state._taskBooting.has(id));
+}
+
+function isTaskPausing(tOrId) {
+  const id = taskIdNum(tOrId);
+  return !!(id && state._taskPausing && state._taskPausing.has(id));
+}
+
+function markTaskActionPhase(id, phase) {
+  const n = Number(id);
+  if (!n) return;
+  if (!state._taskBooting) state._taskBooting = new Set();
+  if (!state._taskPausing) state._taskPausing = new Set();
+  state._taskBooting.delete(n);
+  state._taskPausing.delete(n);
+  if (phase === "boot") state._taskBooting.add(n);
+  else if (phase === "pause") state._taskPausing.add(n);
+}
+
+function clearTaskActionPhase(id) {
+  const n = Number(id);
+  if (state._taskBooting) state._taskBooting.delete(n);
+  if (state._taskPausing) state._taskPausing.delete(n);
+}
+
 function startActionLabel(t) {
+  if (isTaskBooting(t)) {
+    if (isMonitorTask(t)) {
+      return t && t._bootFromPaused ? "恢复中…" : "启动中…";
+    }
+    return "启动中…";
+  }
+  if (isTaskPausing(t) && isMonitorTask(t)) return "暂停中…";
   if (isMonitorTask(t)) {
     // Running: primary control is pause — keep label clear and clickable
     return String(t && t.status) === "running" ? "暂停监控" : "恢复监控";
@@ -1435,7 +1527,14 @@ function fitMobileTaskLogToBottom() {
     tasks.forEach((t) => clearFit(t.querySelector(".task-log")));
     return;
   }
-  const log = tasks[0].querySelector(".task-log");
+  const card = tasks[0];
+  const logPanel = card.querySelector('.task-tab-panel[data-panel="log"]');
+  // Log is a tab — only stretch when that tab is visible
+  if (logPanel && logPanel.hidden) {
+    clearFit(card.querySelector(".task-log"));
+    return;
+  }
+  const log = card.querySelector(".task-log");
   const body = log?.querySelector(".task-log-body, .task-log-empty");
   if (!body) return;
   log.style.maxHeight = "none";
@@ -4019,6 +4118,14 @@ function bindTaskActions(root) {
       });
       return;
     }
+    if (action === "task-tab") {
+      const tab = btn.dataset.tab === "log" ? "log" : "progress";
+      state.taskTabs = state.taskTabs || {};
+      state.taskTabs[String(id)] = tab;
+      switchTaskTab(btn.closest(".task"), tab);
+      scheduleFitMobileTaskLog();
+      return;
+    }
 
     // Delete: confirm first (before busy), then call API
     if (action === "delete") {
@@ -4073,15 +4180,45 @@ function bindTaskActions(root) {
       if (action === "start") {
         const task = taskForBusy;
         const mon = isMonitorTask(task);
+        const fromPaused = String(task && task.status) === "paused";
+        markTaskActionPhase(id, "boot");
+        if (!state.taskTabs) state.taskTabs = {};
+        state.taskTabs[String(id)] = "progress";
+        const cardForTab = btn.closest(".task");
+        if (cardForTab) switchTaskTab(cardForTab, "progress");
         applyOptimisticPauseResume(id, "start");
+        toast(
+          mon
+            ? fromPaused
+              ? "正在恢复监控…"
+              : "正在启动监控…"
+            : fromPaused
+              ? "正在继续下载…"
+              : "正在启动任务…",
+          "info",
+          3200
+        );
         const r = await api(`/api/tasks/${id}/start`, { method: "POST", body: "{}" });
         if (!r.ok) throw new Error(r.message || "启动失败");
-        toast(mon ? "已恢复监控" : "任务已继续", "ok", 1600);
+        toast(
+          mon
+            ? !taskHasMonitorTags(task)
+              ? "已启动监控 · 请先设置标签才会按差集下载"
+              : fromPaused
+                ? "已恢复监控 · 正在检查待下载队列"
+                : "已启动监控 · 正在检查待下载队列"
+            : "任务已继续",
+          "ok",
+          mon ? 2600 : 1600
+        );
       } else if (action === "pause") {
         const task = taskForBusy;
+        const mon = isMonitorTask(task);
+        markTaskActionPhase(id, "pause");
         applyOptimisticPauseResume(id, "pause");
+        toast(mon ? "正在暂停监控…" : "正在暂停…", "info", 2400);
         await api(`/api/tasks/${id}/pause`, { method: "POST", body: "{}" });
-        toast(isMonitorTask(task) ? "已暂停监控" : "已暂停", "ok", 1600);
+        toast(mon ? "已暂停监控" : "已暂停", "ok", 1600);
       } else if (action === "clear-log") {
         const ok = await confirmDialog({
           title: "清空活动日志",
@@ -4099,14 +4236,23 @@ function bindTaskActions(root) {
         toast("操作失败: " + (e.message || e), "err");
         console.error(e);
       }
+      try {
+        await loadTasks({ force: true });
+      } catch (_) {}
     } finally {
       state._taskActionBusy.delete(busyKey);
+      clearTaskActionPhase(id);
+      const taskAfter = (state.tasks || []).find((t) => String(t.id) === String(id));
+      if (taskAfter) delete taskAfter._bootFromPaused;
       btn.classList.remove("is-busy");
       // Disabled state follows next patchTaskCard / render
-      const task = (state.tasks || []).find((t) => String(t.id) === String(id));
+      const task = taskAfter;
       if (action === "start") {
         btn.disabled = task ? task.status === "running" && !isMonitorTask(task) : false;
         if (!btn.disabled) btn.removeAttribute("disabled");
+        // Refresh button label after clearing boot phase
+        const card = btn.closest(".task");
+        if (card && task) patchTaskCard(card, task);
       } else if (action === "pause") {
         const card = btn.closest(".task");
         const startBtn = card?.querySelector('[data-role="start-btn"]');
@@ -4134,6 +4280,7 @@ function bindTaskActions(root) {
           pauseBtn.disabled = true;
           pauseBtn.classList.remove("is-pause-ready");
         }
+        if (card && task) patchTaskCard(card, task);
       } else {
         btn.disabled = false;
         btn.removeAttribute("disabled");
@@ -5995,45 +6142,94 @@ function panelWorkerLanes(live) {
 
 function liveHasDownloadPanel(live) {
   if (!live || live.phase === "indexing") return false;
-  if (Number(live.worker_count) > 0) return true;
+  // Paused: only keep netdisk panel when there are real frozen bars
+  if (live.phase === "paused") return liveHasRealDownloadBars(live);
+  // Real bars / active lanes only — bare idle worker_count must NOT open a panel
+  // (pool create/drain was flipping panel↔idle every poll → progress flicker)
+  if (liveHasRealDownloadBars(live)) return true;
   const workers = Array.isArray(live.workers) ? live.workers : [];
   const files = Array.isArray(live.files) ? live.files : [];
   if (files.length > 0) return true;
-  if (live.phase === "paused" && (livePanelSlotCount(live) > 0 || live.file)) return true;
   if (liveWorkersActive(workers)) return true;
-  return workers.some((w) => w && (w.file || w.status === "paused" || w.status === "switching"));
+  return false;
 }
 
-function rememberLivePanelSnap(t) {
-  if (!t || !t.id || !liveHasDownloadPanel(t.live)) return;
+/** True only when there is a real file/progress bar worth freezing on pause. */
+function liveHasRealDownloadBars(live) {
+  if (!live) return false;
+  const files = Array.isArray(live.files) ? live.files : [];
+  if (
+    files.some(
+      (f) =>
+        f &&
+        (String(f.file || "").trim() ||
+          Number(f.total) > 0 ||
+          Number(f.received) > 0)
+    )
+  ) {
+    return true;
+  }
+  const workers = Array.isArray(live.workers) ? live.workers : [];
+  if (
+    workers.some(
+      (w) =>
+        w &&
+        (String(w.file || "").trim() ||
+          ((w.status === "busy" ||
+            w.status === "paused" ||
+            w.status === "switching") &&
+            (Number(w.total) > 0 || Number(w.received) > 0)))
+    )
+  ) {
+    return true;
+  }
+  if (String(live.file || "").trim() && Number(live.total) > 0) return true;
+  return false;
+}
+
+function rememberLivePanelSnap(t, opts = {}) {
+  if (!t || !t.id || !liveHasRealDownloadBars(t.live)) return;
   if (!state._livePanelSnap) state._livePanelSnap = {};
   const n = Math.max(1, livePanelSlotCount(t.live));
   state._livePanelSnap[t.id] = {
-    sig: `panel:${n}`,
+    // Stable signature — slot count changes must not remount the shell
+    sig: "panel",
     n,
     live: t.live,
     at: Date.now(),
+    resumeGap: !!opts.resumeGap,
   };
+}
+
+function clearLivePanelSnap(id) {
+  if (state._livePanelSnap) delete state._livePanelSnap[Number(id)];
 }
 
 function liveProgressSignature(t) {
   const live = t.live;
+  if (isTaskBooting(t) || (live && live.phase === "starting")) return "starting";
   if (live && live.phase === "indexing") return "indexing";
   // Same signature for running ↔ paused netdisk panel → patch in place, no remount
   if (liveHasDownloadPanel(live)) {
-    const n = Math.max(1, livePanelSlotCount(live));
     rememberLivePanelSnap({ ...t, live });
-    return `panel:${n}`;
+    return "panel";
   }
-  // Brief resume gap: reuse last panel so UI does not jump to「监控中」
+  // Short resume gap only (~4s) — long snap was forcing panel↔idle flicker
   const snap = state._livePanelSnap && state._livePanelSnap[t.id];
+  const gapMs = snap && snap.resumeGap ? 4000 : 0;
   if (
     snap &&
     snap.live &&
-    (t.status === "running" || t.status === "paused") &&
-    Date.now() - (snap.at || 0) < 120000
+    gapMs > 0 &&
+    t.status === "running" &&
+    Date.now() - (snap.at || 0) < gapMs &&
+    liveHasRealDownloadBars(snap.live)
   ) {
-    return snap.sig || `panel:${snap.n || 1}`;
+    return "panel";
+  }
+  if (snap && (!gapMs || Date.now() - (snap.at || 0) >= gapMs)) {
+    // Idle monitor / between batches: drop stale snap so we stay on idle shell
+    if (!liveHasDownloadPanel(live)) clearLivePanelSnap(t.id);
   }
   const mode = normalizeDownloadMode(t.download_mode);
   const tags = taskHasMonitorTags(t) ? 1 : 0;
@@ -6046,49 +6242,81 @@ function applyOptimisticPauseResume(id, action) {
   const tid = Number(id);
   const t = (state.tasks || []).find((x) => Number(x.id) === tid);
   if (!t) return;
-  const card = document.querySelector(`.task[data-id="${tid}"]`);
+  const card =
+    document.querySelector(`.task[data-task-id="${tid}"]`) ||
+    document.querySelector(`.task[data-id="${tid}"]`);
   if (action === "pause") {
     t.status = "paused";
-    const base = t.live && typeof t.live === "object" ? { ...t.live } : {};
-    const workers = Array.isArray(base.workers)
-      ? base.workers.map((w) => ({
-          ...w,
-          status: w.status === "busy" ? "paused" : w.status || "idle",
-          speed: 0,
-        }))
-      : [];
-    t.live = {
-      ...base,
-      phase: "paused",
-      speed: 0,
-      workers,
-      files: Array.isArray(base.files)
-        ? base.files.map((f) => ({ ...f, speed: 0 }))
-        : base.files,
-    };
-    rememberLivePanelSnap(t);
+    if (!liveHasRealDownloadBars(t.live)) {
+      // Idle monitor / no real bars → simple paused placeholder (no fake lanes)
+      t.live = null;
+      clearLivePanelSnap(tid);
+    } else {
+      const base = t.live && typeof t.live === "object" ? { ...t.live } : {};
+      const workers = Array.isArray(base.workers)
+        ? base.workers
+            .filter(
+              (w) =>
+                w &&
+                (String(w.file || "").trim() ||
+                  Number(w.total) > 0 ||
+                  Number(w.received) > 0 ||
+                  w.status === "busy" ||
+                  w.status === "switching")
+            )
+            .map((w) => ({
+              ...w,
+              status: w.status === "busy" || w.status === "switching" ? "paused" : w.status || "idle",
+              speed: 0,
+            }))
+        : [];
+      t.live = {
+        ...base,
+        phase: "paused",
+        speed: 0,
+        workers,
+        files: Array.isArray(base.files)
+          ? base.files.map((f) => ({ ...f, speed: 0 }))
+          : base.files,
+      };
+      rememberLivePanelSnap(t);
+    }
   } else if (action === "start") {
+    t._bootFromPaused = String(t.status) === "paused";
     t.status = "running";
     const snap = state._livePanelSnap && state._livePanelSnap[tid];
-    const base =
-      (t.live && liveHasDownloadPanel(t.live) && t.live) ||
-      (snap && snap.live) ||
-      t.live ||
-      {};
-    const workers = Array.isArray(base.workers)
-      ? base.workers.map((w) => ({
-          ...w,
-          // Keep bars; treat paused lanes as busy until real progress arrives
-          status: w.status === "paused" ? "busy" : w.status || "idle",
-        }))
-      : [];
-    t.live = {
-      ...base,
-      phase: "download",
-      workers,
-      files: base.files,
-    };
-    rememberLivePanelSnap(t);
+    const hasPanel =
+      (t.live && liveHasDownloadPanel(t.live)) ||
+      (snap && snap.live && liveHasDownloadPanel(snap.live));
+    if (!hasPanel) {
+      // No download bars yet — show explicit「启动中」so UI does not look frozen
+      t.live = {
+        phase: "starting",
+        speed: 0,
+        workers: [],
+        files: [],
+      };
+    } else {
+      const base =
+        (t.live && liveHasDownloadPanel(t.live) && t.live) ||
+        (snap && snap.live) ||
+        t.live ||
+        {};
+      const workers = Array.isArray(base.workers)
+        ? base.workers.map((w) => ({
+            ...w,
+            // Keep bars; treat paused lanes as busy until real progress arrives
+            status: w.status === "paused" ? "busy" : w.status || "idle",
+          }))
+        : [];
+      t.live = {
+        ...base,
+        phase: "download",
+        workers,
+        files: base.files,
+      };
+      rememberLivePanelSnap(t, { resumeGap: true });
+    }
   }
   if (card) patchTaskCard(card, t);
 }
@@ -6105,6 +6333,61 @@ function indexProgressPercent(live) {
   return 0;
 }
 
+function patchDlItemRow(row, htmlOrWorker, paused = false) {
+  // Build desired state, then mutate existing row — never replaceWith (resets CSS anim)
+  let nextHtml = "";
+  if (typeof htmlOrWorker === "string") {
+    nextHtml = htmlOrWorker;
+  } else {
+    nextHtml = renderDlItemFromWorker(htmlOrWorker, paused);
+  }
+  const wrap = document.createElement("div");
+  wrap.innerHTML = nextHtml;
+  const src = wrap.firstElementChild;
+  if (!src || !row) return;
+  const nextStatus = [...src.classList].find((c) => c.startsWith("is-")) || "";
+  const prevStatus = [...row.classList].find((c) => c.startsWith("is-")) || "";
+  if (nextStatus !== prevStatus) {
+    row.className = src.className;
+  }
+  const copyText = (sel) => {
+    const a = row.querySelector(sel);
+    const b = src.querySelector(sel);
+    if (a && b && a.textContent !== b.textContent) a.textContent = b.textContent;
+    if (a && b) {
+      const t = b.getAttribute("title");
+      if (t != null && a.getAttribute("title") !== t) a.setAttribute("title", t);
+    }
+  };
+  copyText(".dl-item-name");
+  copyText(".dl-item-lane");
+  copyText(".dl-item-badge");
+  copyText(".dl-item-size");
+  copyText(".dl-item-pct");
+  copyText(".dl-item-speed");
+  const dstTrack = row.querySelector(".prog-track");
+  const srcTrack = src.querySelector(".prog-track");
+  const dstFill = row.querySelector(".prog-fill");
+  const srcFill = src.querySelector(".prog-fill");
+  if (dstTrack && srcTrack) {
+    const srcIndet = srcTrack.classList.contains("indeterminate");
+    const srcIdle = srcTrack.classList.contains("is-idle");
+    const srcHandoff = srcTrack.classList.contains("is-handoff");
+    const dstIndet = dstTrack.classList.contains("indeterminate");
+    const dstIdle = dstTrack.classList.contains("is-idle");
+    // Only rewrite track classes when mode changes — keeps indeterminate animation alive
+    if (srcIndet !== dstIndet || srcIdle !== dstIdle || srcHandoff !== dstTrack.classList.contains("is-handoff")) {
+      dstTrack.className = srcTrack.className;
+    }
+  }
+  if (dstFill && srcFill) {
+    const w = srcFill.style.width || "";
+    if (!srcTrack || !srcTrack.classList.contains("indeterminate")) {
+      if (dstFill.style.width !== w) dstFill.style.width = w;
+    }
+  }
+}
+
 function patchDownloadProgressBox(box, t) {
   const live = t.live || {};
   if (!box.classList.contains("dl-panel")) return false;
@@ -6115,45 +6398,62 @@ function patchDownloadProgressBox(box, t) {
   if (!paused && laneWorkers.length === 0 && files.length === 0 && !liveHasDownloadPanel(live)) {
     return false;
   }
+  // All-idle worker shell with no real bars → leave panel (caller remounts idle)
+  if (!paused && !liveHasDownloadPanel(live) && files.length === 0) {
+    return false;
+  }
   const speedText = paused
-    ? "已暂停"
+    ? "暂停中"
     : formatSpeed(live.speed, { waiting: t.status === "running" });
   const badge = box.querySelector(".dl-status-badge");
   const speedEl = box.querySelector(".dl-panel-speed");
-  if (badge) badge.textContent = paused ? "暂停中" : "下载中";
+  if (badge) {
+    const next = paused ? "暂停中" : "下载中";
+    if (badge.textContent !== next) badge.textContent = next;
+    badge.classList.toggle("is-paused", paused);
+    badge.classList.toggle("is-download", !paused);
+    badge.classList.toggle("is-monitor", false);
+  }
   const multi = laneWorkers.length > 1 || files.length > 1;
   if (speedEl) {
-    speedEl.textContent = paused
-      ? "已暂停"
+    const next = paused
+      ? ""
       : multi
         ? `合计 ${speedText}`
         : speedText;
+    if (speedEl.textContent !== next) speedEl.textContent = next;
   }
   box.classList.toggle("is-state-paused", paused);
   box.classList.toggle("is-state-downloading", !paused);
+  box.classList.toggle("is-state-monitoring", false);
   box.dataset.phase = paused ? "paused" : "download";
   box.dataset.liveState = paused ? "paused" : "downloading";
   const host = box.querySelector(".dl-list");
   if (host) {
     if (laneWorkers.length > 0) {
-      // Patch each lane in place — keep row count stable across file handoff
-      const html = laneWorkers.map((w) => renderDlItemFromWorker(w, paused)).join("");
       if (host.children.length !== laneWorkers.length) {
-        host.innerHTML = html;
+        host.innerHTML = laneWorkers
+          .map((w) => renderDlItemFromWorker(w, paused))
+          .join("");
       } else {
         laneWorkers.forEach((w, i) => {
           const row = host.children[i];
-          if (!row) return;
-          const next = document.createElement("div");
-          next.innerHTML = renderDlItemFromWorker(w, paused);
-          const el = next.firstElementChild;
-          if (el) row.replaceWith(el);
+          if (row) patchDlItemRow(row, w, paused);
         });
       }
     } else if (files.length > 0) {
-      host.innerHTML = files.map((f) => renderDlItemFromFile(f, paused)).join("");
+      if (host.children.length !== files.length) {
+        host.innerHTML = files.map((f) => renderDlItemFromFile(f, paused)).join("");
+      } else {
+        files.forEach((f, i) => {
+          const row = host.children[i];
+          if (row) patchDlItemRow(row, renderDlItemFromFile(f, paused), paused);
+        });
+      }
     } else {
-      host.innerHTML = renderDlItemFromLive(live, paused);
+      const html = renderDlItemFromLive(live, paused);
+      if (host.children.length !== 1) host.innerHTML = html;
+      else patchDlItemRow(host.children[0], html, paused);
     }
   }
   return true;
@@ -6203,7 +6503,7 @@ function patchIndexProgressBox(box, t) {
 
 function patchTaskCard(el, t) {
   const status = t.status || "pending";
-  const statusClass = `status-${status}`;
+  const statusClass = statusPillClass(t);
   const modeMeta = taskModeMeta(t);
   el.dataset.status = status;
   el.dataset.mode = modeMeta.mode;
@@ -6287,13 +6587,23 @@ function patchTaskCard(el, t) {
     else btnStart.removeAttribute("disabled");
     btnStart.dataset.monitorState = startActionState(t);
     btnStart.dataset.action = mon && running ? "pause" : "start";
-    btnStart.title = mon
-      ? running
-        ? "点击暂停监控"
-        : "点击开始/恢复监控"
-      : running
-        ? "下载进行中"
-        : "继续下载";
+    if (isTaskBooting(t)) {
+      btnStart.title = mon
+        ? t._bootFromPaused
+          ? "正在恢复监控，请稍候…"
+          : "正在启动监控，请稍候…"
+        : "正在启动，请稍候…";
+    } else if (isTaskPausing(t)) {
+      btnStart.title = "正在暂停，请稍候…";
+    } else {
+      btnStart.title = mon
+        ? running
+          ? "点击暂停监控"
+          : "点击开始/恢复监控"
+        : running
+          ? "下载进行中"
+          : "继续下载";
+    }
     const label =
       btnStart.querySelector('[data-role="start-label"]') ||
       btnStart.querySelector("span:last-child");
@@ -6351,30 +6661,46 @@ function patchTaskCard(el, t) {
   }
 
   // live progress — preserve bar DOM to avoid animation flicker
-  // Resume gap: reuse last netdisk snapshot so pause/resume stays on one panel
+  // Resume gap only (~4s after continue): reuse last netdisk snapshot
   if (
     !liveHasDownloadPanel(t.live) &&
+    t.status === "running" &&
     state._livePanelSnap &&
-    state._livePanelSnap[t.id] &&
-    (t.status === "running" || t.status === "paused")
+    state._livePanelSnap[t.id]
   ) {
     const snap = state._livePanelSnap[t.id];
-    if (snap.live && Date.now() - (snap.at || 0) < 120000) {
+    const gapMs = snap.resumeGap ? 4000 : 0;
+    if (
+      gapMs > 0 &&
+      snap.live &&
+      liveHasRealDownloadBars(snap.live) &&
+      Date.now() - (snap.at || 0) < gapMs
+    ) {
       t = {
         ...t,
         live: {
           ...snap.live,
-          phase: t.status === "paused" ? "paused" : snap.live.phase || "download",
+          phase: snap.live.phase === "paused" ? "download" : snap.live.phase || "download",
         },
       };
     }
   }
   const sig = liveProgressSignature(t);
-  let liveHost = body.querySelector(":scope > .live-progress");
+  let liveHost =
+    body.querySelector('.task-tab-panel[data-panel="progress"] .live-progress') ||
+    body.querySelector(":scope > .live-progress");
   const prevSig = liveHost?.dataset?.sig || "";
   const isIdleSig = sig === "idle" || String(sig).startsWith("idle:");
   const isPlaceholderSig = String(sig).startsWith("placeholder");
-  const isPanelSig = String(sig).startsWith("panel:");
+  const isPanelSig = sig === "panel" || String(sig).startsWith("panel:");
+  const prevIsPanel =
+    prevSig === "panel" ||
+    String(prevSig).startsWith("panel:") ||
+    prevSig === "download";
+  const prevIsIdle =
+    prevSig === "idle" ||
+    String(prevSig).startsWith("idle:") ||
+    prevSig === "starting";
   if (sig === "indexing" && liveHost && liveHost.dataset.phase === "indexing") {
     patchIndexProgressBox(liveHost, t);
     liveHost.dataset.sig = sig;
@@ -6382,7 +6708,7 @@ function patchTaskCard(el, t) {
     isPanelSig &&
     liveHost &&
     liveHost.classList.contains("dl-panel") &&
-    String(prevSig).startsWith("panel:")
+    prevIsPanel
   ) {
     // pause ↔ resume: same netdisk shell, patch badge/lanes only
     const patched = patchDownloadProgressBox(liveHost, t);
@@ -6393,10 +6719,39 @@ function patchTaskCard(el, t) {
       wrap.innerHTML = html;
       const next = wrap.firstElementChild;
       if (next) {
-        next.dataset.sig = sig;
+        next.dataset.sig = liveProgressSignature(t);
         liveHost.replaceWith(next);
+        clearLivePanelSnap(t.id);
       }
     }
+  } else if (liveHost && isIdleSig && prevIsIdle) {
+    // Same idle family — never remount (keeps indeterminate / monitor-wait anim)
+    const tip = liveHost.querySelector(".live-placeholder-text");
+    const badge = liveHost.querySelector(".dl-status-badge");
+    const nextText = (() => {
+      if (!isMonitorTask(t)) return "正在查找下一条媒体…";
+      if (!taskHasMonitorTags(t)) {
+        return "未选标签；请先设置标签，索引由手动/自动增量更新";
+      }
+      const q = Math.max(
+        0,
+        tagMatchDisplay(t) - Number(t.tag_processed_count ?? 0)
+      );
+      return q > 0
+        ? `队列还有 ${q} 条，正在准备补下…`
+        : "空闲 · 等索引增量后再补差集";
+    })();
+    if (tip && tip.textContent !== nextText) tip.textContent = nextText;
+    if (badge) {
+      const nextBadge = isMonitorTask(t)
+        ? Math.max(0, tagMatchDisplay(t) - Number(t.tag_processed_count ?? 0)) > 0
+          ? "准备中"
+          : "监控中"
+        : "下载中";
+      if (badge.textContent !== nextBadge) badge.textContent = nextBadge;
+    }
+    liveHost.dataset.sig = sig;
+    liveHost.dataset.liveState = isMonitorTask(t) ? "monitoring" : "downloading";
   } else if (sig !== prevSig || !liveHost) {
     const html = renderLiveProgress(t);
     const wrap = document.createElement("div");
@@ -6405,33 +6760,19 @@ function patchTaskCard(el, t) {
     if (next) next.dataset.sig = sig;
     if (liveHost && next) liveHost.replaceWith(next);
     else if (next) {
-      const log = body.querySelector(":scope > .task-log");
+      const progressPanel = body.querySelector(
+        '.task-tab-panel[data-panel="progress"]'
+      );
+      const log = body.querySelector(".task-log");
       const actions = body.querySelector(".task-actions");
       const err = body.querySelector(":scope > .msg.err");
-      if (err) err.after(next);
+      if (progressPanel) progressPanel.replaceChildren(next);
+      else if (err) err.after(next);
       else if (actions) actions.after(next);
       else if (log) log.before(next);
       else body.appendChild(next);
     }
-  } else if (liveHost && isIdleSig) {
-    // Keep idle DOM + animation untouched; only refresh copy if needed
-    const tip = liveHost.querySelector(".live-placeholder-text");
-    const kicker = liveHost.querySelector(".live-placeholder-kicker");
-    const nextText = (() => {
-      if (!isMonitorTask(t)) return "正在查找下一条媒体…";
-      return taskHasMonitorTags(t)
-        ? "等索引增量后再补差集（不空转轮询）"
-        : "未选标签；请先设置标签，索引由手动/自动增量更新";
-    })();
-    if (tip && tip.textContent !== nextText) tip.textContent = nextText;
-    if (kicker) {
-      const nextKick = isMonitorTask(t) ? "监控中" : "下载中";
-      if (kicker.textContent !== nextKick) kicker.textContent = nextKick;
-    }
-    liveHost.dataset.sig = sig;
-    liveHost.dataset.liveState = isMonitorTask(t) ? "monitoring" : "downloading";
   } else if (liveHost && !isPlaceholderSig && !isIdleSig && sig !== "indexing") {
-    // same download shape — patch numbers in place (no DOM replace / flicker)
     const patched = patchDownloadProgressBox(liveHost, t);
     if (patched) {
       liveHost.dataset.sig = sig;
@@ -6448,7 +6789,7 @@ function patchTaskCard(el, t) {
   }
 
   // log — replace when content changes, or UI shell is outdated (e.g. missing 清空)
-  const logEl = body.querySelector(":scope > .task-log");
+  const logEl = body.querySelector(".task-log");
   const logKey = String(t.last_log || "");
   const logShellStale = !!(
     logEl &&
@@ -6466,15 +6807,21 @@ function patchTaskCard(el, t) {
     if (nextLog) {
       nextLog.dataset.logKey = logKey;
       logEl.replaceWith(nextLog);
-      const body = nextLog.querySelector(".task-log-body");
-      if (body) {
-        if (pinTop) body.scrollTop = 0;
-        else body.scrollTop = scrollTop + Math.max(0, body.scrollHeight - prevH);
+      const logBody = nextLog.querySelector(".task-log-body");
+      if (logBody) {
+        if (pinTop) logBody.scrollTop = 0;
+        else
+          logBody.scrollTop =
+            scrollTop + Math.max(0, logBody.scrollHeight - prevH);
       }
     }
   } else if (logEl) {
     logEl.dataset.logKey = logKey;
   }
+  // Keep tab selection across patches
+  const wantTab =
+    (state.taskTabs && state.taskTabs[String(t.id)]) || "progress";
+  switchTaskTab(el, wantTab);
 }
 
 async function loadTasks(opts = {}) {
@@ -6531,8 +6878,9 @@ async function loadTasks(opts = {}) {
       list.querySelectorAll(".task-log").forEach((el, i) => {
         if (tasks[i]) el.dataset.logKey = String(tasks[i].last_log || "");
       });
-      list.querySelectorAll(".live-progress").forEach((el) => {
-        el.dataset.sig = el.dataset.phase || el.className;
+      list.querySelectorAll(".task[data-task-id]").forEach((card, i) => {
+        const liveEl = card.querySelector(".live-progress");
+        if (liveEl && tasks[i]) liveEl.dataset.sig = liveProgressSignature(tasks[i]);
       });
       restoreTaskLogScroll(scrollMap);
       bindTaskActions(list);
@@ -6606,32 +6954,36 @@ function renderDlItem({
       ? `${formatBytes(received)} / ${formatBytes(total)}`
       : received
         ? formatBytes(received)
-        : switching
-          ? "即将开始下一个…"
-          : "准备中…"
+        : frozen
+          ? "暂停中"
+          : switching
+            ? "即将开始下一个…"
+            : "准备中…"
     : "等待任务";
   const speedText = busy
     ? formatSpeed(speed, { waiting: true })
     : frozen
-      ? "已暂停"
+      ? "—"
       : switching
         ? "接下一个…"
         : "—";
   const bar = showBar
     ? pct != null
       ? `<div class="prog-track dl-bar${switching ? " is-handoff" : ""}"><div class="prog-fill" style="width:${Math.min(100, pct)}%"></div></div>`
-      : `<div class="prog-track dl-bar indeterminate"><div class="prog-fill"></div></div>`
+      : frozen
+        ? `<div class="prog-track dl-bar is-idle"><div class="prog-fill" style="width:0%"></div></div>`
+        : `<div class="prog-track dl-bar indeterminate"><div class="prog-fill"></div></div>`
     : `<div class="prog-track dl-bar is-idle"><div class="prog-fill" style="width:0%"></div></div>`;
   const title = fullPath || name;
   const display =
-    name || (switching ? "准备下一个…" : idle ? "等待任务" : "下载任务");
+    name || (switching ? "准备下一个…" : idle ? "等待任务" : frozen ? "暂停中" : "下载任务");
   return `<div class="dl-item is-${status}" data-worker-lane="${escapeHtml(label)}">
     <div class="dl-item-top">
       <div class="dl-item-title">
         ${label ? `<span class="dl-item-lane">${escapeHtml(label)}</span>` : ""}
         <span class="dl-item-name" title="${escapeHtml(title)}">${escapeHtml(display)}</span>
       </div>
-      <span class="dl-item-badge">${escapeHtml(statusText)}</span>
+      <span class="dl-item-badge is-${status}">${escapeHtml(statusText)}</span>
     </div>
     <div class="dl-item-meta">
       <span class="dl-item-size">${escapeHtml(sizeLine)}</span>
@@ -6714,11 +7066,12 @@ function renderDlItemFromLive(live, forcePaused = false) {
 function renderDlPanel({ paused = false, speedText = "", itemsHtml = "" }) {
   const state = paused ? "paused" : "downloading";
   const badge = paused ? "暂停中" : "下载中";
+  const badgeCls = paused ? "is-paused" : "is-download";
   return `<div class="live-progress dl-panel is-state-${state}" data-phase="${
     paused ? "paused" : "download"
   }" data-live-state="${state}">
     <div class="dl-panel-head">
-      <span class="dl-status-badge">${badge}</span>
+      <span class="dl-status-badge ${badgeCls}">${badge}</span>
       <span class="dl-panel-speed">${escapeHtml(speedText)}</span>
     </div>
     <div class="dl-list">${itemsHtml}</div>
@@ -6757,29 +7110,31 @@ function renderLiveProgress(t) {
     </div>`;
   }
 
-  // 网盘式：暂停中（冻结进度列表）
-  if (live && live.phase === "paused") {
+  // 网盘式：暂停中（仅冻结真实下载条；空闲暂停走下方简洁占位）
+  if (live && live.phase === "paused" && liveHasRealDownloadBars(live)) {
     const workers = Array.isArray(live.workers) ? live.workers : [];
     const files = Array.isArray(live.files) ? live.files : [];
+    const realWorkers = workers.filter(
+      (w) =>
+        w &&
+        (String(w.file || "").trim() ||
+          Number(w.total) > 0 ||
+          Number(w.received) > 0 ||
+          w.status === "busy" ||
+          w.status === "paused" ||
+          w.status === "switching")
+    );
     let itemsHtml = "";
-    if (workers.length > 0) {
-      itemsHtml = workers.map((w) => renderDlItemFromWorker(w, true)).join("");
+    if (realWorkers.length > 0) {
+      itemsHtml = realWorkers.map((w) => renderDlItemFromWorker(w, true)).join("");
     } else if (files.length > 0) {
       itemsHtml = files.map((f) => renderDlItemFromFile(f, true)).join("");
     } else {
-      const monitor = isMonitorTask(t);
-      itemsHtml = renderDlItem({
-        name: monitor ? "监控任务已暂停" : "下载任务已暂停",
-        status: "paused",
-        percent: live.percent,
-        received: live.received,
-        total: live.total,
-      });
+      itemsHtml = renderDlItemFromLive(live, true);
     }
-    const multi = workers.length > 1 || files.length > 1;
     return renderDlPanel({
       paused: true,
-      speedText: multi ? "已暂停" : "已暂停",
+      speedText: "",
       itemsHtml,
     });
   }
@@ -6790,6 +7145,30 @@ function renderLiveProgress(t) {
     liveWorkersActive(workersForIdle) || filesForIdle.length > 0;
   if (!live || !hasActiveDownload) {
     const monitor = isMonitorTask(t);
+    const booting =
+      isTaskBooting(t) ||
+      (live && live.phase === "starting") ||
+      (t.status === "running" && live && live.phase === "starting");
+    if (booting && (t.status === "running" || isTaskBooting(t))) {
+      const bootLabel = monitor
+        ? t._bootFromPaused
+          ? "恢复中"
+          : "启动中"
+        : "启动中";
+      const bootTip = monitor
+        ? t._bootFromPaused
+          ? "正在恢复监控：连接 Telegram、检查标签差集队列…"
+          : "正在启动监控：连接 Telegram、检查标签差集队列…"
+        : "正在启动下载，请稍候…";
+      return `<div class="live-progress idle is-monitor-wait is-state-starting" data-phase="starting" data-live-state="starting">
+      <div class="dl-panel-head">
+        ${progressBadgeHtml("starting", bootLabel)}
+        <span class="dl-panel-speed">请稍候…</span>
+      </div>
+      <div class="live-placeholder-text">${escapeHtml(bootTip)}</div>
+      <div class="prog-track indeterminate"><div class="prog-fill"></div></div>
+    </div>`;
+    }
     if (t.status === "running") {
       if (monitor) {
         const q = Math.max(
@@ -6803,7 +7182,7 @@ function renderLiveProgress(t) {
             : "空闲 · 等索引增量后再补差集";
         return `<div class="live-progress idle is-monitor-wait is-state-monitoring" data-phase="idle" data-live-state="monitoring">
       <div class="dl-panel-head">
-        <span class="dl-status-badge is-monitor">${q > 0 ? "准备中" : "监控中"}</span>
+        ${progressBadgeHtml("monitoring", q > 0 ? "准备中" : "监控中")}
       </div>
       <div class="live-placeholder-text">${escapeHtml(text)}</div>
       <div class="prog-track monitor-wait"><div class="prog-fill"></div></div>
@@ -6811,7 +7190,7 @@ function renderLiveProgress(t) {
       }
       return `<div class="live-progress idle is-state-downloading is-seeking" data-phase="idle" data-live-state="downloading">
       <div class="dl-panel-head">
-        <span class="dl-status-badge">下载中</span>
+        ${progressBadgeHtml("downloading", "下载中")}
         <span class="dl-panel-speed">查找文件…</span>
       </div>
       <div class="live-placeholder-text">正在查找下一条媒体…</div>
@@ -6821,32 +7200,32 @@ function renderLiveProgress(t) {
     const status = t.status || "pending";
     let tip = "下载进度将显示在这里";
     let badge = "待开始";
+    let kind = "idle";
     let stateClass = "is-placeholder is-state-idle";
     let liveState = "idle";
-    let badgeCls = "";
     if (status === "paused") {
       badge = "暂停中";
-      tip = monitor
-        ? "已暂停 · 点击「恢复监控」继续"
-        : "已暂停 · 点击「继续」恢复下载";
+      kind = "paused";
+      tip = monitor ? "点「恢复监控」继续" : "点「继续」恢复下载";
       stateClass = "is-state-paused";
       liveState = "paused";
     } else if (status === "completed") {
       badge = "已完成";
+      kind = "done";
       tip = monitor ? "监控任务已结束" : "任务已完成";
       stateClass = "is-placeholder is-state-done";
       liveState = "done";
-      badgeCls = "is-done";
     } else if (status === "failed") {
       badge = "失败";
+      kind = "failed";
       tip = monitor
         ? "任务失败 · 可点击「恢复监控」重试"
         : "任务失败 · 可点击「继续」重试";
       stateClass = "is-placeholder is-state-failed";
       liveState = "failed";
-      badgeCls = "is-fail";
     } else if (status === "pending") {
       badge = "待开始";
+      kind = "idle";
       tip = monitor
         ? "等待开始 · 点击「恢复监控」开始监控"
         : "等待开始 · 点击「继续」开始下载";
@@ -6855,7 +7234,7 @@ function renderLiveProgress(t) {
     }
     return `<div class="live-progress idle ${stateClass}" data-phase="placeholder" data-live-state="${liveState}">
       <div class="dl-panel-head">
-        <span class="dl-status-badge ${badgeCls}">${escapeHtml(badge)}</span>
+        ${progressBadgeHtml(kind, badge)}
       </div>
       <div class="live-placeholder-text">${escapeHtml(tip)}</div>
       <div class="prog-track state-bar"><div class="prog-fill"></div></div>
@@ -6866,18 +7245,18 @@ function renderLiveProgress(t) {
   const paused = live.phase === "paused" || t.status === "paused";
   const laneWorkers = panelWorkerLanes(live);
   const speedText = paused
-    ? "已暂停"
+    ? "暂停中"
     : formatSpeed(live.speed, { waiting: t.status === "running" });
   let itemsHtml = "";
   let panelSpeed = speedText;
   if (laneWorkers.length > 0) {
     itemsHtml = laneWorkers.map((w) => renderDlItemFromWorker(w, paused)).join("");
     if (!paused && laneWorkers.length > 1) panelSpeed = `合计 ${speedText}`;
-    if (paused) panelSpeed = "已暂停";
+    if (paused) panelSpeed = "";
   } else if (files.length > 0) {
     itemsHtml = files.map((f) => renderDlItemFromFile(f, paused)).join("");
     if (!paused && files.length > 1) panelSpeed = `合计 ${speedText}`;
-    if (paused) panelSpeed = "已暂停";
+    if (paused) panelSpeed = "";
   } else {
     itemsHtml = renderDlItemFromLive(live, paused);
   }
@@ -7012,6 +7391,22 @@ function humanizeLogText(text) {
   t = t.replace(/已下载:\s*/g, "已下载 ");
   t = t.replace(/^已请求暂停：/, "已请求暂停 · ");
   t = t.replace(/^已暂停，保留进度:\s*/, "已暂停，保留进度 ");
+  // Settings lines with English enum values (legacy DB rows)
+  if (/^已更新任务设置:|^已改设置/.test(t)) {
+    t = t.replace(/^已更新任务设置:\s*/, "已改设置 · ");
+    t = t.replace(/目录 caption/g, "按文案建目录");
+    t = t.replace(/目录 media_type/g, "按类型建目录");
+    t = t.replace(/目录 flat/g, "不建子目录");
+    t = t.replace(/方向 added_first/g, "先入库先下");
+    t = t.replace(/方向 oldest_first/g, "从旧到新");
+    t = t.replace(/方向 newest_first/g, "从新到旧");
+    t = t.replace(/\bphoto\b/g, "图片");
+    t = t.replace(/\bvideo_note\b/g, "圆视频");
+    t = t.replace(/\bvideo\b/g, "视频");
+    t = t.replace(/\bdocument\b/g, "文件");
+    t = t.replace(/\baudio\b/g, "音频");
+    t = t.replace(/\bvoice\b/g, "语音");
+  }
   return t;
 }
 
@@ -7069,6 +7464,19 @@ function orderLogLinesNewestFirst(raw) {
   return lines;
 }
 
+function switchTaskTab(card, tab) {
+  if (!card) return;
+  const want = tab === "log" ? "log" : "progress";
+  card.querySelectorAll(".task-tab").forEach((b) => {
+    const on = b.dataset.tab === want;
+    b.classList.toggle("is-active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  card.querySelectorAll(".task-tab-panel").forEach((p) => {
+    p.hidden = p.dataset.panel !== want;
+  });
+}
+
 function renderTaskLog(raw, taskId) {
   const id = taskId != null ? String(taskId) : "";
   const clearBtn = id
@@ -7078,9 +7486,8 @@ function renderTaskLog(raw, taskId) {
   if (!lines.length) {
     return `<div class="task-log">
       <div class="task-log-head">
-        <span>活动日志</span>
+        <span class="muted">暂无记录</span>
         <div class="task-log-head-right">
-          <span class="muted">暂无</span>
           ${clearBtn}
         </div>
       </div>
@@ -7114,9 +7521,7 @@ function renderTaskLog(raw, taskId) {
     .join("");
   return `<div class="task-log">
     <div class="task-log-head">
-      <span>活动日志</span>
       <div class="task-log-head-right">
-        <span class="muted">最新在上 · ${lines.length} 条</span>
         ${clearBtn}
       </div>
     </div>
@@ -7291,7 +7696,7 @@ function renderMonitorTagHint(t) {
 
 function renderTask(t) {
   const status = t.status || "pending";
-  const statusClass = `status-${status}`;
+  const statusClass = statusPillClass(t);
   const modeMeta = taskModeMeta(t);
   const q = queueRemaining(t);
   const title = t.chat_title || t.chat_id || "";
@@ -7314,6 +7719,8 @@ function renderTask(t) {
       : "ui-ico-check"
     : "ui-ico-play";
   const statTitles = taskStatTitles(t);
+  const activeTab =
+    (state.taskTabs && state.taskTabs[String(t.id)]) === "log" ? "log" : "progress";
   return `<div class="task" data-task-id="${t.id}" data-status="${escapeHtml(status)}" data-mode="${modeMeta.mode}">
     <div class="task-head">
       <div class="task-head-main">
@@ -7344,8 +7751,18 @@ function renderTask(t) {
         </button>
       </div>
       ${t.last_error ? `<p class="msg err is-visible"><span class="msg-icon" aria-hidden="true"></span><span class="msg-text">${escapeHtml(t.last_error)}</span></p>` : ""}
-      ${renderLiveProgress(t)}
-      ${renderTaskLog(t.last_log, t.id)}
+      <div class="task-tabs" role="tablist" aria-label="任务面板">
+        <button type="button" class="task-tab${activeTab === "progress" ? " is-active" : ""}" role="tab" data-action="task-tab" data-tab="progress" data-id="${t.id}" aria-selected="${activeTab === "progress" ? "true" : "false"}">进度</button>
+        <button type="button" class="task-tab${activeTab === "log" ? " is-active" : ""}" role="tab" data-action="task-tab" data-tab="log" data-id="${t.id}" aria-selected="${activeTab === "log" ? "true" : "false"}">日志</button>
+      </div>
+      <div class="task-tab-panels">
+        <div class="task-tab-panel" data-panel="progress"${activeTab === "progress" ? "" : " hidden"}>
+          ${renderLiveProgress(t)}
+        </div>
+        <div class="task-tab-panel" data-panel="log"${activeTab === "log" ? "" : " hidden"}>
+          ${renderTaskLog(t.last_log, t.id)}
+        </div>
+      </div>
     </div>
   </div>`;
 }

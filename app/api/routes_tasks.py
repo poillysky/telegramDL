@@ -635,7 +635,15 @@ async def update_task_settings(
         old_media = [str(x) for x in (task.get("media_types") or [])]
         if set(media) != set(old_media) or len(media) != len(old_media):
             fields["media_types"] = media
-            log_bits.append("媒体 " + "、".join(media))
+            media_zh = {
+                "photo": "图片",
+                "video": "视频",
+                "document": "文件",
+                "audio": "音频",
+                "voice": "语音",
+                "video_note": "圆视频",
+            }
+            log_bits.append("媒体 " + "、".join(media_zh.get(m, m) for m in media))
 
     if body.folder_mode is not None:
         folder_mode = str(body.folder_mode or "caption")
@@ -653,28 +661,33 @@ async def update_task_settings(
         if folder_mode != old_folder or use_text != old_use:
             fields["folder_mode"] = folder_mode
             fields["use_text_as_folder"] = use_text
-            log_bits.append(f"目录 {folder_mode}")
+            folder_zh = {
+                "caption": "按文案建目录",
+                "media_type": "按类型建目录",
+                "flat": "不建子目录",
+            }
+            log_bits.append(folder_zh.get(folder_mode, "目录已改"))
     elif body.use_text_as_folder is not None:
         use_text = bool(body.use_text_as_folder)
         if use_text != bool(task.get("use_text_as_folder")):
             fields["use_text_as_folder"] = use_text
-            log_bits.append(f"文案目录 {'开' if use_text else '关'}")
+            log_bits.append(f"文案目录{'开' if use_text else '关'}")
 
     if body.clear_start_date:
         fields["start_date"] = None
-        log_bits.append("起始日期 清空")
+        log_bits.append("清空起始日期")
     elif body.start_date is not None:
         sd = str(body.start_date).strip() or None
         fields["start_date"] = sd
-        log_bits.append(f"起始日期 {sd or '空'}")
+        log_bits.append(f"起始 {sd}" if sd else "清空起始日期")
 
     if body.clear_end_date:
         fields["end_date"] = None
-        log_bits.append("结束日期 清空")
+        log_bits.append("清空结束日期")
     elif body.end_date is not None:
         ed = str(body.end_date).strip() or None
         fields["end_date"] = ed
-        log_bits.append(f"结束日期 {ed or '空'}")
+        log_bits.append(f"结束 {ed}" if ed else "清空结束日期")
 
     if body.download_order is not None:
         order = str(body.download_order or "added_first")
@@ -683,11 +696,16 @@ async def update_task_settings(
         old_order = str(task.get("download_order") or "added_first")
         if order != old_order:
             fields["download_order"] = order
-            log_bits.append(f"方向 {order}")
+            order_zh = {
+                "added_first": "先入库先下",
+                "oldest_first": "从旧到新",
+                "newest_first": "从新到旧",
+            }
+            log_bits.append(order_zh.get(order, "方向已改"))
 
     if body.clear_max_messages:
         fields["max_messages"] = None
-        log_bits.append("上限 不限")
+        log_bits.append("数量不限")
     elif body.max_messages is not None:
         fields["max_messages"] = int(body.max_messages)
         log_bits.append(f"上限 {fields['max_messages']}")
@@ -703,24 +721,39 @@ async def update_task_settings(
 
     if body.min_file_bytes is not None:
         fields["min_file_bytes"] = max(0, int(body.min_file_bytes))
-        log_bits.append(f"最小文件 {fields['min_file_bytes']}B")
+        mb = fields["min_file_bytes"]
+        if mb >= 1024 * 1024:
+            log_bits.append(f"最小 {mb / (1024 * 1024):g}MB")
+        elif mb >= 1024:
+            log_bits.append(f"最小 {mb / 1024:g}KB")
+        else:
+            log_bits.append(f"最小 {mb}B" if mb else "最小不限")
     if body.max_file_bytes is not None:
         fields["max_file_bytes"] = max(0, int(body.max_file_bytes))
-        log_bits.append(f"最大文件 {fields['max_file_bytes']}B")
+        mb = fields["max_file_bytes"]
+        if mb <= 0:
+            log_bits.append("最大不限")
+        elif mb >= 1024 * 1024:
+            log_bits.append(f"最大 {mb / (1024 * 1024):g}MB")
+        elif mb >= 1024:
+            log_bits.append(f"最大 {mb / 1024:g}KB")
+        else:
+            log_bits.append(f"最大 {mb}B")
 
     if not fields:
         return {"ok": True, "task": _task_list_snapshot(task)}
 
     await db.update_task(task_id, **fields)
     # Log in background — append_log contends with downloaders on SQLite
+    settings_line = "已改设置 · " + " · ".join(log_bits) if log_bits else "已改设置"
     try:
         import asyncio
 
         asyncio.get_running_loop().create_task(
-            db.append_log(task_id, "已更新任务设置: " + " · ".join(log_bits))
+            db.append_log(task_id, settings_line)
         )
     except Exception:
-        await db.append_log(task_id, "已更新任务设置: " + " · ".join(log_bits))
+        await db.append_log(task_id, settings_line)
     _tag_match_cache.pop(int(task_id), None)
     _tag_done_cache.pop(int(task_id), None)
     task = await db.get_task(task_id)
@@ -822,9 +855,17 @@ async def start_task(task_id: int, _: None = Depends(require_web_auth)):
     if not task:
         raise HTTPException(404, "任务不存在")
     await scheduler.heal_stale_running(task_id)
-    await db.update_task(task_id, status="pending", last_error=None)
+    prev = str(task.get("status") or "")
+    mon = normalize_download_mode(task.get("download_mode") or "") == "monitor"
+    # Mark running immediately so UI never sticks on「等待中」
+    await db.update_task(task_id, status="running", last_error=None)
+    if mon:
+        boot_msg = "正在恢复监控…" if prev == "paused" else "正在启动监控…"
+    else:
+        boot_msg = "正在继续下载…" if prev == "paused" else "正在启动下载…"
+    await db.append_log(task_id, boot_msg)
     await scheduler.start_task(task_id)
-    # Brief wait for worker to flip status — keep short so UI stays responsive
+    # Brief wait for worker to settle — keep short so UI stays responsive
     for _ in range(15):
         await asyncio.sleep(0.1)
         task = await db.get_task(task_id)
@@ -839,7 +880,9 @@ async def pause_task(task_id: int, _: None = Depends(require_web_auth)):
     task = await db.get_task(task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
+    mon = normalize_download_mode(task.get("download_mode") or "") == "monitor"
     await scheduler.pause_task(task_id)
+    await db.append_log(task_id, "已暂停监控" if mon else "已暂停下载")
     task = await db.get_task(task_id)
     return {"ok": True, "task": task}
 

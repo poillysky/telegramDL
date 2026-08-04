@@ -282,16 +282,16 @@ body {
   .task-filter-line {
     border-color: rgba(148, 163, 184, 0.14) !important;
   }
-  /* Phone + single task: log stretches toward screen bottom (JS refines) */
+  /* Phone + single task: log tab stretches toward screen bottom (JS refines) */
   .page-tasks .tasks > .task:only-child .task-body {
     padding-bottom: 0;
   }
-  .page-tasks .tasks > .task:only-child .task-log {
+  .page-tasks .tasks > .task:only-child .task-tab-panel[data-panel="log"]:not([hidden]) .task-log {
     max-height: none !important;
     margin-bottom: 0;
   }
-  .page-tasks .tasks > .task:only-child .task-log-body,
-  .page-tasks .tasks > .task:only-child .task-log-empty {
+  .page-tasks .tasks > .task:only-child .task-tab-panel[data-panel="log"]:not([hidden]) .task-log-body,
+  .page-tasks .tasks > .task:only-child .task-tab-panel[data-panel="log"]:not([hidden]) .task-log-empty {
     max-height: none !important;
     min-height: calc(
       100dvh - 22.5rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
@@ -3575,6 +3575,7 @@ button:disabled {
 .page-tasks .tasks > .task .task-actions,
 .page-tasks .tasks > .task .task-tags-summary,
 .page-tasks .tasks > .task .task-filter-line,
+.page-tasks .tasks > .task .task-tabs,
 .page-tasks .tasks > .task .live-panel,
 .page-tasks .tasks > .task .task-body {
   flex-shrink: 0;
@@ -3582,6 +3583,10 @@ button:disabled {
 .page-tasks .tasks > .task .task-body {
   display: flex;
   flex-direction: column;
+}
+.page-tasks .tasks > .task .task-tab-panels {
+  flex: 0 0 auto;
+  min-width: 0;
 }
 .page-tasks .tasks > .task .task-log {
   flex: 0 0 auto;
@@ -4279,6 +4284,67 @@ button:disabled {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
 }
 
+.task-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  margin: 2px 0 0;
+  padding: 3px;
+  border-radius: 12px;
+  background: rgba(148, 163, 184, 0.12);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.task-tab {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 34px !important;
+  height: 34px;
+  padding: 0 12px !important;
+  margin: 0;
+  border: none !important;
+  border-radius: 9px !important;
+  background: transparent !important;
+  color: #64748b !important;
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  box-shadow: none !important;
+  transform: none !important;
+}
+
+.task-tab:hover {
+  color: #334155 !important;
+  background: rgba(255, 255, 255, 0.45) !important;
+  transform: none !important;
+}
+
+.task-tab.is-active {
+  color: #0f172a !important;
+  background: #fff !important;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08) !important;
+}
+
+.task-tab-panels {
+  min-width: 0;
+}
+
+.task-tab-panel[hidden] {
+  display: none !important;
+}
+
+.task-tab-panel[data-panel="progress"]:empty::before {
+  content: "暂无进行中的下载";
+  display: block;
+  padding: 16px 12px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.82rem;
+  border-radius: 14px;
+  border: 1px dashed rgba(148, 163, 184, 0.35);
+  background: rgba(248, 250, 252, 0.8);
+}
+
 .task-log-head {
   display: flex;
   align-items: center;
@@ -4291,7 +4357,7 @@ button:disabled {
   letter-spacing: 0.04em;
   color: #374151;
   background: linear-gradient(180deg, #eef6ff 0%, #e8f2fc 100%);
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 .task-log-head-right {
@@ -4527,11 +4593,11 @@ button.log-clear-btn:hover {
   }
   .log-title { font-size: 0.9rem; }
   .log-detail { font-size: 0.88rem; }
-  .page-tasks .tasks > .task:only-child .task-log {
+  .page-tasks .tasks > .task:only-child .task-tab-panel[data-panel="log"]:not([hidden]) .task-log {
     max-height: none !important;
   }
-  .page-tasks .tasks > .task:only-child .task-log-body,
-  .page-tasks .tasks > .task:only-child .task-log-empty {
+  .page-tasks .tasks > .task:only-child .task-tab-panel[data-panel="log"]:not([hidden]) .task-log-body,
+  .page-tasks .tasks > .task:only-child .task-tab-panel[data-panel="log"]:not([hidden]) .task-log-empty {
     max-height: none !important;
     min-height: calc(
       100dvh - 20rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
@@ -4540,7 +4606,7 @@ button.log-clear-btn:hover {
       100dvh - 20rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
     );
   }
-  .page-tasks .tasks > .task:only-child .task-log-empty {
+  .page-tasks .tasks > .task:only-child .task-tab-panel[data-panel="log"]:not([hidden]) .task-log-empty {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -4564,17 +4630,58 @@ button.log-clear-btn:hover {
 
 .status-pill {
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-family: var(--font-display);
   font-size: 0.72rem;
   font-weight: 700;
-  padding: 6px 11px;
+  padding: 6px 11px 6px 9px;
   border-radius: 10px;
   border: 1px solid var(--line);
   letter-spacing: 0.04em;
   text-transform: uppercase;
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }
+.status-pill::before {
+  content: "";
+  width: 10px;
+  height: 10px;
+  flex-shrink: 0;
+  background: currentColor;
+  -webkit-mask: no-repeat center / contain;
+  mask: no-repeat center / contain;
+}
+.status-running::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3v12'/%3E%3Cpath d='m7 11 5 5 5-5'/%3E%3Cpath d='M5 19h14'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3v12'/%3E%3Cpath d='m7 11 5 5 5-5'/%3E%3Cpath d='M5 19h14'/%3E%3C/svg%3E");
+}
+.status-monitoring::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='2.2' fill='black' stroke='none'/%3E%3Ccircle cx='12' cy='12' r='6'/%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='2.2' fill='black' stroke='none'/%3E%3Ccircle cx='12' cy='12' r='6'/%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3C/svg%3E");
+}
+.status-paused::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='black'%3E%3Cpath d='M7 5h3v14H7zm7 0h3v14h-3z'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='black'%3E%3Cpath d='M7 5h3v14H7zm7 0h3v14h-3z'/%3E%3C/svg%3E");
+}
+.status-completed::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+}
+.status-failed::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 7v6M12 16.5v.5'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 7v6M12 16.5v.5'/%3E%3C/svg%3E");
+}
+.status-pending::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 7v5l3 2'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 7v5l3 2'/%3E%3C/svg%3E");
+}
 .status-running { color: #ffffff; border-color: transparent; background: var(--accent); }
+.status-monitoring {
+  color: #047857;
+  border-color: rgba(16, 185, 129, 0.38);
+  background: rgba(16, 185, 129, 0.16);
+}
 .status-paused { color: #9a6408; border-color: rgba(212, 137, 11, 0.35); background: rgba(245, 165, 36, 0.16); }
 .status-completed { color: #147a42; border-color: rgba(40, 199, 111, 0.35); background: rgba(40, 199, 111, 0.14); }
 .status-failed { color: #b42334; border-color: rgba(255, 90, 106, 0.35); background: rgba(255, 90, 106, 0.12); }
@@ -4636,8 +4743,9 @@ a { color: var(--accent); }
 .dl-status-badge {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
   min-height: 24px;
-  padding: 0 10px;
+  padding: 0 10px 0 8px;
   border-radius: 999px;
   font-size: 0.75rem;
   font-weight: 750;
@@ -4646,25 +4754,68 @@ a { color: var(--accent); }
   background: rgba(37, 99, 235, 0.12);
   border: 1px solid rgba(37, 99, 235, 0.28);
 }
+.dl-status-badge::before {
+  content: "";
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  background: currentColor;
+  -webkit-mask: no-repeat center / contain;
+  mask: no-repeat center / contain;
+  /* default = download arrow */
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3v12'/%3E%3Cpath d='m7 11 5 5 5-5'/%3E%3Cpath d='M5 19h14'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3v12'/%3E%3Cpath d='m7 11 5 5 5-5'/%3E%3Cpath d='M5 19h14'/%3E%3C/svg%3E");
+}
+.dl-status-badge.is-download {
+  color: #1d4ed8;
+  background: rgba(37, 99, 235, 0.12);
+  border-color: rgba(37, 99, 235, 0.28);
+}
 .dl-status-badge.is-monitor {
   color: #047857;
   background: rgba(16, 185, 129, 0.14);
   border-color: rgba(16, 185, 129, 0.32);
+}
+.dl-status-badge.is-monitor::before {
+  /* radar / pulse ring */
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='2.2' fill='black' stroke='none'/%3E%3Ccircle cx='12' cy='12' r='6'/%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='2.2' fill='black' stroke='none'/%3E%3Ccircle cx='12' cy='12' r='6'/%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3C/svg%3E");
+}
+.dl-status-badge.is-paused {
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(217, 119, 6, 0.35);
+}
+.dl-status-badge.is-paused::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='black'%3E%3Cpath d='M7 5h3v14H7zm7 0h3v14h-3z'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='black'%3E%3Cpath d='M7 5h3v14H7zm7 0h3v14h-3z'/%3E%3C/svg%3E");
 }
 .dl-status-badge.is-done {
   color: #15803d;
   background: rgba(34, 197, 94, 0.14);
   border-color: rgba(34, 197, 94, 0.3);
 }
+.dl-status-badge.is-done::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+}
 .dl-status-badge.is-fail {
   color: #b91c1c;
   background: rgba(239, 68, 68, 0.12);
   border-color: rgba(239, 68, 68, 0.28);
 }
+.dl-status-badge.is-fail::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 7v6M12 16.5v.5'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 7v6M12 16.5v.5'/%3E%3C/svg%3E");
+}
 .live-progress.is-state-paused .dl-status-badge {
   color: #b45309;
   background: rgba(245, 158, 11, 0.16);
   border-color: rgba(217, 119, 6, 0.35);
+}
+.live-progress.is-state-paused .dl-status-badge::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='black'%3E%3Cpath d='M7 5h3v14H7zm7 0h3v14h-3z'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='black'%3E%3Cpath d='M7 5h3v14H7zm7 0h3v14h-3z'/%3E%3C/svg%3E");
 }
 .dl-panel-speed {
   font-size: 0.82rem;
@@ -4674,6 +4825,10 @@ a { color: var(--accent); }
 }
 .live-progress.is-state-paused .dl-panel-speed {
   color: #b45309;
+}
+.live-progress.is-state-monitoring .dl-panel-speed,
+.live-progress.is-monitor-wait .dl-panel-speed {
+  color: #047857;
 }
 
 /* 单条下载项 */
@@ -4789,19 +4944,22 @@ a { color: var(--accent); }
   background: rgba(148, 163, 184, 0.18);
 }
 
-/* —— 监控中：青绿 —— */
+/* —— 监控中 / 启动中：青绿 —— */
 .live-progress.is-state-monitoring,
-.live-progress.is-monitor-wait {
+.live-progress.is-monitor-wait,
+.live-progress.is-state-starting {
   border-color: rgba(31, 157, 126, 0.34);
   background: linear-gradient(180deg, rgba(236, 253, 245, 0.98) 0%, rgba(209, 250, 229, 0.55) 100%);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
 }
 .live-progress.is-state-monitoring .live-placeholder-kicker,
-.live-progress.is-monitor-wait .live-placeholder-kicker {
+.live-progress.is-monitor-wait .live-placeholder-kicker,
+.live-progress.is-state-starting .live-placeholder-kicker {
   color: #047857;
 }
 .live-progress.is-state-monitoring .live-placeholder-text,
-.live-progress.is-monitor-wait .live-placeholder-text {
+.live-progress.is-monitor-wait .live-placeholder-text,
+.live-progress.is-state-starting .live-placeholder-text {
   color: #065f46;
 }
 .prog-track.monitor-wait {

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "镜像标签（如 1.0.16）"
+        description: "镜像标签（如 1.0.17）"
         required: true
-        default: "1.0.16"
+        default: "1.0.17"
       dockerhub_username:
         description: "Docker Hub 用户名（默认 poillysky）"
         required: false

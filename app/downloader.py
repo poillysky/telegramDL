@@ -856,13 +856,19 @@ class DownloadScheduler:
         with self._progress_lock:
             bucket = self._progress.get(task_id)
             if not bucket or bucket.get("phase") == "indexing":
-                self._progress[task_id] = {
-                    "phase": "paused",
-                    "title": "已暂停",
-                    "worker_count": 0,
-                    "workers": {},
-                    "files": {},
-                }
+                # Idle pause — no bars to freeze; clear so UI shows simple placeholder
+                self._progress.pop(task_id, None)
+                return
+            has_bars = False
+            for slot in (bucket.get("workers") or {}).values():
+                st = str(slot.get("status") or "")
+                if st in ("busy", "switching", "paused") or slot.get("file"):
+                    has_bars = True
+                    break
+            if not has_bars and (bucket.get("files") or {}):
+                has_bars = True
+            if not has_bars:
+                self._progress.pop(task_id, None)
                 return
             bucket["phase"] = "paused"
             for slot in (bucket.get("workers") or {}).values():
@@ -1156,6 +1162,14 @@ class DownloadScheduler:
         self, task_id: int, stop_event: asyncio.Event, gen: int
     ) -> None:
         me = asyncio.current_task()
+        try:
+            limit = await self._parallel_limit()
+            if self._active_slots >= limit:
+                await self.db.append_log(
+                    task_id, f"并行位已满（上限 {limit}），排队等待空位…"
+                )
+        except Exception:
+            pass
         await self._acquire_slot()
         try:
             # Superseded while waiting for a parallel slot
