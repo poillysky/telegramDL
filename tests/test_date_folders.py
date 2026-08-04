@@ -116,3 +116,35 @@ def test_migrate_moves_caption_folder(tmp_path: Path):
     assert moves
     assert (new / "vlc_record_2026_04_11_01h00m00s.mp4").is_file()
     assert not old.exists()
+
+
+def test_migrate_does_not_merge_different_date_ranges(tmp_path: Path):
+    """Different caption ranges must not flip-flop into each other."""
+    tag = tmp_path / "#娇萌小朋友"
+    a = tag / "2025.6.12-2025.6.18"
+    b = tag / "2025.6.26-2025.7.1"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    (a / "early.mp4").write_bytes(b"a")
+    (b / "late.mp4").write_bytes(b"b")
+    moves = migrate_legacy_date_dirs(
+        tag, "2025.6.26-2025.7.1", caption="#娇萌小朋友 6.26-7.1"
+    )
+    assert not moves
+    assert a.is_dir() and (a / "early.mp4").is_file()
+    assert b.is_dir() and (b / "late.mp4").is_file()
+
+
+def test_migrate_skips_dir_with_part_files(tmp_path: Path):
+    tag = tmp_path / "#demo"
+    old = tag / "7.11"
+    old.mkdir(parents=True)
+    (old / "clip.mp4.part").write_bytes(b"partial")
+    new = tag / "2026.7.11-2026.7.14"
+    new.mkdir()
+    moves = migrate_legacy_date_dirs(
+        tag, "2026.7.11-2026.7.14", caption="#demo 7.11-14"
+    )
+    assert not moves
+    assert old.is_dir()
+    assert (old / "clip.mp4.part").is_file()

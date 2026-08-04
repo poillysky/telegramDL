@@ -468,12 +468,25 @@ def date_token_from_dir(
     caption_hint: Optional[str] = None,
     sample: int = 80,
 ) -> Optional[str]:
-    """Rebuild folder date: MD from dir name/caption mapping hint + years from files."""
-    md = strip_years_from_date_token(dir_path.name)
+    """Rebuild folder date: MD from dir name (+ optional caption only if name is start-only)."""
+    name_md = strip_years_from_date_token(dir_path.name) or dir_path.name
+    md = name_md
+    # Caption may expand start-only「7.11」→「7.11-7.14」, but must NEVER
+    # overwrite an existing full range with a different caption range
+    # (that caused 6.12-6.18 ↔ 6.26-7.1 flip-flop mid-download).
     if caption_hint:
         cap_md = extract_date_token(caption_hint)
         if cap_md:
-            md = strip_years_from_date_token(cap_md) or cap_md
+            cap_bare = strip_years_from_date_token(cap_md) or cap_md
+            name_is_range = "-" in str(name_md)
+            cap_is_range = "-" in str(cap_bare)
+            if not name_is_range and cap_is_range:
+                # start-only dir → allow caption range expansion when start matches
+                if str(name_md) == str(cap_bare).split("-", 1)[0]:
+                    md = cap_bare
+            elif not name_is_range and not cap_is_range:
+                md = cap_bare
+            # else: keep dir's own MD range
     years = years_from_dir(dir_path, sample=sample)
     return apply_years_to_caption_date(md, years)
 
@@ -1250,6 +1263,17 @@ def date_folder_legacy_aliases(token: str) -> set[str]:
     return {x for x in out if x}
 
 
+def _dir_has_part_files(dir_path: Path) -> bool:
+    """True if tree has any .part (active/resumable download) — do not merge away."""
+    try:
+        for p in dir_path.rglob("*.part"):
+            if p.is_file():
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def migrate_legacy_date_dirs(
     parent_dir: Path,
     canonical: str,
@@ -1260,8 +1284,9 @@ def migrate_legacy_date_dirs(
     """
     Move sibling legacy date folders into canonical under parent_dir.
 
-    Pulls: name aliases of canonical, caption date folders (e.g. 7.11), and
-    siblings whose file YMD range equals canonical. Old files move with rename.
+    Pulls only true aliases of canonical (same month-day span / start-only
+    legacy names). Never merges a different caption date range into another.
+    Skips sources that still hold .part files (active download).
     """
     canonical = sanitize_name(str(canonical or "").strip(), max_len=40)
     if not canonical or not parent_dir.is_dir():
@@ -1274,11 +1299,21 @@ def migrate_legacy_date_dirs(
             aliases |= date_folder_legacy_aliases(a)
     cap_tok = extract_date_token(caption or "")
     if cap_tok:
-        aliases.add(cap_tok)
-        aliases |= date_folder_legacy_aliases(cap_tok)
-        if "-" in cap_tok:
-            aliases.add(cap_tok.split("-", 1)[0])
+        # Caption aliases only when they match this canonical MD span
+        cap_bare = strip_years_from_date_token(cap_tok) or cap_tok
+        can_bare = strip_years_from_date_token(canonical) or canonical
+        if cap_bare == can_bare or (
+            "-" not in str(cap_bare)
+            and str(can_bare).startswith(str(cap_bare) + "-")
+        ) or (
+            "-" not in str(cap_bare) and str(can_bare).split("-", 1)[0] == str(cap_bare)
+        ):
+            aliases.add(cap_tok)
+            aliases |= date_folder_legacy_aliases(cap_tok)
+            if "-" in cap_tok:
+                aliases.add(cap_tok.split("-", 1)[0])
     aliases.discard(canonical)
+    can_bare = strip_years_from_date_token(canonical) or canonical
 
     dst = parent_dir / canonical
     moves: list[tuple[str, Path, Path]] = []
@@ -1293,13 +1328,25 @@ def migrate_legacy_date_dirs(
             continue
         pull = child.name in aliases
         if not pull and looks_like_date_folder(child.name):
-            # Same MD (ignoring year) or rebuilt token equals canonical
-            rebuilt = date_token_from_dir(child, caption_hint=caption)
-            pull = rebuilt == canonical or (
-                strip_years_from_date_token(child.name)
-                == strip_years_from_date_token(canonical)
-            )
+            child_bare = strip_years_from_date_token(child.name) or child.name
+            # Same MD span (ignore year) only — never pull a different range
+            if child_bare == can_bare:
+                pull = True
+            else:
+                # Rebuild from dir's OWN name (no caption override)
+                rebuilt = date_token_from_dir(child, caption_hint=None)
+                pull = bool(
+                    rebuilt
+                    and (
+                        rebuilt == canonical
+                        or (strip_years_from_date_token(rebuilt) or rebuilt)
+                        == can_bare
+                    )
+                )
         if not pull:
+            continue
+        if _dir_has_part_files(child):
+            # Active / paused resume pieces live here — leave until idle
             continue
         try:
             if child.resolve() == dst.resolve():
@@ -1439,6 +1486,8 @@ def repair_date_folders(
                 except OSError:
                     if src.name == dst.name:
                         continue
+                if _dir_has_part_files(src):
+                    continue
                 src_snap = Path(src)
                 dst.mkdir(parents=True, exist_ok=True)
                 _merge_tree_into(src, dst)

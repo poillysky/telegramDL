@@ -1216,6 +1216,18 @@ class DownloadScheduler:
                         st = None
                     if st and str(st.get("status") or "") == "paused":
                         self._freeze_progress_paused(task_id)
+                        try:
+                            title = str((st or {}).get("chat_title") or "")
+                            chat_id = st.get("chat_id")
+                            if chat_id is not None:
+                                gdir = get_settings().download_dir / sanitize_name(
+                                    title or str(chat_id)
+                                )
+                                await self._cleanup_temp_for_group(
+                                    task_id, chat_id, gdir
+                                )
+                        except Exception:
+                            logger.debug("temp cleanup after pause failed", exc_info=True)
                     else:
                         self._clear_progress(task_id)
                     self._clear_task_filters(task_id)
@@ -1292,6 +1304,17 @@ class DownloadScheduler:
 
         group_dir = settings.download_dir / sanitize_name(title)
         group_dir.mkdir(parents=True, exist_ok=True)
+        # Fresh date-dir sync bookkeeping for this run
+        self._synced_date_dirs = set()
+        # Sync local finished files into completed queue, then tidy temp
+        try:
+            await self.db.sync_local_completed_from_dir(chat_id, group_dir)
+        except Exception:
+            logger.debug("sync_local_completed_from_dir failed", exc_info=True)
+        try:
+            await self._cleanup_temp_for_group(task_id, chat_id, group_dir)
+        except Exception:
+            logger.debug("temp cleanup failed", exc_info=True)
 
         media_types = set(task["media_types"] or [])
         use_text_as_folder = bool(task["use_text_as_folder"])
@@ -2627,6 +2650,12 @@ class DownloadScheduler:
             except Exception:
                 logger.debug("rewrite paths after date repair failed", exc_info=True)
         await self._mirror_moves_to_temp(moves, prune_under=group_dir)
+        try:
+            await self._cleanup_temp_for_group(
+                task_id, chat_id if chat_id is not None else 0, group_dir, quiet=True
+            )
+        except Exception:
+            logger.debug("temp cleanup after date repair failed", exc_info=True)
 
     async def _mirror_moves_to_temp(
         self,
@@ -2661,6 +2690,15 @@ class DownloadScheduler:
 
         if not looks_like_date_folder(target_dir.name):
             return
+        # Once per target path per worker generation — avoid flip-flop mid-batch
+        key = str(target_dir.resolve()) if target_dir.exists() else str(target_dir)
+        done = getattr(self, "_synced_date_dirs", None)
+        if done is None:
+            self._synced_date_dirs = set()
+            done = self._synced_date_dirs
+        if key in done:
+            return
+        done.add(key)
         parent = target_dir.parent
         try:
             moves = await asyncio.to_thread(
@@ -3252,7 +3290,67 @@ class DownloadScheduler:
                 logger.debug(
                     "migrate legacy .part failed: %s -> %s", legacy, part, exc_info=True
                 )
+        # Date-folder rename may have moved the .part under a sibling dir
+        if not part.exists():
+            recovered = self._find_relocated_part(part)
+            if recovered is not None and recovered.exists():
+                try:
+                    part.parent.mkdir(parents=True, exist_ok=True)
+                    if recovered.resolve() != part.resolve():
+                        self._move_path(recovered, part)
+                except OSError:
+                    return recovered
         return part
+
+    def _find_relocated_part(self, expected_part: Path) -> Path | None:
+        """Find same-named .part under the tag folder if date dir was renamed."""
+        name = expected_part.name
+        try:
+            # temp/.../Group/Tag/Date/file.mp4.part → search under Tag/
+            tag_dir = expected_part.parent.parent
+            if not tag_dir.is_dir():
+                return None
+            hits: list[Path] = []
+            for p in tag_dir.rglob(name):
+                if p.is_file():
+                    hits.append(p)
+            if not hits:
+                return None
+            # Prefer largest (most progress)
+            hits.sort(key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
+            return hits[0]
+        except OSError:
+            return None
+
+    async def _cleanup_temp_for_group(
+        self,
+        task_id: int,
+        chat_id: int | str,
+        group_dir: Path,
+        *,
+        quiet: bool = False,
+    ) -> dict:
+        """Compare temp .part files with completed queue / downloads; keep resumable ones."""
+        from app.temp_cleanup import cleanup_temp_group, format_temp_cleanup_log
+
+        settings = get_settings()
+        temp_group = Path(settings.temp_dir) / group_dir.name
+        completed = await self.db.list_completed_basenames(chat_id)
+        stats = await asyncio.to_thread(
+            cleanup_temp_group,
+            temp_group,
+            Path(group_dir),
+            completed_basenames=completed,
+        )
+        changed = (
+            int(stats.get("removed_empty") or 0)
+            + int(stats.get("removed_done") or 0)
+            + int(stats.get("removed_dup") or 0)
+            + int(stats.get("dirs_pruned") or 0)
+        )
+        if changed and not quiet:
+            await self.db.append_log(task_id, format_temp_cleanup_log(stats))
+        return stats
 
     @staticmethod
     def _move_path(src: Path, dst: Path) -> None:

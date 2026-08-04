@@ -2838,6 +2838,40 @@ class Database:
             items.append(d)
         return items, total
 
+    async def list_completed_basenames(self, chat_id: str | int) -> set[str]:
+        """Filenames of finished downloads for this chat (for temp cleanup)."""
+        from pathlib import Path
+
+        chat_id = str(chat_id)
+        names: set[str] = set()
+        async with self.conn.execute(
+            """
+            SELECT file_path FROM chat_completed
+            WHERE chat_id = ?
+              AND file_path IS NOT NULL AND file_path != ''
+            """,
+            (chat_id,),
+        ) as cur:
+            for r in await cur.fetchall():
+                p = str(r["file_path"] or "").strip()
+                if p:
+                    names.add(Path(p).name)
+        async with self.conn.execute(
+            """
+            SELECT d.file_path FROM downloaded d
+            JOIN tasks t ON t.id = d.task_id
+            WHERE t.chat_id = ?
+              AND d.status = 'done'
+              AND d.file_path IS NOT NULL AND d.file_path != ''
+            """,
+            (chat_id,),
+        ) as cur:
+            for r in await cur.fetchall():
+                p = str(r["file_path"] or "").strip()
+                if p:
+                    names.add(Path(p).name)
+        return names
+
     async def sync_local_completed_from_dir(
         self,
         chat_id: str | int,
