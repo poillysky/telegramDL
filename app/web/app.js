@@ -6119,7 +6119,6 @@ function liveWorkersActive(workers) {
       w &&
       (w.status === "busy" ||
         w.status === "paused" ||
-        w.status === "switching" ||
         (w.file && w.status !== "idle"))
   );
 }
@@ -6197,8 +6196,7 @@ function liveHasRealDownloadBars(live) {
         w &&
         (String(w.file || "").trim() ||
           ((w.status === "busy" ||
-            w.status === "paused" ||
-            w.status === "switching") &&
+            w.status === "paused") &&
             (Number(w.total) > 0 || Number(w.received) > 0)))
     )
   ) {
@@ -6282,12 +6280,11 @@ function applyOptimisticPauseResume(id, action) {
                 (String(w.file || "").trim() ||
                   Number(w.total) > 0 ||
                   Number(w.received) > 0 ||
-                  w.status === "busy" ||
-                  w.status === "switching")
+                  w.status === "busy")
             )
             .map((w) => ({
               ...w,
-              status: w.status === "busy" || w.status === "switching" ? "paused" : w.status || "idle",
+              status: w.status === "busy" ? "paused" : w.status || "idle",
               speed: 0,
             }))
         : [];
@@ -6393,11 +6390,10 @@ function patchDlItemRow(row, htmlOrWorker, paused = false) {
   if (dstTrack && srcTrack) {
     const srcIndet = srcTrack.classList.contains("indeterminate");
     const srcIdle = srcTrack.classList.contains("is-idle");
-    const srcHandoff = srcTrack.classList.contains("is-handoff");
     const dstIndet = dstTrack.classList.contains("indeterminate");
     const dstIdle = dstTrack.classList.contains("is-idle");
     // Only rewrite track classes when mode changes — keeps indeterminate animation alive
-    if (srcIndet !== dstIndet || srcIdle !== dstIdle || srcHandoff !== dstTrack.classList.contains("is-handoff")) {
+    if (srcIndet !== dstIndet || srcIdle !== dstIdle) {
       dstTrack.className = srcTrack.className;
     }
   }
@@ -6987,22 +6983,15 @@ function renderDlItem({
   total = 0,
   percent = null,
   speed = 0,
-  status = "busy", // busy | paused | idle | switching
+  status = "busy", // busy | paused | idle
   label = "",
 }) {
   const busy = status === "busy";
   const frozen = status === "paused";
-  const switching = status === "switching";
-  const idle = status === "idle";
-  const showBar = busy || frozen || switching;
+  const idle = status === "idle" || (!busy && !frozen);
+  const showBar = busy || frozen;
   const pct = showBar && percent != null ? Number(percent) : null;
-  const statusText = busy
-    ? "下载中"
-    : frozen
-      ? "暂停中"
-      : switching
-        ? "准备中"
-        : "空闲";
+  const statusText = busy ? "下载中" : frozen ? "暂停中" : "空闲";
   const sizeLine = showBar
     ? total
       ? `${formatBytes(received)} / ${formatBytes(total)}`
@@ -7010,34 +6999,28 @@ function renderDlItem({
         ? formatBytes(received)
         : frozen
           ? "暂停中"
-          : switching
-            ? "即将开始下一个…"
-            : "准备中…"
+          : "准备中…"
     : "等待任务";
   const speedText = busy
     ? formatSpeed(speed, { waiting: true })
-    : frozen
-      ? "—"
-      : switching
-        ? "接下一个…"
-        : "—";
+    : "—";
   const bar = showBar
     ? pct != null
-      ? `<div class="prog-track dl-bar${switching ? " is-handoff" : ""}"><div class="prog-fill" style="width:${Math.min(100, pct)}%"></div></div>`
+      ? `<div class="prog-track dl-bar"><div class="prog-fill" style="width:${Math.min(100, pct)}%"></div></div>`
       : frozen
         ? `<div class="prog-track dl-bar is-idle"><div class="prog-fill" style="width:0%"></div></div>`
         : `<div class="prog-track dl-bar indeterminate"><div class="prog-fill"></div></div>`
     : `<div class="prog-track dl-bar is-idle"><div class="prog-fill" style="width:0%"></div></div>`;
   const title = fullPath || name;
   const display =
-    name || (switching ? "准备下一个…" : idle ? "等待任务" : frozen ? "暂停中" : "下载任务");
-  return `<div class="dl-item is-${status}" data-worker-lane="${escapeHtml(label)}">
+    name || (idle ? "等待任务" : frozen ? "暂停中" : "下载任务");
+  return `<div class="dl-item is-${busy ? "busy" : frozen ? "paused" : "idle"}" data-worker-lane="${escapeHtml(label)}">
     <div class="dl-item-top">
       <div class="dl-item-title">
         ${label ? `<span class="dl-item-lane">${escapeHtml(label)}</span>` : ""}
         <span class="dl-item-name" title="${escapeHtml(title)}">${escapeHtml(display)}</span>
       </div>
-      <span class="dl-item-badge is-${status}">${escapeHtml(statusText)}</span>
+      <span class="dl-item-badge is-${busy ? "busy" : frozen ? "paused" : "idle"}">${escapeHtml(statusText)}</span>
     </div>
     <div class="dl-item-meta">
       <span class="dl-item-size">${escapeHtml(sizeLine)}</span>
@@ -7050,24 +7033,13 @@ function renderDlItem({
 
 function renderDlItemFromWorker(w, forcePaused = false) {
   let st = String(w.status || "idle");
-  if (forcePaused && (st === "busy" || st === "switching")) st = "paused";
+  // Legacy handoff → treat as idle
+  if (st === "switching") st = "idle";
+  if (forcePaused && st === "busy") st = "paused";
   const raw = w.file || "";
-  const show =
-    st === "busy" || st === "paused" || st === "switching" || !!raw;
+  const show = st === "busy" || st === "paused" || !!raw;
   let pct = w.percent;
-  // Handoff flash at 100% only while still switching (not when paused)
-  if (
-    st === "switching" &&
-    !forcePaused &&
-    (pct == null || Number(pct) < 100) &&
-    Number(w.total) > 0
-  ) {
-    pct = 100;
-  }
-  const recv =
-    st === "switching" && !forcePaused && Number(w.total) > 0
-      ? w.total
-      : w.received;
+  const recv = w.received;
   if (
     st === "paused" &&
     (pct == null || Number.isNaN(Number(pct))) &&
@@ -7078,7 +7050,7 @@ function renderDlItemFromWorker(w, forcePaused = false) {
   return renderDlItem({
     name: show
       ? basenamePath(raw) ||
-        (w.message_id ? `消息 ${w.message_id}` : st === "switching" ? "准备下一个…" : "下载中…")
+        (w.message_id ? `消息 ${w.message_id}` : "下载中…")
       : "等待任务",
     fullPath: raw,
     received: recv,
@@ -7175,8 +7147,7 @@ function renderLiveProgress(t) {
           Number(w.total) > 0 ||
           Number(w.received) > 0 ||
           w.status === "busy" ||
-          w.status === "paused" ||
-          w.status === "switching")
+          w.status === "paused")
     );
     let itemsHtml = "";
     if (realWorkers.length > 0) {
