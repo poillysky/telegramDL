@@ -1147,11 +1147,11 @@ def merge_related_tag_folders(
     *,
     extra_tag_groups: Optional[Iterable[list[str]]] = None,
     blacklist: Optional[Iterable[str]] = None,
-) -> list[str]:
+) -> list[tuple[str, Path, Path]]:
     """
     Merge top-level #tag dirs that share tags transitively.
     #1 + #2 + related #3 → single folder #1 #2 #3
-    Date subfolders (e.g. 7.18) are preserved under the merged name.
+    Returns ``(log_line, src, dst)`` for each merge (date subfolders move with the tree).
     """
     if not group_dir.is_dir():
         return []
@@ -1182,14 +1182,15 @@ def merge_related_tag_folders(
     if not plan:
         return []
 
-    logs: list[str] = []
+    moves: list[tuple[str, Path, Path]] = []
     for src, target_name in plan:
         if not src.exists():
             continue
         dst = group_dir / target_name
+        src_snap = Path(src)
         _merge_tree_into(src, dst)
-        logs.append(f"合并目录: {src.name} → {target_name}")
-    return logs
+        moves.append((f"合并目录: {src_snap.name} → {target_name}", src_snap, dst))
+    return moves
 
 
 def build_date_folder_repairs(captions: Iterable[str]) -> dict[str, str]:
@@ -1640,6 +1641,21 @@ def resolve_media_subdir(
     return category or "_未分类"
 
 
+# Old folder_mode=media_type layout under group root
+LEGACY_MEDIA_TYPE_DIRS = frozenset(
+    {
+        "photo",
+        "video",
+        "document",
+        "audio",
+        "voice",
+        "video_note",
+        "file",
+        "sticker",
+    }
+)
+
+
 def flatten_date_dirs_under_group(group_dir: Path) -> list[tuple[str, Path, Path]]:
     """
     Move contents of date-named subfolders up into their parent tag folder.
@@ -1666,9 +1682,6 @@ def flatten_date_dirs_under_group(group_dir: Path) -> list[tuple[str, Path, Path
         for child in children:
             if not looks_like_date_folder(child.name):
                 continue
-            if _dir_has_part_files(child):
-                # Still flatten — parts stay as files under tag root via merge
-                pass
             src_snap = Path(child)
             try:
                 _merge_tree_into(child, parent)
@@ -1684,6 +1697,64 @@ def flatten_date_dirs_under_group(group_dir: Path) -> list[tuple[str, Path, Path
                     child.rmdir()
             except OSError:
                 pass
+    return moves
+
+
+def collapse_legacy_media_dirs(group_dir: Path) -> list[tuple[str, Path, Path]]:
+    """
+    Move old media-type folders (photo/video/…) into ``_未分类``.
+
+    ``群组/video/xxx.mp4`` → ``群组/_未分类/xxx.mp4``
+    """
+    group_dir = Path(group_dir)
+    if not group_dir.is_dir():
+        return []
+    moves: list[tuple[str, Path, Path]] = []
+    dst = group_dir / "_未分类"
+    try:
+        children = [p for p in group_dir.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+    for child in children:
+        if child.name not in LEGACY_MEDIA_TYPE_DIRS:
+            continue
+        if child.resolve() == dst.resolve():
+            continue
+        src_snap = Path(child)
+        try:
+            dst.mkdir(parents=True, exist_ok=True)
+            _merge_tree_into(child, dst)
+        except OSError:
+            continue
+        moves.append((f"类型目录已合并: {src_snap.name}/ → _未分类/", src_snap, dst))
+        try:
+            if child.exists() and not any(child.iterdir()):
+                child.rmdir()
+        except OSError:
+            pass
+    return moves
+
+
+def reorganize_group_to_tag_layout(group_dir: Path) -> list[tuple[str, Path, Path]]:
+    """
+    Adjust an existing group folder to tag-only layout:
+    flatten date subdirs, collapse legacy media-type dirs, re-flatten nested dates.
+    """
+    group_dir = Path(group_dir)
+    if not group_dir.is_dir():
+        return []
+    moves: list[tuple[str, Path, Path]] = []
+    for _ in range(4):
+        batch = flatten_date_dirs_under_group(group_dir)
+        if not batch:
+            break
+        moves.extend(batch)
+    moves.extend(collapse_legacy_media_dirs(group_dir))
+    for _ in range(4):
+        batch = flatten_date_dirs_under_group(group_dir)
+        if not batch:
+            break
+        moves.extend(batch)
     return moves
 
 

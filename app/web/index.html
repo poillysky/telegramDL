@@ -50,7 +50,7 @@
       font-size: 16px !important;
     }
   </style>
-  <link rel="stylesheet" href="/static/style.min.css?v=20260804-v1021" />
+  <link rel="stylesheet" href="/static/style.min.css?v=20260804-v1022" />
   <!-- Webfonts: non-blocking + optional (no 3s spinner / no late glyph swap stretch) -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -833,6 +833,13 @@
 
       <input type="hidden" id="tagsModalFolderMode" value="tag" />
 
+      <div class="tags-modal-section" id="tagsModalLocalSection" data-settings-for="both">
+        <div class="tags-modal-section-title">本地目录</div>
+        <button type="button" class="ghost" id="btnReorganizeLocal" title="整理本群 download 与 temp（运行中请先暂停）">
+          整理本地目录
+        </button>
+      </div>
+
       <!-- Sequential-only: more options -->
       <details class="tags-modal-more" id="tagsModalMoreOptions" data-settings-for="sequential" hidden>
         <summary>
@@ -1026,6 +1033,6 @@
     </div>
   </div>
 
-  <script src="/static/app.min.js?v=20260804-v1021"></script>
+  <script src="/static/app.min.js?v=20260804-v1022"></script>
 </body>
 </html>

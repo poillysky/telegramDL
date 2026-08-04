@@ -59,3 +59,25 @@ def test_flatten_noop_when_already_flat(tmp_path: Path):
     tag.mkdir()
     (tag / "a.mp4").write_bytes(b"a")
     assert flatten_date_dirs_under_group(tmp_path) == []
+
+
+def test_collapse_legacy_media_dirs(tmp_path: Path):
+    from app.organizer import collapse_legacy_media_dirs, reorganize_group_to_tag_layout
+
+    video = tmp_path / "video"
+    video.mkdir()
+    (video / "x.mp4").write_bytes(b"x")
+    dated = video / "2025.7.2-2025.7.4"
+    dated.mkdir()
+    (dated / "y.mp4").write_bytes(b"y")
+    moves = reorganize_group_to_tag_layout(tmp_path)
+    assert moves
+    assert (tmp_path / "_未分类" / "x.mp4").is_file()
+    assert (tmp_path / "_未分类" / "y.mp4").is_file()
+    assert not video.exists()
+    # collapse alone
+    photo = tmp_path / "photo"
+    photo.mkdir()
+    (photo / "z.jpg").write_bytes(b"z")
+    assert collapse_legacy_media_dirs(tmp_path)
+    assert (tmp_path / "_未分类" / "z.jpg").is_file()

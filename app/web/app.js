@@ -1189,6 +1189,7 @@ function bindUi() {
   if (btnTagsClose) btnTagsClose.addEventListener("click", closeTaskTagsModal);
   if (btnTagsModalSave) btnTagsModalSave.addEventListener("click", () => saveTaskTagsModal());
   if (tagsBackdrop) tagsBackdrop.addEventListener("click", closeTaskTagsModal);
+  $("btnReorganizeLocal")?.addEventListener("click", () => reorganizeTaskLocal());
   document.querySelectorAll(".num-stepper").forEach((wrap) => {
     if (wrap.dataset.bound === "1") return;
     wrap.dataset.bound = "1";
@@ -5929,6 +5930,35 @@ function parseKeywordsInput(raw) {
     .filter(Boolean);
 }
 
+async function reorganizeTaskLocal() {
+  const draft = state.taskTagsDraft;
+  if (!draft || !draft.taskId) {
+    toast("请先打开任务设置", "err");
+    return;
+  }
+  const btn = $("btnReorganizeLocal");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await api(`/api/tasks/${draft.taskId}/reorganize-local`, {
+      method: "POST",
+    });
+    if (!res || res.ok === false) {
+      throw new Error((res && (res.detail || res.message)) || "整理失败");
+    }
+    toast("本地目录已整理（见任务日志）", "ok");
+    try {
+      if (typeof loadTasks === "function") await loadTasks();
+    } catch (_) {
+      /* ignore */
+    }
+  } catch (e) {
+    const msg = String((e && e.message) || e || "整理失败");
+    toast(msg, "err");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function saveTaskTagsModal() {
   const draft = state.taskTagsDraft;
   if (!draft) return;
@@ -7297,9 +7327,11 @@ function parseLogLine(line) {
 function classifyLogText(text) {
   const t = String(text || "");
   // Ops that mention 「失败/空文件」but are not errors
-  if (/^临时目录整理/.test(t)) return "ok";
+  if (/^临时目录整理|^本地 (download|temp) 已整理|^本地目录整理|^开始整理本地|^\[temp\]/.test(t))
+    return "ok";
   if (/仍有\s*\d+\s*条(失败|未完成)，已暂停/.test(t)) return "warn";
-  if (/队列仍有.*待命|构建失败，回退|无法续传/.test(t)) return "warn";
+  if (/队列仍有.*待命|构建失败，回退|无法续传|无需整理/.test(t)) return "warn";
+  if (/本地目录无需整理/.test(t)) return "ok";
   if (
     /优先续传|优先重试(失败|未完成)消息|定时自动重试|重试(失败|未完成)\s*\d+|失败\/待补|未完成\/待补|\.part\/失败/.test(
       t

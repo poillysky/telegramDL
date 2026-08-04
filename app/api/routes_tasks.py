@@ -875,6 +875,29 @@ async def clear_task_log(task_id: int, _: None = Depends(require_web_auth)):
     return {"ok": True, "task": task}
 
 
+@router.post("/{task_id}/reorganize-local")
+async def reorganize_task_local(task_id: int, _: None = Depends(require_web_auth)):
+    """
+    Adjust existing download/temp folders for this task to #标签 layout:
+    merge related tags, flatten date subdirs, collapse legacy media-type dirs.
+    """
+    from app.downloader import scheduler
+
+    task = await db.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    try:
+        result = await scheduler.reorganize_local(task_id)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+    except Exception as e:
+        raise HTTPException(500, f"整理失败: {e}") from e
+    task = await db.get_task(task_id)
+    return {"ok": True, "task": task, **(result or {})}
+
+
 @router.get("/{task_id}/queue")
 async def get_task_queue(
     task_id: int,

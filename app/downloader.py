@@ -33,10 +33,10 @@ from app.organizer import (
     build_caption_batch_filenames,
     merge_related_tag_folders,
     message_text,
-    flatten_date_dirs_under_group,
     next_folder_state,
     normalize_keyword_list,
     normalize_tag_list,
+    reorganize_group_to_tag_layout,
     resolve_caption_text,
     resolve_download_path,
     resolve_media_subdir,
@@ -1380,8 +1380,10 @@ class DownloadScheduler:
         tag_blacklist = await self.db.get_tag_relation_blacklist()
         # Tag filter is always OR: hit any selected tag → download
         tag_match_mode = "any"
-        # Flatten legacy date subfolders into tag dirs before download
-        await self._flatten_date_dirs_for_group(task_id, group_dir, chat_id=chat_id)
+        # Adjust existing download/temp folders to #标签 layout before download
+        await self._reorganize_local_layout_for_group(
+            task_id, group_dir, chat_id=chat_id
+        )
         # Cap ≤8; safe operating range is 2–3 (see 运行设置 → 媒体连接数)
         from app import runtime_tune
 
@@ -2581,38 +2583,101 @@ class DownloadScheduler:
             )
         return mapping
 
-    async def _flatten_date_dirs_for_group(
+    async def _reorganize_local_layout_for_group(
         self,
         task_id: int,
         group_dir: Path,
         *,
         chat_id: int | None = None,
         quiet: bool = False,
-    ) -> None:
-        """Merge legacy date subfolders into their parent tag folder."""
+    ) -> int:
+        """
+        Adjust download + temp trees to tag-only layout.
+
+        Flattens date subdirs, collapses legacy media-type folders, mirrors
+        download moves into temp, then reorganizes temp independently.
+        Returns number of directory merges performed.
+        """
+        settings = get_settings()
+        total = 0
         try:
-            moves = await asyncio.to_thread(flatten_date_dirs_under_group, group_dir)
+            moves = await asyncio.to_thread(reorganize_group_to_tag_layout, group_dir)
         except Exception as e:
-            logger.exception("flatten date dirs failed")
-            await self.db.append_log(task_id, f"日期子目录合并失败: {e}")
-            return
-        if not moves:
-            return
-        if not quiet:
-            await self.db.append_log(task_id, f"已取消日期子目录（合并 {len(moves)} 处）")
-        for line, src, dst in moves:
-            await self.db.append_log(task_id, line)
-            try:
-                await self.db.rewrite_file_paths_dir_move(src, dst)
-            except Exception:
-                logger.debug("rewrite paths after flatten failed", exc_info=True)
-        await self._mirror_moves_to_temp(moves, prune_under=group_dir)
+            logger.exception("reorganize download layout failed")
+            await self.db.append_log(task_id, f"本地目录整理失败: {e}")
+            moves = []
+        if moves:
+            total += len(moves)
+            if not quiet:
+                await self.db.append_log(
+                    task_id, f"本地 download 已整理（{len(moves)} 处）"
+                )
+            for line, src, dst in moves:
+                await self.db.append_log(task_id, line)
+                try:
+                    await self.db.rewrite_file_paths_dir_move(src, dst)
+                except Exception:
+                    logger.debug("rewrite paths after reorganize failed", exc_info=True)
+            await self._mirror_moves_to_temp(moves, prune_under=group_dir)
+
+        temp_group = Path(settings.temp_dir) / Path(group_dir).name
+        try:
+            temp_moves = await asyncio.to_thread(
+                reorganize_group_to_tag_layout, temp_group
+            )
+        except Exception as e:
+            logger.exception("reorganize temp layout failed")
+            await self.db.append_log(task_id, f"临时目录整理失败: {e}")
+            temp_moves = []
+        if temp_moves:
+            total += len(temp_moves)
+            if not quiet:
+                await self.db.append_log(
+                    task_id, f"本地 temp 已整理（{len(temp_moves)} 处）"
+                )
+            for line, _src, _dst in temp_moves:
+                await self.db.append_log(task_id, f"[temp] {line}")
+
+        if total == 0 and not quiet:
+            await self.db.append_log(task_id, "本地目录无需整理")
+
         try:
             await self._cleanup_temp_for_group(
                 task_id, chat_id if chat_id is not None else 0, group_dir, quiet=True
             )
         except Exception:
-            logger.debug("temp cleanup after flatten failed", exc_info=True)
+            logger.debug("temp cleanup after reorganize failed", exc_info=True)
+        return total
+
+    async def reorganize_local(self, task_id: int) -> dict[str, Any]:
+        """Manual entry: merge related tags + reorganize download/temp for one task."""
+        task_id = int(task_id)
+        if self.is_worker_alive(task_id):
+            raise RuntimeError("请先暂停任务再整理本地目录")
+        task = await self.db.get_task(task_id)
+        if not task:
+            raise LookupError("任务不存在")
+        settings = get_settings()
+        title = task.get("chat_title") or str(task.get("chat_id") or "")
+        group_dir = Path(settings.download_dir) / sanitize_name(str(title))
+        group_dir.mkdir(parents=True, exist_ok=True)
+        chat_id = int(task["chat_id"])
+        tag_blacklist = await self.db.get_tag_relation_blacklist()
+        await self.db.append_log(task_id, "开始整理本地目录…")
+        await self._merge_tag_folders_after(
+            task_id,
+            group_dir,
+            chat_id=chat_id,
+            tag_blacklist=tag_blacklist,
+        )
+        # _merge_tag_folders_after already reorganizes; count via a quiet no-op pass
+        # is wasteful — just report done.
+        await self.db.append_log(task_id, "本地目录整理完成")
+        return {
+            "ok": True,
+            "group_dir": str(group_dir),
+            "temp_dir": str(Path(settings.temp_dir) / group_dir.name),
+        }
 
     async def _merge_tag_folders_after(
         self,
@@ -2624,7 +2689,7 @@ class DownloadScheduler:
         quiet: bool = False,
         tag_blacklist: frozenset | set | None = None,
     ) -> None:
-        """Merge related #tag folders; flatten leftover date subfolders."""
+        """Merge related #tag folders; reorganize leftover date/media-type dirs."""
         groups: list[list[str]] = list(extra_tag_groups or [])
         if chat_id is not None:
             try:
@@ -2636,7 +2701,7 @@ class DownloadScheduler:
         if tag_blacklist is None:
             tag_blacklist = await self.db.get_tag_relation_blacklist()
         try:
-            logs = await asyncio.to_thread(
+            merge_moves = await asyncio.to_thread(
                 merge_related_tag_folders,
                 group_dir,
                 extra_tag_groups=groups or None,
@@ -2645,14 +2710,19 @@ class DownloadScheduler:
         except Exception as e:
             logger.exception("merge tag folders failed")
             await self.db.append_log(task_id, f"同类目录合并失败: {e}")
-            logs = []
-        if logs:
+            merge_moves = []
+        if merge_moves:
             if not quiet:
                 await self.db.append_log(task_id, "同类标签目录已合并")
-            for line in logs:
+            for line, src, dst in merge_moves:
                 await self.db.append_log(task_id, line)
+                try:
+                    await self.db.rewrite_file_paths_dir_move(src, dst)
+                except Exception:
+                    logger.debug("rewrite paths after tag merge failed", exc_info=True)
+            await self._mirror_moves_to_temp(merge_moves, prune_under=group_dir)
 
-        await self._flatten_date_dirs_for_group(
+        await self._reorganize_local_layout_for_group(
             task_id, group_dir, chat_id=chat_id, quiet=quiet
         )
 
@@ -3423,6 +3493,17 @@ class DownloadScheduler:
 
         settings = get_settings()
         temp_group = Path(settings.temp_dir) / group_dir.name
+        # Pull stray .part out of download/ before temp tidy (pause/legacy leftovers)
+        try:
+            n_reclaim = await asyncio.to_thread(
+                self._reclaim_stray_parts_from_download, group_dir
+            )
+            if n_reclaim and not quiet:
+                await self.db.append_log(
+                    task_id, f"未完成文件已移回临时目录 {n_reclaim} 个"
+                )
+        except Exception:
+            logger.debug("reclaim stray download parts failed", exc_info=True)
         # Ensure disk residues are registered as partial before keep-list filter
         try:
             await self._collect_priority_resume_ids(task_id, group_dir)
@@ -3490,31 +3571,97 @@ class DownloadScheduler:
         """
         If target (or a finished .part) is already a complete file, mark done.
         Used after pause/cancel so resume won't re-download finished media.
+
+        Incomplete .part must stay in temp — never promote without a known
+        matching expected_size (unknown size used to shove half files into download/).
         """
         if expected_size <= 0 and message is not None:
             expected_size = self._expected_size(message)
-        if file_looks_complete(target_path, expected_size):
+        # Already finished under download/ (final name, not .part)
+        if expected_size > 0 and file_looks_complete(target_path, expected_size):
+            await self.db.mark_message(
+                task_id, message_id, status="done", file_path=str(target_path)
+            )
+            return True
+        if expected_size <= 0 and file_looks_complete(target_path, 0):
+            # Unknown size: only trust an existing final file, never a .part promote
             await self.db.mark_message(
                 task_id, message_id, status="done", file_path=str(target_path)
             )
             return True
         part = self._part_path(target_path)
         try:
-            if part.exists() and part.is_file():
-                size = part.stat().st_size
-                if size > 0 and (not expected_size or size == expected_size):
-                    self._move_path(part, target_path)
-                    if file_looks_complete(target_path, expected_size):
-                        await self.db.mark_message(
-                            task_id,
-                            message_id,
-                            status="done",
-                            file_path=str(target_path),
-                        )
-                        return True
+            if not (part.exists() and part.is_file()):
+                return False
+            size = part.stat().st_size
+            # Require known size match — incomplete pause must keep .part in temp
+            if expected_size <= 0 or size <= 0 or size != int(expected_size):
+                return False
+            self._move_path(part, target_path)
+            if file_looks_complete(target_path, expected_size):
+                await self.db.mark_message(
+                    task_id,
+                    message_id,
+                    status="done",
+                    file_path=str(target_path),
+                )
+                return True
+            # Promote failed verification — put bytes back under temp as .part
+            try:
+                self._move_path(target_path, part)
+            except OSError:
+                logger.debug(
+                    "salvage rollback to temp failed for %s", target_path, exc_info=True
+                )
         except OSError:
             logger.debug("salvage part failed for %s", target_path, exc_info=True)
         return False
+
+    def _reclaim_stray_parts_from_download(self, group_dir: Path) -> int:
+        """
+        Move any ``*.part`` left under download/ back into the temp mirror.
+
+        Pause/legacy paths must not leave incomplete sidecars in download/.
+        """
+        settings = get_settings()
+        download_root = Path(settings.download_dir)
+        temp_root = Path(settings.temp_dir)
+        group_dir = Path(group_dir)
+        if not group_dir.is_dir():
+            return 0
+        moved = 0
+        try:
+            parts = [p for p in group_dir.rglob("*.part") if p.is_file()]
+        except OSError:
+            return 0
+        for src in parts:
+            try:
+                rel = src.resolve().relative_to(download_root.resolve())
+            except (ValueError, OSError):
+                continue
+            dst = temp_root / rel
+            try:
+                if dst.exists() and dst.is_file():
+                    # Keep the larger residue
+                    try:
+                        if dst.stat().st_size >= src.stat().st_size:
+                            src.unlink(missing_ok=True)
+                            moved += 1
+                            continue
+                    except OSError:
+                        pass
+                self._move_path(src, dst)
+                moved += 1
+            except OSError:
+                logger.debug("reclaim stray part failed: %s", src, exc_info=True)
+        if moved:
+            try:
+                from app.organizer import prune_empty_dirs
+
+                prune_empty_dirs(group_dir, stop_at=group_dir)
+            except Exception:
+                pass
+        return moved
 
     async def _log_queue_skip_stats(
         self,

@@ -282,9 +282,9 @@ body {
   .task-filter-line {
     border-color: rgba(148, 163, 184, 0.14) !important;
   }
-  /* Phone + single task: log tab stretches toward screen bottom (JS refines) */
-  .page-tasks .tasks > .task:only-child .task-body {
-    padding-bottom: 0;
+  /* Phone + single task: stretch log, but keep card bottom inset (don't flush to border) */
+  .page-tasks .tasks > .task:only-child:has(.task-tab-panel[data-panel="log"]:not([hidden])) .task-body {
+    padding-bottom: 14px;
   }
   .page-tasks .tasks > .task:only-child .task-tab-panel[data-panel="log"]:not([hidden]) .task-log {
     max-height: none !important;
@@ -4411,7 +4411,7 @@ button.log-clear-btn:hover {
   overflow-x: hidden;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
-  padding: 2px 0;
+  padding: 2px 0 12px;
   touch-action: pan-y;
 }
 
@@ -8283,7 +8283,12 @@ body.confirm-open .drawer {
     padding: 0;
   }
   .task-head { padding: 14px 14px 12px 16px; }
-  .task-body { padding: 12px 12px 16px 14px; gap: 12px; }
+  /* Keep stable bottom inset so card border doesn't climb when width shrinks */
+  .task-body {
+    padding: 12px 12px 16px 14px;
+    gap: 12px;
+    box-sizing: border-box;
+  }
   .task:hover { transform: none; }
   .task-title { font-size: 1rem; }
   .task-stats {
@@ -8298,21 +8303,20 @@ body.confirm-open .drawer {
   }
   .task-stats strong { font-size: 0.9rem; }
   .task-stat-label { font-size: 0.64rem; }
-  /* 左：主操作；右：设置|删除（与桌面一致） */
+  /* 左：主操作；右：设置|删除（与桌面一致）；间距交给 .task-body gap，避免窄屏叠 margin 上抬底边 */
   .task-actions {
     display: flex;
     flex-wrap: nowrap;
     align-items: stretch;
     gap: 6px;
     padding: 8px;
-    /* 图标栏与下方进度/日志卡片拉开间距 */
-    margin-bottom: 6px;
+    margin-bottom: 0;
   }
   .task-tabs {
-    margin-top: 10px;
+    margin-top: 0;
   }
   .task-tab-panels {
-    margin-top: 4px;
+    margin-top: 0;
   }
   .task-actions button[data-action="open-settings"] {
     margin-left: auto;
