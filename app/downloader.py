@@ -382,6 +382,12 @@ class DownloadScheduler:
             worker_count = int(p.get("worker_count") or 0)
             workers_map = p.get("workers") or {}
             files_map = p.get("files") or {}
+            # Stale handoff after pool ended: last file stuck on「接下一个…」— drop it
+            live_pool = self._live_pools.get(int(task_id))
+            pool_alive = bool(live_pool and live_pool.get("started"))
+            if not paused_phase and not pool_alive and (worker_count > 0 or files_map):
+                self._progress.pop(task_id, None)
+                return None
 
             workers: list[dict[str, Any]] = []
             files: list[dict[str, Any]] = []
@@ -1319,6 +1325,7 @@ class DownloadScheduler:
         folder_mode = "tag"
         min_len = int(task["min_folder_title_len"] or settings.min_folder_title_len)
         current_folder: Optional[str] = task.get("current_folder")
+        # Bound album caption cache — Telethon grouped_id → text (avoid unbounded growth)
         album_captions: dict = {}
         last_id = int(task.get("last_message_id") or 0)
         start_id = int(task.get("start_message_id") or 0)
@@ -1556,6 +1563,7 @@ class DownloadScheduler:
                 t = message_text(m)
                 if t:
                     album_captions[grouped_id] = t
+                    self._trim_album_captions(album_captions)
                     return t
         except Exception:
             logger.debug("album caption lookup failed", exc_info=True)
@@ -3309,6 +3317,16 @@ class DownloadScheduler:
                 return 0
         return 0
 
+    @staticmethod
+    def _trim_album_captions(album_captions: dict, *, max_items: int = 400) -> None:
+        """Keep album caption cache from growing without bound on long runs."""
+        if not album_captions or len(album_captions) <= max_items:
+            return
+        # dict preserves insertion order — drop oldest half
+        drop_n = len(album_captions) - (max_items // 2)
+        for key in list(album_captions.keys())[: max(0, drop_n)]:
+            album_captions.pop(key, None)
+
     def _part_path(self, target_path: Path) -> Path:
         """Stage incomplete downloads under temp_dir (mirror of download_dir tree)."""
         settings = get_settings()
@@ -3793,7 +3811,7 @@ class DownloadScheduler:
             "_stopping": False,
             "done_event": asyncio.Event(),
             "lock": asyncio.Lock(),
-            "order": [],  # scan order for checkpoint
+            "order": [],  # message_id scan order for checkpoint (ids only — not Message objs)
             "settled": {},  # message_id -> True(ok) | False(blocked)
             "order_idx": 0,
             "active": {},  # worker_id -> {yield: Event, job}
@@ -4103,6 +4121,10 @@ class DownloadScheduler:
                 async with pool["lock"]:
                     pool["settled"][job.message_id] = False
                     pool["blocked"] = True
+                try:
+                    job.message = None
+                except Exception:
+                    pass
                 return
 
         # Serialize DB + counter updates across concurrent settles
@@ -4158,11 +4180,13 @@ class DownloadScheduler:
 
                 processed = int(counters["processed"])
                 last_id = int(counters.get("last_id") or 0)
-                order: list[DownloadJob] = pool["order"]
+                order: list = pool["order"]
                 idx = int(pool["order_idx"])
                 settled: dict = pool["settled"]
                 while idx < len(order):
-                    mid = order[idx].message_id
+                    # order holds message_id ints (legacy: DownloadJob → .message_id)
+                    entry = order[idx]
+                    mid = int(entry.message_id if hasattr(entry, "message_id") else entry)
                     if mid not in settled:
                         break
                     if not settled[mid]:
@@ -4171,6 +4195,16 @@ class DownloadScheduler:
                     processed += 1
                     idx += 1
                 pool["order_idx"] = idx
+                # Drop settled prefix so Message-era leftovers / id lists cannot grow forever
+                if idx >= 64:
+                    dropped = order[:idx]
+                    del order[:idx]
+                    pool["order_idx"] = 0
+                    for entry in dropped:
+                        mid = int(
+                            entry.message_id if hasattr(entry, "message_id") else entry
+                        )
+                        settled.pop(mid, None)
 
                 counters["processed"] = processed
                 counters["downloaded"] = downloaded
@@ -4201,6 +4235,12 @@ class DownloadScheduler:
             if flush_snapshot is not None:
                 await self.db.update_task(task_id, commit=False, **flush_snapshot)
             await self.db.commit()
+
+        # Release Telethon Message — keep only path/ids for any leftover refs
+        try:
+            job.message = None
+        except Exception:
+            pass
 
         if merge_groups:
             cid = counters.get("chat_id")
@@ -4377,6 +4417,9 @@ class DownloadScheduler:
         pool["worker_tasks"] = {}
         pool["active"] = {}
         pool["priority"] = deque()
+        pool["order"] = []
+        pool["order_idx"] = 0
+        pool["settled"] = {}
         pool["settle_pending"] = 0
         pool["settle_tasks"] = set()
         pool["started"] = False
@@ -4388,15 +4431,9 @@ class DownloadScheduler:
             # Pause: keep frozen progress on the live box
             self._freeze_progress_paused(task_id)
         else:
-            # Normal drain between batches: clear worker shell
-            with self._progress_lock:
-                bucket = self._progress.get(task_id)
-                if bucket and int(bucket.get("worker_count") or 0):
-                    if not (bucket.get("files") or {}):
-                        self._progress.pop(task_id, None)
-                    else:
-                        bucket["worker_count"] = 0
-                        bucket["workers"] = {}
+            # Batch / tag finished — drop handoff lanes so UI shows idle placeholder
+            # (not last file stuck on「接下一个…»)
+            self._clear_progress(task_id)
         return blocked
 
     async def _pool_submit(
@@ -4475,7 +4512,7 @@ class DownloadScheduler:
             if stop_event.is_set() or pool.get("blocked"):
                 return "paused"
 
-        pool["order"].append(job)
+        pool["order"].append(int(job.message_id))
         # Prefer jobs that already have resumable .part so residues finish first
         if self._job_has_resumable_part(job):
             pool.setdefault("priority", deque()).append(job)

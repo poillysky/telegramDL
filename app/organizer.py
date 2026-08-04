@@ -1548,6 +1548,14 @@ def repair_date_folders(
 MENTION_RE = re.compile(r"@\S+")
 
 
+def _trim_album_captions(album_captions: dict, *, max_items: int = 400) -> None:
+    if len(album_captions) <= max_items:
+        return
+    drop_n = len(album_captions) - (max_items // 2)
+    for key in list(album_captions.keys())[: max(0, drop_n)]:
+        album_captions.pop(key, None)
+
+
 def resolve_caption_text(
     message: Message,
     *,
@@ -1564,6 +1572,7 @@ def resolve_caption_text(
         grouped_id = getattr(message, "grouped_id", None)
         if album_captions is not None and grouped_id:
             album_captions[grouped_id] = text
+            _trim_album_captions(album_captions)
         return text
 
     text = message_text(message)
@@ -1572,6 +1581,7 @@ def resolve_caption_text(
     if album_captions is not None and grouped_id:
         if text:
             album_captions[grouped_id] = text
+            _trim_album_captions(album_captions)
         else:
             text = album_captions.get(grouped_id, "") or ""
 
