@@ -389,6 +389,30 @@ class DownloadScheduler:
                 self._progress.pop(task_id, None)
                 return None
 
+            # No busy lane and nothing queued → 监控中 / idle shell (not handoff leftovers)
+            queued = 0
+            if live_pool and pool_alive:
+                try:
+                    queued = int(self._pool_pending_count(live_pool))
+                except Exception:
+                    queued = 0
+            any_busy_slot = False
+            if worker_count > 0:
+                any_busy_slot = any(
+                    str((workers_map.get(wid) or {}).get("status") or "") == "busy"
+                    for wid in range(1, worker_count + 1)
+                )
+            if not any_busy_slot and files_map:
+                any_busy_slot = any(
+                    str((slot or {}).get("status") or "") == "busy"
+                    or float((slot or {}).get("speed") or 0) > 0
+                    for slot in files_map.values()
+                )
+            if not paused_phase and not any_busy_slot and queued <= 0:
+                if worker_count > 0 or files_map:
+                    self._progress.pop(task_id, None)
+                return None
+
             workers: list[dict[str, Any]] = []
             files: list[dict[str, Any]] = []
             total_speed = 0.0
@@ -476,6 +500,7 @@ class DownloadScheduler:
             if paused_phase:
                 summary_file = p.get("title") or "已暂停"
             elif active == 0 and worker_count > 0:
+                # Should be unreachable (idle cleared above); keep for pause edge
                 summary_file = f"{worker_count} 路 Worker 待命"
             elif active == 1 and files:
                 summary_file = files[0]["file"]
@@ -580,9 +605,21 @@ class DownloadScheduler:
                         "speed": 0.0,
                     }
 
+    def _task_has_queued_jobs(self, task_id: int) -> bool:
+        """True when the live pool still has jobs waiting in queue/priority."""
+        pool = self._live_pools.get(int(task_id))
+        if not pool or not pool.get("started"):
+            return False
+        try:
+            return int(self._pool_pending_count(pool)) > 0
+        except Exception:
+            return False
+
     def _set_worker_idle(self, task_id: int, worker_id: int) -> None:
         if not worker_id:
             return
+        # Queue empty → this lane goes clean idle (整体无忙线时 UI 进「监控中」)
+        keep_handoff = self._task_has_queued_jobs(task_id)
         with self._progress_lock:
             bucket = self._progress.get(task_id)
             if not bucket:
@@ -590,14 +627,15 @@ class DownloadScheduler:
             slot = (bucket.get("workers") or {}).get(int(worker_id))
             if not slot:
                 return
-            # Keep last file/bytes so the lane stays visible until the next job
-            # binds — avoids progress-bar flicker between multi-worker files.
-            # Do NOT inflate received→total here; pause must keep real stop %.
-            if slot.get("file") or int(slot.get("received") or 0) > 0:
-                if bucket.get("phase") == "paused":
-                    slot["status"] = "paused"
-                else:
-                    slot["status"] = "switching"
+            if bucket.get("phase") == "paused" and (
+                slot.get("file") or int(slot.get("received") or 0) > 0
+            ):
+                slot["status"] = "paused"
+                slot["speed"] = 0.0
+                return
+            if keep_handoff and (slot.get("file") or int(slot.get("received") or 0) > 0):
+                # Next job already queued — brief handoff on this lane
+                slot["status"] = "switching"
             else:
                 slot["status"] = "idle"
                 slot["message_id"] = 0
@@ -800,6 +838,8 @@ class DownloadScheduler:
         worker_id: int | None = None,
         completed: bool = False,
     ) -> None:
+        # More jobs waiting → handoff; else this lane clears toward「监控中」
+        keep_handoff = self._task_has_queued_jobs(task_id)
         with self._progress_lock:
             bucket = self._progress.get(task_id)
             if not bucket:
@@ -836,13 +876,20 @@ class DownloadScheduler:
                     if completed and last_total > 0:
                         last_recv = last_total
                     paused = bucket.get("phase") == "paused"
-                    if last_file or last_recv > 0:
-                        wslot["status"] = "paused" if paused else "switching"
+                    if paused and (last_file or last_recv > 0):
+                        wslot["status"] = "paused"
+                        wslot["file"] = last_file
+                        if last_total > 0:
+                            wslot["total"] = last_total
+                        wslot["received"] = last_recv
+                    elif keep_handoff and (last_file or last_recv > 0):
+                        wslot["status"] = "switching"
                         wslot["file"] = last_file
                         if last_total > 0:
                             wslot["total"] = last_total
                         wslot["received"] = last_recv
                     else:
+                        # No queued work — lane idle; all-idle → UI「监控中」
                         wslot["status"] = "idle"
                         wslot["message_id"] = 0
                         wslot["file"] = ""
