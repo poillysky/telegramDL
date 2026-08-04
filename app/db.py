@@ -1104,11 +1104,13 @@ class Database:
             return str(row["file_path"]) if row and row["file_path"] else None
 
     async def list_failed_message_ids(self, task_id: int) -> list[int]:
+        """Unfinished downloads: partial (.part resume) first, then hard fails."""
         async with self.conn.execute(
             """
             SELECT message_id FROM downloaded
-            WHERE task_id = ? AND status = 'failed'
-            ORDER BY message_id ASC
+            WHERE task_id = ? AND status IN ('failed', 'partial')
+            ORDER BY CASE status WHEN 'partial' THEN 0 ELSE 1 END,
+                     message_id ASC
             """,
             (task_id,),
         ) as cur:
@@ -1117,11 +1119,85 @@ class Database:
 
     async def count_failed(self, task_id: int) -> int:
         async with self.conn.execute(
-            "SELECT COUNT(*) AS c FROM downloaded WHERE task_id = ? AND status = 'failed'",
+            """
+            SELECT COUNT(*) AS c FROM downloaded
+            WHERE task_id = ? AND status IN ('failed', 'partial')
+            """,
             (task_id,),
         ) as cur:
             row = await cur.fetchone()
             return int(row["c"] if row else 0)
+
+    async def map_basenames_to_undone_message_ids(
+        self, task_id: int, basenames: list[str] | set[str]
+    ) -> dict[str, int]:
+        """Map final filename → message_id for non-done rows with matching file_path."""
+        from pathlib import Path
+
+        want = {str(b).strip().lower() for b in (basenames or []) if str(b).strip()}
+        if not want:
+            return {}
+        async with self.conn.execute(
+            """
+            SELECT message_id, file_path FROM downloaded
+            WHERE task_id = ?
+              AND status != 'done'
+              AND file_path IS NOT NULL AND file_path != ''
+            """,
+            (task_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        out: dict[str, int] = {}
+        for r in rows:
+            name = Path(str(r["file_path"] or "")).name.lower()
+            if name in want and name not in out:
+                out[name] = int(r["message_id"])
+        return out
+
+    async def list_resume_basenames(self, task_id: int) -> set[str]:
+        """Final filenames of partial/failed rows (for temp keep-list)."""
+        from pathlib import Path
+
+        names: set[str] = set()
+        async with self.conn.execute(
+            """
+            SELECT file_path FROM downloaded
+            WHERE task_id = ?
+              AND status IN ('failed', 'partial')
+              AND file_path IS NOT NULL AND file_path != ''
+            """,
+            (task_id,),
+        ) as cur:
+            for r in await cur.fetchall():
+                p = str(r["file_path"] or "").strip()
+                if p:
+                    names.add(Path(p).name)
+        return names
+
+    async def list_done_message_ids_for_basenames(
+        self, task_id: int, basenames: list[str] | set[str]
+    ) -> set[str]:
+        """Basenames that already have a done row (should not keep .part)."""
+        from pathlib import Path
+
+        want = {str(b).strip().lower() for b in (basenames or []) if str(b).strip()}
+        if not want:
+            return set()
+        hit: set[str] = set()
+        async with self.conn.execute(
+            """
+            SELECT file_path FROM downloaded
+            WHERE task_id = ?
+              AND status = 'done'
+              AND file_path IS NOT NULL AND file_path != ''
+            """,
+            (task_id,),
+        ) as cur:
+            for r in await cur.fetchall():
+                name = Path(str(r["file_path"] or "")).name.lower()
+                if name in want:
+                    hit.add(name)
+        return hit
 
     async def mark_message(
         self,

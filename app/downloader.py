@@ -3322,6 +3322,120 @@ class DownloadScheduler:
         except OSError:
             return None
 
+    def _job_has_resumable_part(self, job: DownloadJob) -> bool:
+        """True when temp already holds a non-empty .part for this target."""
+        try:
+            part = self._part_path(job.target_path)
+            if part.is_file() and part.stat().st_size > 0:
+                return True
+            relocated = self._find_relocated_part(part)
+            return bool(
+                relocated and relocated.is_file() and relocated.stat().st_size > 0
+            )
+        except OSError:
+            return False
+
+    async def _collect_priority_resume_ids(
+        self, task_id: int, group_dir: Path
+    ) -> list[int]:
+        """
+        Message ids that should download before new work: DB partial/failed +
+        resumable .part residues discovered under temp.
+        """
+        from app.temp_cleanup import list_resumable_part_entries
+
+        settings = get_settings()
+        failed_ids = await self.db.list_failed_message_ids(task_id)
+        temp_group = Path(settings.temp_dir) / Path(group_dir).name
+        entries = await asyncio.to_thread(list_resumable_part_entries, temp_group)
+
+        from_parts: list[int] = []
+        need_bases: list[str] = []
+        part_bases_by_mid: dict[int, str] = {}
+        for e in entries:
+            mid = e.get("message_id")
+            base = str(e.get("basename") or "").strip()
+            if mid:
+                mid_i = int(mid)
+                from_parts.append(mid_i)
+                if base:
+                    part_bases_by_mid[mid_i] = base
+            elif base:
+                need_bases.append(base)
+
+        if need_bases:
+            try:
+                mapped = await self.db.map_basenames_to_undone_message_ids(
+                    task_id, need_bases
+                )
+                for base, mid in mapped.items():
+                    mid_i = int(mid)
+                    from_parts.append(mid_i)
+                    part_bases_by_mid[mid_i] = base
+            except Exception:
+                logger.debug("map part basenames failed", exc_info=True)
+
+        # Register disk residues as partial so they stay in the retry set
+        known = set(int(x) for x in failed_ids)
+        for mid in from_parts:
+            mid = int(mid)
+            if mid in known:
+                continue
+            try:
+                if await self.db.is_message_done(task_id, mid):
+                    continue
+                fpath = part_bases_by_mid.get(mid)
+                await self.db.mark_message(
+                    task_id,
+                    mid,
+                    status="partial",
+                    error="part_resume",
+                    file_path=fpath,
+                    commit=False,
+                )
+                known.add(mid)
+            except Exception:
+                logger.debug("mark part_resume failed mid=%s", mid, exc_info=True)
+        try:
+            await self.db.commit()
+        except Exception:
+            pass
+
+        ordered: list[int] = []
+        seen: set[int] = set()
+        for mid in list(failed_ids) + from_parts:
+            mid = int(mid)
+            if mid in seen:
+                continue
+            seen.add(mid)
+            ordered.append(mid)
+        return ordered
+
+    async def _purge_temp_parts(
+        self,
+        group_dir: Path,
+        *,
+        message_id: int | None = None,
+        basename: str | None = None,
+    ) -> int:
+        """Drop temp .part files for a finished / abandoned message."""
+        from app.temp_cleanup import purge_parts_under
+
+        settings = get_settings()
+        temp_group = Path(settings.temp_dir) / Path(group_dir).name
+        mids = {int(message_id)} if message_id is not None else None
+        bases = {basename} if basename else None
+        try:
+            return await asyncio.to_thread(
+                purge_parts_under,
+                temp_group,
+                message_ids=mids,
+                basenames=bases,
+            )
+        except Exception:
+            logger.debug("purge temp parts failed", exc_info=True)
+            return 0
+
     async def _cleanup_temp_for_group(
         self,
         task_id: int,
@@ -3331,21 +3445,48 @@ class DownloadScheduler:
         quiet: bool = False,
     ) -> dict:
         """Compare temp .part files with completed queue / downloads; keep resumable ones."""
-        from app.temp_cleanup import cleanup_temp_group, format_temp_cleanup_log
+        from app.temp_cleanup import (
+            cleanup_temp_group,
+            format_temp_cleanup_log,
+            list_resumable_part_entries,
+        )
 
         settings = get_settings()
         temp_group = Path(settings.temp_dir) / group_dir.name
+        # Ensure disk residues are registered as partial before keep-list filter
+        try:
+            await self._collect_priority_resume_ids(task_id, group_dir)
+        except Exception:
+            logger.debug("register part resumes before cleanup failed", exc_info=True)
+
         completed = await self.db.list_completed_basenames(chat_id)
+        resume_ids = set(await self.db.list_failed_message_ids(task_id))
+        resume_bases = set(await self.db.list_resume_basenames(task_id))
+        # Also allow keep by parsed mid from still-present parts that just got marked
+        try:
+            entries = await asyncio.to_thread(list_resumable_part_entries, temp_group)
+            for e in entries:
+                mid = e.get("message_id")
+                base = str(e.get("basename") or "").strip()
+                if mid and int(mid) in resume_ids and base:
+                    resume_bases.add(base)
+        except Exception:
+            pass
+
         stats = await asyncio.to_thread(
             cleanup_temp_group,
             temp_group,
             Path(group_dir),
             completed_basenames=completed,
+            resume_message_ids=resume_ids,
+            resume_basenames=resume_bases,
+            drop_unmapped=True,
         )
         changed = (
             int(stats.get("removed_empty") or 0)
             + int(stats.get("removed_done") or 0)
             + int(stats.get("removed_dup") or 0)
+            + int(stats.get("removed_orphan") or 0)
             + int(stats.get("dirs_pruned") or 0)
         )
         if changed and not quiet:
@@ -3826,6 +3967,22 @@ class DownloadScheduler:
             ):
                 result = True
             else:
+                # Keep .part and mark partial so next run retries BEFORE new work
+                try:
+                    await self.db.mark_message(
+                        task_id,
+                        job.message_id,
+                        status="partial",
+                        error="paused_partial",
+                        file_path=str(job.target_path),
+                        chat_id=counters.get("chat_id"),
+                    )
+                except Exception:
+                    logger.debug(
+                        "mark partial after pause failed msg=%s",
+                        job.message_id,
+                        exc_info=True,
+                    )
                 async with pool["lock"]:
                     pool["settled"][job.message_id] = False
                     pool["blocked"] = True
@@ -4202,7 +4359,11 @@ class DownloadScheduler:
                 return "paused"
 
         pool["order"].append(job)
-        await pool["queue"].put(job)
+        # Prefer jobs that already have resumable .part so residues finish first
+        if self._job_has_resumable_part(job):
+            pool.setdefault("priority", deque()).append(job)
+        else:
+            await pool["queue"].put(job)
         return "ok"
 
     async def _flush_download_batch(
@@ -4301,12 +4462,13 @@ class DownloadScheduler:
         include_tags = include_tags or []
         caption_keywords = caption_keywords or []
         client = await tg_manager.ensure_client()
-        failed_ids = await self.db.list_failed_message_ids(task_id)
+        failed_ids = await self._collect_priority_resume_ids(task_id, group_dir)
         if not failed_ids:
             return True
 
         await self.db.append_log(
-            task_id, f"优先重试未完成消息 {len(failed_ids)} 条（并发 {concurrency}）"
+            task_id,
+            f"优先续传未完成消息 {len(failed_ids)} 条（.part/失败 · 并发 {concurrency}）",
         )
         concurrency = max(1, min(5, int(concurrency or 1)))
 
@@ -4325,7 +4487,9 @@ class DownloadScheduler:
                 messages = [messages]
 
             pool = self._new_download_pool(concurrency)
-            for message in messages:
+            # Keep ids aligned — Telethon returns None for deleted messages
+            for mid, message in zip(chunk, messages):
+                mid = int(mid)
                 if self._pool_busy(pool) and await self._pool_reap(
                     pool,
                     task_id=task_id,
@@ -4375,11 +4539,17 @@ class DownloadScheduler:
                         )
                     return True
                 if not message:
+                    await self.db.mark_message(
+                        task_id, mid, status="done", error="message_gone"
+                    )
+                    await self._purge_temp_parts(group_dir, message_id=mid)
                     continue
                 if await self.db.is_message_done(task_id, message.id):
+                    await self._purge_temp_parts(group_dir, message_id=int(message.id))
                     continue
                 if not has_media(message):
                     await self.db.mark_message(task_id, message.id, status="done")
+                    await self._purge_temp_parts(group_dir, message_id=int(message.id))
                     continue
 
                 media_type = detect_media_type(message)
@@ -4387,9 +4557,11 @@ class DownloadScheduler:
                     media_type = "document"
                 if not media_type or media_type not in media_types:
                     await self.db.mark_message(task_id, message.id, status="done")
+                    await self._purge_temp_parts(group_dir, message_id=int(message.id))
                     continue
                 if not self._passes_file_filters(task_id, message, media_type):
                     await self.db.mark_message(task_id, message.id, status="done")
+                    await self._purge_temp_parts(group_dir, message_id=int(message.id))
                     continue
 
                 caption = await self._ensure_caption(
@@ -4400,6 +4572,7 @@ class DownloadScheduler:
                     tags, include_tags, mode=tag_match_mode
                 ) or not matches_caption_keywords(caption, caption_keywords):
                     await self.db.mark_message(task_id, message.id, status="done")
+                    await self._purge_temp_parts(group_dir, message_id=int(message.id))
                     counters["skipped"] = int(counters.get("skipped") or 0) + 1
                     counters["processed"] = int(counters.get("processed") or 0) + 1
                     continue
@@ -4440,6 +4613,11 @@ class DownloadScheduler:
                     except ValueError:
                         rel = existing
                     await self.db.append_log(task_id, f"队列已处理，跳过: {rel}")
+                    await self._purge_temp_parts(
+                        group_dir,
+                        message_id=int(message.id),
+                        basename=filename,
+                    )
                     continue
                 target_path, _ = resolve_download_path(
                     target_dir,
@@ -4509,6 +4687,11 @@ class DownloadScheduler:
             ):
                 return False
 
+        # Drop leftovers that became done / unmapped during this retry pass
+        try:
+            await self._cleanup_temp_for_group(task_id, chat_id, group_dir, quiet=True)
+        except Exception:
+            logger.debug("temp cleanup after retry failed", exc_info=True)
         return True
 
     async def _download_with_retry(
@@ -4651,6 +4834,17 @@ class DownloadScheduler:
 
                 tmp_path = self._part_path(target_path)
                 tmp_path.parent.mkdir(parents=True, exist_ok=True)
+                # Track in-progress so pause/crash residues are retried before new work
+                try:
+                    await self.db.mark_message(
+                        task_id,
+                        mid,
+                        status="partial",
+                        error="downloading",
+                        file_path=str(target_path),
+                    )
+                except Exception:
+                    logger.debug("mark downloading partial failed", exc_info=True)
                 # Keep incomplete .part in temp for Telegram ranged resume
                 if tmp_path.exists():
                     try:

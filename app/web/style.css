@@ -8283,7 +8283,7 @@ body.confirm-open .drawer {
     padding: 0;
   }
   .task-head { padding: 14px 14px 12px 16px; }
-  .task-body { padding: 12px 12px 14px 14px; gap: 10px; }
+  .task-body { padding: 12px 12px 16px 14px; gap: 12px; }
   .task:hover { transform: none; }
   .task-title { font-size: 1rem; }
   .task-stats {
@@ -8305,6 +8305,14 @@ body.confirm-open .drawer {
     align-items: stretch;
     gap: 6px;
     padding: 8px;
+    /* 图标栏与下方进度/日志卡片拉开间距 */
+    margin-bottom: 6px;
+  }
+  .task-tabs {
+    margin-top: 10px;
+  }
+  .task-tab-panels {
+    margin-top: 4px;
   }
   .task-actions button[data-action="open-settings"] {
     margin-left: auto;

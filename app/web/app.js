@@ -6690,7 +6690,11 @@ function patchTaskCard(el, t) {
     body.querySelector('.task-tab-panel[data-panel="progress"] .live-progress') ||
     body.querySelector(":scope > .live-progress");
   const prevSig = liveHost?.dataset?.sig || "";
-  const isIdleSig = sig === "idle" || String(sig).startsWith("idle:");
+  // Treat boot shell as idle-family so same-sig "starting" never remounts
+  const isIdleSig =
+    sig === "idle" ||
+    String(sig).startsWith("idle:") ||
+    sig === "starting";
   const isPlaceholderSig = String(sig).startsWith("placeholder");
   const isPanelSig = sig === "panel" || String(sig).startsWith("panel:");
   const prevIsPanel =
@@ -6725,33 +6729,62 @@ function patchTaskCard(el, t) {
       }
     }
   } else if (liveHost && isIdleSig && prevIsIdle) {
-    // Same idle family — never remount (keeps indeterminate / monitor-wait anim)
-    const tip = liveHost.querySelector(".live-placeholder-text");
-    const badge = liveHost.querySelector(".dl-status-badge");
-    const nextText = (() => {
-      if (!isMonitorTask(t)) return "正在查找下一条媒体…";
-      if (!taskHasMonitorTags(t)) {
-        return "未选标签；请先设置标签，索引由手动/自动增量更新";
+    // Same idle/boot family — never remount (keeps progress-bar CSS anim)
+    if (sig === "starting") {
+      liveHost.dataset.sig = "starting";
+      liveHost.dataset.phase = "starting";
+      liveHost.dataset.liveState = "starting";
+    } else {
+      const tip = liveHost.querySelector(".live-placeholder-text");
+      const badge = liveHost.querySelector(".dl-status-badge");
+      const nextText = (() => {
+        if (!isMonitorTask(t)) return "正在查找下一条媒体…";
+        if (!taskHasMonitorTags(t)) {
+          return "未选标签；请先设置标签，索引由手动/自动增量更新";
+        }
+        const q = Math.max(
+          0,
+          tagMatchDisplay(t) - Number(t.tag_processed_count ?? 0)
+        );
+        return q > 0
+          ? `队列还有 ${q} 条，正在准备补下…`
+          : "空闲 · 等索引增量后再补差集";
+      })();
+      if (tip && tip.textContent !== nextText) tip.textContent = nextText;
+      if (badge) {
+        const nextBadge = isMonitorTask(t)
+          ? Math.max(0, tagMatchDisplay(t) - Number(t.tag_processed_count ?? 0)) > 0
+            ? "准备中"
+            : "监控中"
+          : "下载中";
+        if (badge.textContent !== nextBadge) badge.textContent = nextBadge;
       }
-      const q = Math.max(
-        0,
-        tagMatchDisplay(t) - Number(t.tag_processed_count ?? 0)
-      );
-      return q > 0
-        ? `队列还有 ${q} 条，正在准备补下…`
-        : "空闲 · 等索引增量后再补差集";
-    })();
-    if (tip && tip.textContent !== nextText) tip.textContent = nextText;
-    if (badge) {
-      const nextBadge = isMonitorTask(t)
-        ? Math.max(0, tagMatchDisplay(t) - Number(t.tag_processed_count ?? 0)) > 0
-          ? "准备中"
-          : "监控中"
-        : "下载中";
-      if (badge.textContent !== nextBadge) badge.textContent = nextBadge;
+      // starting → monitoring/seeking: swap classes without killing the fill anim
+      if (prevSig === "starting") {
+        liveHost.classList.remove("is-state-starting");
+        if (isMonitorTask(t)) {
+          liveHost.classList.add("is-state-monitoring", "is-monitor-wait");
+          liveHost.classList.remove("is-state-downloading", "is-seeking");
+          liveHost.dataset.liveState = "monitoring";
+          const track = liveHost.querySelector(".prog-track");
+          if (track) {
+            track.classList.remove("indeterminate");
+            track.classList.add("monitor-wait");
+          }
+        } else {
+          liveHost.classList.add("is-state-downloading", "is-seeking");
+          liveHost.classList.remove("is-state-monitoring");
+          liveHost.dataset.liveState = "downloading";
+        }
+        liveHost.dataset.phase = "idle";
+      }
+      liveHost.dataset.sig = sig;
+      if (!liveHost.dataset.liveState) {
+        liveHost.dataset.liveState = isMonitorTask(t)
+          ? "monitoring"
+          : "downloading";
+      }
     }
-    liveHost.dataset.sig = sig;
-    liveHost.dataset.liveState = isMonitorTask(t) ? "monitoring" : "downloading";
   } else if (sig !== prevSig || !liveHost) {
     const html = renderLiveProgress(t);
     const wrap = document.createElement("div");
@@ -7275,9 +7308,9 @@ function classifyLogText(text) {
   // Ops that mention 「失败/空文件」but are not errors
   if (/^临时目录整理/.test(t)) return "ok";
   if (/仍有\s*\d+\s*条(失败|未完成)，已暂停/.test(t)) return "warn";
-  if (/队列仍有.*待命|构建失败，回退/.test(t)) return "warn";
+  if (/队列仍有.*待命|构建失败，回退|无法续传/.test(t)) return "warn";
   if (
-    /优先重试(失败|未完成)消息|定时自动重试|重试(失败|未完成)\s*\d+|失败\/待补|未完成\/待补/.test(
+    /优先续传|优先重试(失败|未完成)消息|定时自动重试|重试(失败|未完成)\s*\d+|失败\/待补|未完成\/待补/.test(
       t
     )
   ) {
@@ -7396,7 +7429,8 @@ function humanizeLogText(text) {
   t = t.replace(/已达上限\s*(\d+)\s*个文件，任务完成/, "已下满 $1 个文件，任务完成");
   t = t.replace(/测试模式时间到，已停止（未下完整文件）/, "测试模式结束（未下完整文件）");
   // Soften legacy 「失败」wording that meant "pending retry", not crash
-  t = t.replace(/^优先重试失败消息/, "优先重试未完成消息");
+  t = t.replace(/^优先重试失败消息/, "优先续传未完成消息");
+  t = t.replace(/^优先重试未完成消息/, "优先续传未完成消息");
   t = t.replace(/定时自动重试\s+(\d+)\s*条失败项/, "定时自动重试 $1 条未完成项");
   t = t.replace(/^定时自动重试失败\/待补项/, "定时自动重试未完成/待补项");
   t = t.replace(/（失败\s*(\d+)）/, "（未完成 $1）");
