@@ -50,7 +50,7 @@
       font-size: 16px !important;
     }
   </style>
-  <link rel="stylesheet" href="/static/style.min.css?v=20260804-v1020" />
+  <link rel="stylesheet" href="/static/style.min.css?v=20260804-v1021" />
   <!-- Webfonts: non-blocking + optional (no 3s spinner / no late glyph swap stretch) -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -262,7 +262,7 @@
                     选群后创建。标签在「设置」配置；索引用手动/自动/全量更新。
                   </p>
                   <p class="field-hint index-create-defaults">
-                    将使用默认媒体类型与保存方式，可在任务设置中修改。
+                    将使用默认媒体类型；文件按 #标签 目录保存，可在任务设置中修改媒体等选项。
                   </p>
                 </div>
                 <input type="hidden" id="includeTags" value="" />
@@ -289,24 +289,9 @@
               </div>
             </div>
 
-            <div class="form-section create-block" id="createFolderSection">
-              <h3 class="form-section-title">保存方式</h3>
-              <label class="create-field">
-                <select id="folderMode">
-                  <option value="caption" selected>按文案 #标签 + 日期（推荐）</option>
-                  <option value="media_type">按媒体类型</option>
-                  <option value="flat">扁平（群目录下）</option>
-                </select>
-              </label>
-              <!-- caption 模式默认自动建夹；节点保留供脚本读写 -->
-              <label class="check" id="useTextFolderWrap" hidden>
-                <input type="checkbox" id="useTextFolder" checked />
-                <span><strong>按文案自动建夹</strong></span>
-              </label>
-              <label hidden>最短标题字数
-                <input id="minTitleLen" type="number" min="1" value="2" />
-              </label>
-            </div>
+            <input type="hidden" id="folderMode" value="tag" />
+            <input type="hidden" id="useTextFolder" checked />
+            <input type="hidden" id="minTitleLen" value="2" />
 
             <details class="advanced create-more" id="createMoreOptions">
               <summary>更多选项 <span class="create-more-hint">日期 · 并发 · 过滤</span></summary>
@@ -846,17 +831,7 @@
         </div>
       </div>
 
-      <!-- Both: folder mode -->
-      <div class="tags-modal-section" id="tagsModalFolderSection" data-settings-for="both">
-        <div class="tags-modal-section-title">保存方式</div>
-        <label class="create-field">
-          <select id="tagsModalFolderMode">
-            <option value="caption" selected>按文案 #标签 + 日期（推荐）</option>
-            <option value="media_type">按媒体类型</option>
-            <option value="flat">扁平（群目录下）</option>
-          </select>
-        </label>
-      </div>
+      <input type="hidden" id="tagsModalFolderMode" value="tag" />
 
       <!-- Sequential-only: more options -->
       <details class="tags-modal-more" id="tagsModalMoreOptions" data-settings-for="sequential" hidden>
@@ -1051,6 +1026,6 @@
     </div>
   </div>
 
-  <script src="/static/app.min.js?v=20260804-v1020"></script>
+  <script src="/static/app.min.js?v=20260804-v1021"></script>
 </body>
 </html>

@@ -1263,6 +1263,25 @@ def date_folder_legacy_aliases(token: str) -> set[str]:
     return {x for x in out if x}
 
 
+def date_folder_years(name: Optional[str]) -> set[int]:
+    """Explicit calendar years in a date-folder name (empty if bare MD only)."""
+    return {int(y) for y in extract_years_from_text(name or []) if y}
+
+
+def date_folders_year_compatible(canonical: str, other: str) -> bool:
+    """
+    True if ``other`` may merge into ``canonical``.
+
+    Bare MD ↔ year-prefixed OK. Same MD with *different* full years
+    (``2025.7.2-2025.7.4`` vs ``2026.7.2-2026.7.4``) must NOT merge.
+    """
+    cy = date_folder_years(canonical)
+    oy = date_folder_years(other)
+    if cy and oy and cy.isdisjoint(oy):
+        return False
+    return True
+
+
 def _dir_has_part_files(dir_path: Path) -> bool:
     """True if tree has any .part (active/resumable download) — do not merge away."""
     try:
@@ -1329,7 +1348,7 @@ def migrate_legacy_date_dirs(
         pull = child.name in aliases
         if not pull and looks_like_date_folder(child.name):
             child_bare = strip_years_from_date_token(child.name) or child.name
-            # Same MD span (ignore year) only — never pull a different range
+            # Same MD span only — never pull a different caption range
             if child_bare == can_bare:
                 pull = True
             else:
@@ -1343,6 +1362,9 @@ def migrate_legacy_date_dirs(
                         == can_bare
                     )
                 )
+        # Same MD but conflicting years (2025.x vs 2026.x) → keep both
+        if pull and not date_folders_year_compatible(canonical, child.name):
+            pull = False
         if not pull:
             continue
         if _dir_has_part_files(child):
@@ -1394,13 +1416,16 @@ def repair_date_folders(
         if not date_dirs:
             continue
 
-        # preferred: 月日←文案映射/夹名，年←夹内文件名
+        # preferred: 月日←文案映射/夹名，年←夹内文件名（勿用错误年份兄弟夹名带偏）
         preferred: dict[Path, str] = {}
-        sibling_years: list[int] = []
+        from collections import Counter
+
+        file_year_votes: list[int] = []
         for child in date_dirs:
-            sibling_years.extend(extract_years_from_text(child.name))
-            sibling_years.extend(years_from_dir(child, sample=20))
-        sibling_year = sibling_years[0] if sibling_years else None
+            file_year_votes.extend(years_from_dir(child, sample=40))
+        sibling_year = (
+            Counter(file_year_votes).most_common(1)[0][0] if file_year_votes else None
+        )
         for child in date_dirs:
             md = mapping.get(child.name) or strip_years_from_date_token(child.name)
             if not md:
@@ -1410,9 +1435,12 @@ def repair_date_folders(
                 strip_years_from_date_token(child.name) or ""
             ) or md
             years = years_from_dir(child)
-            token = apply_years_to_caption_date(
-                md, years, fallback_year=sibling_year
-            )
+            name_years = list(date_folder_years(child.name))
+            # Empty dir: keep its own year label rather than a conflicting sibling year
+            if not years and name_years:
+                years = name_years
+            fallback = None if name_years else sibling_year
+            token = apply_years_to_caption_date(md, years, fallback_year=fallback)
             preferred[child] = token or child.name
 
 
@@ -1441,6 +1469,10 @@ def repair_date_folders(
                     preferred.get(child),
                 ):
                     child_pref = preferred.get(child) or child.name
+                    if not date_folders_year_compatible(target_name, child.name):
+                        continue
+                    if not date_folders_year_compatible(target_name, child_pref):
+                        continue
                     if (
                         child_pref != target_name
                         and child.name not in aliases
@@ -1456,6 +1488,10 @@ def repair_date_folders(
             for child in date_dirs:
                 if child not in sources and child.name in aliases:
                     child_pref = preferred.get(child) or child.name
+                    if not date_folders_year_compatible(target_name, child.name):
+                        continue
+                    if not date_folders_year_compatible(target_name, child_pref):
+                        continue
                     if (
                         child_pref != target_name
                         and strip_years_from_date_token(child_pref)
@@ -1569,7 +1605,7 @@ def resolve_media_subdir(
     use_caption_folders: bool = True,
     tag_folder_map: Optional[dict[str, str]] = None,
     group_dir: Optional[Path] = None,
-    folder_mode: str = "caption",
+    folder_mode: str = "tag",
     caption_override: Optional[str] = None,
     tag_blacklist: Optional[Iterable[str]] = None,
     batch_filenames: Optional[Iterable[str]] = None,
@@ -1579,22 +1615,10 @@ def resolve_media_subdir(
     """
     Resolve relative folder under group dir.
 
-    folder_mode:
-      - caption: #tags + date（月日←文案，年←文件名 / 附近文案）
-      - media_type: photo/video/...
-      - flat: no subfolder (files directly under group dir)
+    Single layout: ``#标签`` only (no date subfolders). Legacy folder_mode /
+    date / media_type / flat args are ignored for compatibility.
     """
-    mode = (folder_mode or "caption").strip()
-    if mode not in ("caption", "media_type", "flat"):
-        mode = "caption" if use_caption_folders else "flat"
-
-    if mode == "flat":
-        return ""
-    if mode == "media_type":
-        mt = detect_media_type(message) or "file"
-        if mt == "sticker":
-            mt = "document"
-        return mt
+    _ = (folder_mode, batch_filenames, hint_year, nearby_texts)
     if not use_caption_folders:
         return "_未分类"
 
@@ -1604,52 +1628,63 @@ def resolve_media_subdir(
         caption_override=caption_override,
     )
     tags = extract_tags(combined)
-    names = list(batch_filenames) if batch_filenames is not None else []
-    if not names:
-        fn = _original_filename(message)
-        if fn:
-            names = [fn]
-    # Also peek sibling year-prefixed date folders under the tag dir
-    disk_hint = hint_year
-    if disk_hint is None and group_dir and group_dir.is_dir() and tags:
-        try:
-            for p in group_dir.iterdir():
-                if not p.is_dir() or not looks_like_date_folder(p.name):
-                    # tag folders — look one level down later via nearby
-                    continue
-                ys = extract_years_from_text(p.name)
-                if ys:
-                    disk_hint = ys[0]
-                    break
-        except OSError:
-            pass
-    date_token = resolve_caption_date_token(
-        combined,
-        names,
-        hint_year=disk_hint if hint_year is None else hint_year,
-        nearby_texts=nearby_texts,
+    if not tags:
+        return "_未分类"
+
+    category = canonical_tag_folder(
+        group_dir,
+        tags,
+        tag_folder_map=tag_folder_map,
+        blacklist=tag_blacklist,
     )
-    if date_token:
-        date_token = sanitize_name(date_token, max_len=40)
+    return category or "_未分类"
 
-    # Use full related multi-tag folder name (index co-occurrence + disk),
-    # not only the tags present on this single caption.
-    category: Optional[str] = None
-    if tags:
-        category = canonical_tag_folder(
-            group_dir,
-            tags,
-            tag_folder_map=tag_folder_map,
-            blacklist=tag_blacklist,
-        )
 
-    if category and date_token:
-        return f"{category}/{date_token}"
-    if category:
-        return category
-    if date_token:
-        return f"_未分类/{date_token}"
-    return "_未分类"
+def flatten_date_dirs_under_group(group_dir: Path) -> list[tuple[str, Path, Path]]:
+    """
+    Move contents of date-named subfolders up into their parent tag folder.
+
+    ``群组/#标签/2025.7.2-2025.7.4/*.mp4`` → ``群组/#标签/*.mp4``
+    Also flattens date dirs directly under group root / ``_未分类``.
+    Returns ``(log_line, src_date_dir, dst_parent)`` for each merge.
+    """
+    group_dir = Path(group_dir)
+    if not group_dir.is_dir():
+        return []
+    moves: list[tuple[str, Path, Path]] = []
+    try:
+        parents = [group_dir]
+        parents.extend(p for p in group_dir.iterdir() if p.is_dir())
+    except OSError:
+        return []
+
+    for parent in parents:
+        try:
+            children = [p for p in parent.iterdir() if p.is_dir()]
+        except OSError:
+            continue
+        for child in children:
+            if not looks_like_date_folder(child.name):
+                continue
+            if _dir_has_part_files(child):
+                # Still flatten — parts stay as files under tag root via merge
+                pass
+            src_snap = Path(child)
+            try:
+                _merge_tree_into(child, parent)
+            except OSError:
+                continue
+            if parent == group_dir:
+                line = f"日期子目录已合并: {src_snap.name} → （群根）"
+            else:
+                line = f"日期子目录已合并: {parent.name}/{src_snap.name} → {parent.name}/"
+            moves.append((line, src_snap, parent))
+            try:
+                if child.exists() and not any(child.iterdir()):
+                    child.rmdir()
+            except OSError:
+                pass
+    return moves
 
 
 def build_filename(
@@ -1681,7 +1716,7 @@ def next_folder_state(
     album_captions: Optional[dict] = None,
     tag_folder_map: Optional[dict[str, str]] = None,
     group_dir: Optional[Path] = None,
-    folder_mode: str = "caption",
+    folder_mode: str = "tag",
     tag_blacklist: Optional[Iterable[str]] = None,
 ) -> tuple[Optional[str], Optional[str], bool]:
     if not has_media(message):

@@ -35,7 +35,7 @@ class CreateTaskBody(BaseModel):
     max_messages: Optional[int] = Field(default=None, ge=1)  # 最多下载条数
     delay_min: float = Field(default=0.5, ge=0)
     delay_max: float = Field(default=0.5, ge=0)
-    folder_mode: str = "caption"  # caption | media_type | flat
+    folder_mode: str = "tag"  # always #标签 (legacy caption/media_type/flat ignored)
     include_tags: List[str] = Field(default_factory=list)  # e.g. ["风流狗尾巴","1"] empty=all
     caption_keywords: List[str] = Field(default_factory=list)  # caption substring filter
     tag_match_mode: str = "any"  # any | all
@@ -62,7 +62,7 @@ class BatchCreateBody(BaseModel):
     max_messages: Optional[int] = Field(default=None, ge=1)
     delay_min: float = Field(default=0.5, ge=0)
     delay_max: float = Field(default=0.5, ge=0)
-    folder_mode: str = "caption"
+    folder_mode: str = "tag"
     include_tags: List[str] = Field(default_factory=list)
     caption_keywords: List[str] = Field(default_factory=list)
     tag_match_mode: str = "any"
@@ -421,11 +421,8 @@ def _task_payload_from_body(body: CreateTaskBody | BatchCreateBody, chat_id, tit
     delay_max = float(body.delay_max)
     if delay_max < delay_min:
         delay_max = delay_min
-    folder_mode = body.folder_mode if body.folder_mode in ("caption", "media_type", "flat") else "caption"
-    if folder_mode == "caption":
-        use_text = bool(body.use_text_as_folder)
-    else:
-        use_text = False
+    folder_mode = "tag"
+    use_text = True
     download_mode = normalize_download_mode(body.download_mode)
     use_index = bool(body.use_index) or download_mode == "monitor"
     return {
@@ -645,33 +642,14 @@ async def update_task_settings(
             }
             log_bits.append("媒体 " + "、".join(media_zh.get(m, m) for m in media))
 
-    if body.folder_mode is not None:
-        folder_mode = str(body.folder_mode or "caption")
-        if folder_mode not in ("caption", "media_type", "flat"):
-            folder_mode = "caption"
-        use_text = (
-            bool(body.use_text_as_folder)
-            if body.use_text_as_folder is not None
-            else folder_mode == "caption"
-        )
-        if folder_mode != "caption":
-            use_text = False
-        old_folder = str(task.get("folder_mode") or "caption")
+    if body.folder_mode is not None or body.use_text_as_folder is not None:
+        # Single layout only — keep #标签 folders; ignore client mode switches
+        old_folder = str(task.get("folder_mode") or "tag")
         old_use = bool(task.get("use_text_as_folder"))
-        if folder_mode != old_folder or use_text != old_use:
-            fields["folder_mode"] = folder_mode
-            fields["use_text_as_folder"] = use_text
-            folder_zh = {
-                "caption": "按文案建目录",
-                "media_type": "按类型建目录",
-                "flat": "不建子目录",
-            }
-            log_bits.append(folder_zh.get(folder_mode, "目录已改"))
-    elif body.use_text_as_folder is not None:
-        use_text = bool(body.use_text_as_folder)
-        if use_text != bool(task.get("use_text_as_folder")):
-            fields["use_text_as_folder"] = use_text
-            log_bits.append(f"文案目录{'开' if use_text else '关'}")
+        if old_folder != "tag" or not old_use:
+            fields["folder_mode"] = "tag"
+            fields["use_text_as_folder"] = True
+            log_bits.append("按标签建目录")
 
     if body.clear_start_date:
         fields["start_date"] = None

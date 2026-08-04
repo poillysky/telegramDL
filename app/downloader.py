@@ -33,11 +33,10 @@ from app.organizer import (
     build_caption_batch_filenames,
     merge_related_tag_folders,
     message_text,
-    migrate_legacy_date_dirs,
+    flatten_date_dirs_under_group,
     next_folder_state,
     normalize_keyword_list,
     normalize_tag_list,
-    repair_date_folders,
     resolve_caption_text,
     resolve_download_path,
     resolve_media_subdir,
@@ -1304,8 +1303,6 @@ class DownloadScheduler:
 
         group_dir = settings.download_dir / sanitize_name(title)
         group_dir.mkdir(parents=True, exist_ok=True)
-        # Fresh date-dir sync bookkeeping for this run
-        self._synced_date_dirs = set()
         # Sync local finished files into completed queue, then tidy temp
         try:
             await self.db.sync_local_completed_from_dir(chat_id, group_dir)
@@ -1317,7 +1314,9 @@ class DownloadScheduler:
             logger.debug("temp cleanup failed", exc_info=True)
 
         media_types = set(task["media_types"] or [])
-        use_text_as_folder = bool(task["use_text_as_folder"])
+        # Single layout: #标签 only (ignore legacy caption/media_type/flat)
+        use_text_as_folder = True
+        folder_mode = "tag"
         min_len = int(task["min_folder_title_len"] or settings.min_folder_title_len)
         current_folder: Optional[str] = task.get("current_folder")
         album_captions: dict = {}
@@ -1376,12 +1375,13 @@ class DownloadScheduler:
         delay_max = float(task.get("delay_max") if task.get("delay_max") is not None else delay_min)
         if delay_max < delay_min:
             delay_max = delay_min
-        folder_mode = task.get("folder_mode") or ("caption" if use_text_as_folder else "flat")
         include_tags = normalize_tag_list(task.get("include_tags") or [])
         caption_keywords = normalize_keyword_list(task.get("caption_keywords") or [])
         tag_blacklist = await self.db.get_tag_relation_blacklist()
         # Tag filter is always OR: hit any selected tag → download
         tag_match_mode = "any"
+        # Flatten legacy date subfolders into tag dirs before download
+        await self._flatten_date_dirs_for_group(task_id, group_dir, chat_id=chat_id)
         # Cap ≤8; safe operating range is 2–3 (see 运行设置 → 媒体连接数)
         from app import runtime_tune
 
@@ -1655,12 +1655,8 @@ class DownloadScheduler:
         media_types = set(fresh.get("media_types") or media_types or []) or set(
             media_types or []
         )
-        folder_mode = str(fresh.get("folder_mode") or folder_mode or "caption")
-        use_text_as_folder = bool(
-            fresh.get("use_text_as_folder")
-            if fresh.get("use_text_as_folder") is not None
-            else use_text_as_folder
-        )
+        folder_mode = "tag"
+        use_text_as_folder = True
         try:
             concurrency = max(1, min(5, int(fresh.get("concurrency") or concurrency or 1)))
         except (TypeError, ValueError):
@@ -2382,13 +2378,9 @@ class DownloadScheduler:
             new_media = set(fresh.get("media_types") or []) or prev_media
             media_changed = new_media != prev_media
             media_types = new_media
-            # Hot-refresh folder / delay / concurrency for next gap download
-            folder_mode = str(fresh.get("folder_mode") or folder_mode or "caption")
-            use_text_as_folder = bool(
-                fresh.get("use_text_as_folder")
-                if fresh.get("use_text_as_folder") is not None
-                else use_text_as_folder
-            )
+            # Hot-refresh delay / concurrency for next gap download
+            folder_mode = "tag"
+            use_text_as_folder = True
             try:
                 concurrency = max(
                     1, min(5, int(fresh.get("concurrency") or concurrency or 1))
@@ -2573,7 +2565,9 @@ class DownloadScheduler:
         self, task_id: int, chat_id: int, group_dir: Path, *, folder_mode: str
     ) -> dict[str, str]:
         """Build tag → full related multi-tag folder map from index + disk."""
-        if (folder_mode or "caption") != "caption":
+        mode = (folder_mode or "tag").strip()
+        # tag + legacy caption both use #标签 folders; media_type/flat skip map
+        if mode not in ("tag", "caption"):
             return {}
         try:
             mapping = await self.db.get_tag_folder_map(chat_id, group_dir)
@@ -2587,6 +2581,39 @@ class DownloadScheduler:
             )
         return mapping
 
+    async def _flatten_date_dirs_for_group(
+        self,
+        task_id: int,
+        group_dir: Path,
+        *,
+        chat_id: int | None = None,
+        quiet: bool = False,
+    ) -> None:
+        """Merge legacy date subfolders into their parent tag folder."""
+        try:
+            moves = await asyncio.to_thread(flatten_date_dirs_under_group, group_dir)
+        except Exception as e:
+            logger.exception("flatten date dirs failed")
+            await self.db.append_log(task_id, f"日期子目录合并失败: {e}")
+            return
+        if not moves:
+            return
+        if not quiet:
+            await self.db.append_log(task_id, f"已取消日期子目录（合并 {len(moves)} 处）")
+        for line, src, dst in moves:
+            await self.db.append_log(task_id, line)
+            try:
+                await self.db.rewrite_file_paths_dir_move(src, dst)
+            except Exception:
+                logger.debug("rewrite paths after flatten failed", exc_info=True)
+        await self._mirror_moves_to_temp(moves, prune_under=group_dir)
+        try:
+            await self._cleanup_temp_for_group(
+                task_id, chat_id if chat_id is not None else 0, group_dir, quiet=True
+            )
+        except Exception:
+            logger.debug("temp cleanup after flatten failed", exc_info=True)
+
     async def _merge_tag_folders_after(
         self,
         task_id: int,
@@ -2597,7 +2624,7 @@ class DownloadScheduler:
         quiet: bool = False,
         tag_blacklist: frozenset | set | None = None,
     ) -> None:
-        """Merge related #tag folders; repair legacy date folders from captions."""
+        """Merge related #tag folders; flatten leftover date subfolders."""
         groups: list[list[str]] = list(extra_tag_groups or [])
         if chat_id is not None:
             try:
@@ -2625,37 +2652,9 @@ class DownloadScheduler:
             for line in logs:
                 await self.db.append_log(task_id, line)
 
-        captions: list[str] = []
-        if chat_id is not None:
-            try:
-                captions = await self.db.list_index_captions(chat_id)
-            except Exception:
-                logger.debug("list_index_captions failed", exc_info=True)
-        try:
-            moves = await asyncio.to_thread(
-                repair_date_folders, group_dir, captions
-            )
-        except Exception as e:
-            logger.exception("repair date folders failed")
-            await self.db.append_log(task_id, f"日期目录修复失败: {e}")
-            return
-        if not moves:
-            return
-        if not quiet:
-            await self.db.append_log(task_id, "日期目录已同步到新文件夹")
-        for line, src, dst in moves:
-            await self.db.append_log(task_id, line)
-            try:
-                await self.db.rewrite_file_paths_dir_move(src, dst)
-            except Exception:
-                logger.debug("rewrite paths after date repair failed", exc_info=True)
-        await self._mirror_moves_to_temp(moves, prune_under=group_dir)
-        try:
-            await self._cleanup_temp_for_group(
-                task_id, chat_id if chat_id is not None else 0, group_dir, quiet=True
-            )
-        except Exception:
-            logger.debug("temp cleanup after date repair failed", exc_info=True)
+        await self._flatten_date_dirs_for_group(
+            task_id, group_dir, chat_id=chat_id, quiet=quiet
+        )
 
     async def _mirror_moves_to_temp(
         self,
@@ -2685,38 +2684,9 @@ class DownloadScheduler:
         *,
         caption: str = "",
     ) -> None:
-        """When using a new date folder, merge leftover legacy siblings into it."""
-        from app.organizer import looks_like_date_folder
-
-        if not looks_like_date_folder(target_dir.name):
-            return
-        # Once per target path per worker generation — avoid flip-flop mid-batch
-        key = str(target_dir.resolve()) if target_dir.exists() else str(target_dir)
-        done = getattr(self, "_synced_date_dirs", None)
-        if done is None:
-            self._synced_date_dirs = set()
-            done = self._synced_date_dirs
-        if key in done:
-            return
-        done.add(key)
-        parent = target_dir.parent
-        try:
-            moves = await asyncio.to_thread(
-                migrate_legacy_date_dirs,
-                parent,
-                target_dir.name,
-                caption=caption or "",
-            )
-        except Exception:
-            logger.debug("migrate_legacy_date_dirs failed", exc_info=True)
-            return
-        for line, src, dst in moves or []:
-            await self.db.append_log(task_id, line)
-            try:
-                await self.db.rewrite_file_paths_dir_move(src, dst)
-            except Exception:
-                logger.debug("rewrite paths after date migrate failed", exc_info=True)
-        await self._mirror_moves_to_temp(moves, prune_under=parent)
+        """No-op: date subfolders are no longer used (flatten on start instead)."""
+        _ = (task_id, target_dir, caption)
+        return
 
     async def _download_loop_body(
         self,
@@ -4468,7 +4438,7 @@ class DownloadScheduler:
 
         await self.db.append_log(
             task_id,
-            f"优先续传未完成消息 {len(failed_ids)} 条（.part/失败 · 并发 {concurrency}）",
+            f"优先续传未完成消息 {len(failed_ids)} 条（.part/未完成 · 并发 {concurrency}）",
         )
         concurrency = max(1, min(5, int(concurrency or 1)))
 

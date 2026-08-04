@@ -1133,7 +1133,7 @@ function bindUi() {
   });
 
   const folderModeEl = $("folderMode");
-  if (folderModeEl) {
+  if (folderModeEl && folderModeEl.tagName === "SELECT") {
     folderModeEl.addEventListener("change", syncFolderModeUi);
     syncFolderModeUi();
   }
@@ -1722,18 +1722,11 @@ async function loadTaskDefaults() {
 }
 
 function syncFolderModeUi() {
-  const mode = ($("folderMode") && $("folderMode").value) || "caption";
-  const wrap = $("useTextFolderWrap");
+  // Single layout: #标签 only — no mode select
   const cb = $("useTextFolder");
-  if (!cb) return;
-  // Create modal: caption ⇒ auto folders on; no extra checkbox step
-  if (wrap) wrap.hidden = true;
-  if (mode === "caption") {
-    cb.disabled = false;
+  if (cb) {
     cb.checked = true;
-  } else {
-    cb.checked = false;
-    cb.disabled = true;
+    cb.disabled = false;
   }
 }
 
@@ -1780,13 +1773,11 @@ function setDownloadMode(mode) {
   const more = $("createMoreOptions");
   const hint = $("downloadModeHint");
   const mediaSec = $("createMediaSection");
-  const folderSec = $("createFolderSection");
   const createBtn = $("btnCreateTask");
   if (datePanel) datePanel.hidden = m !== "sequential";
   setCreatePanelVisible(tagsPanel, m === "monitor");
   setCreatePanelVisible(more, m !== "monitor");
   setCreatePanelVisible(mediaSec, m !== "monitor");
-  setCreatePanelVisible(folderSec, m !== "monitor");
   if (hint) {
     hint.classList.remove("create-hint-flash");
     void hint.offsetWidth;
@@ -2721,7 +2712,7 @@ function buildTaskOptions() {
   const startDate = $("startDate").value;
   const endDate = $("endDate").value;
   const maxRaw = $("maxMessages") ? $("maxMessages").value.trim() : "";
-  const folderMode = ($("folderMode") && $("folderMode").value) || "caption";
+  const folderMode = "tag";
   let delayMin = Number(($("delayMin") && $("delayMin").value) || 0.5);
   let delayMax = Number(($("delayMax") && $("delayMax").value) || delayMin);
   if (Number.isNaN(delayMin) || delayMin < 0) delayMin = 0;
@@ -2736,7 +2727,7 @@ function buildTaskOptions() {
       : [];
   return {
     media_types: media,
-    use_text_as_folder: folderMode === "caption" ? ($("useTextFolder") ? $("useTextFolder").checked : true) : false,
+    use_text_as_folder: true,
     test_mode: $("testMode").checked,
     min_folder_title_len: Number(($("minTitleLen") && $("minTitleLen").value) || 2),
     start_message_id: Number(($("startMsgId") && $("startMsgId").value) || 0),
@@ -5006,7 +4997,7 @@ function fillTaskSettingsFields(task) {
   const tags = Array.isArray(task.include_tags) ? task.include_tags.slice() : [];
   const downloadMode = normalizeDownloadMode(task.download_mode);
   const order = String(task.download_order || "added_first");
-  const folderMode = String(task.folder_mode || "caption");
+  const folderMode = "tag";
   const media = Array.isArray(task.media_types) && task.media_types.length
     ? task.media_types.map(String)
     : ["photo", "video", "document", "audio"];
@@ -5957,7 +5948,7 @@ async function saveTaskTagsModal() {
     (x) => x.value
   );
   if (!media.length) media = ["photo", "video", "document", "audio"];
-  const folderMode = ($("tagsModalFolderMode") && $("tagsModalFolderMode").value) || "caption";
+  const folderMode = "tag";
   const orderEl =
     downloadMode === "monitor"
       ? $("tagsModalDownloadOrder")
@@ -5970,7 +5961,7 @@ async function saveTaskTagsModal() {
     delay_max: delayMax,
     media_types: media,
     folder_mode: folderMode,
-    use_text_as_folder: folderMode === "caption",
+    use_text_as_folder: true,
     download_order: downloadOrder,
   };
 
@@ -7310,7 +7301,7 @@ function classifyLogText(text) {
   if (/仍有\s*\d+\s*条(失败|未完成)，已暂停/.test(t)) return "warn";
   if (/队列仍有.*待命|构建失败，回退|无法续传/.test(t)) return "warn";
   if (
-    /优先续传|优先重试(失败|未完成)消息|定时自动重试|重试(失败|未完成)\s*\d+|失败\/待补|未完成\/待补/.test(
+    /优先续传|优先重试(失败|未完成)消息|定时自动重试|重试(失败|未完成)\s*\d+|失败\/待补|未完成\/待补|\.part\/失败/.test(
       t
     )
   ) {
@@ -7464,9 +7455,10 @@ function humanizeLogText(text) {
   // Settings lines with English enum values (legacy DB rows)
   if (/^已更新任务设置:|^已改设置/.test(t)) {
     t = t.replace(/^已更新任务设置:\s*/, "已改设置 · ");
-    t = t.replace(/目录 caption/g, "按文案建目录");
-    t = t.replace(/目录 media_type/g, "按类型建目录");
-    t = t.replace(/目录 flat/g, "不建子目录");
+    t = t.replace(/目录 tag/g, "按标签建目录");
+    t = t.replace(/目录 caption/g, "按标签建目录");
+    t = t.replace(/目录 media_type/g, "按标签建目录");
+    t = t.replace(/目录 flat/g, "按标签建目录");
     t = t.replace(/方向 added_first/g, "先入库先下");
     t = t.replace(/方向 oldest_first/g, "从旧到新");
     t = t.replace(/方向 newest_first/g, "从新到旧");

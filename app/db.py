@@ -379,7 +379,7 @@ class Database:
             )
         if "folder_mode" not in cols:
             await self.conn.execute(
-                "ALTER TABLE tasks ADD COLUMN folder_mode TEXT NOT NULL DEFAULT 'caption'"
+                "ALTER TABLE tasks ADD COLUMN folder_mode TEXT NOT NULL DEFAULT 'tag'"
             )
         if "include_tags" not in cols:
             await self.conn.execute(
@@ -804,7 +804,8 @@ class Database:
         d["max_file_bytes"] = max(0, int(d.get("max_file_bytes") or 0))
         d["delay_min"] = float(d.get("delay_min") if d.get("delay_min") is not None else 0.5)
         d["delay_max"] = float(d.get("delay_max") if d.get("delay_max") is not None else d["delay_min"])
-        d["folder_mode"] = d.get("folder_mode") or "caption"
+        d["folder_mode"] = "tag"
+        d["use_text_as_folder"] = True
         for key in ("include_tags", "caption_keywords"):
             raw = d.get(key) or "[]"
             try:
@@ -843,12 +844,8 @@ class Database:
                 max_messages = None
         else:
             max_messages = None
-        folder_mode = data.get("folder_mode") or "caption"
-        if folder_mode not in ("caption", "media_type", "flat"):
-            folder_mode = "caption"
-        use_text = bool(data.get("use_text_as_folder", True))
-        if folder_mode != "caption":
-            use_text = False
+        folder_mode = "tag"
+        use_text = True
         include_tags = data.get("include_tags") or []
         from app.organizer import normalize_tag_list
 

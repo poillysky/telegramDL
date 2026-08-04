@@ -135,6 +135,36 @@ def test_migrate_does_not_merge_different_date_ranges(tmp_path: Path):
     assert b.is_dir() and (b / "late.mp4").is_file()
 
 
+def test_migrate_does_not_merge_same_md_different_years(tmp_path: Path):
+    """2025.7.2-2025.7.4 must not be swallowed by 2026.7.2-2026.7.4."""
+    tag = tmp_path / "#娇萌小朋友"
+    y25 = tag / "2025.7.2-2025.7.4"
+    y26 = tag / "2026.7.2-2026.7.4"
+    y25.mkdir(parents=True)
+    y26.mkdir(parents=True)
+    (y25 / "vlc_record_2025_07_02_x.mp4").write_bytes(b"a")
+    (y26 / "stray.mp4").write_bytes(b"b")
+    moves = migrate_legacy_date_dirs(
+        tag, "2026.7.2-2026.7.4", caption="#娇萌小朋友 7.2-7.4"
+    )
+    assert not moves
+    assert y25.is_dir() and (y25 / "vlc_record_2025_07_02_x.mp4").is_file()
+    assert y26.is_dir() and (y26 / "stray.mp4").is_file()
+
+
+def test_migrate_still_merges_bare_md_into_year(tmp_path: Path):
+    tag = tmp_path / "#demo"
+    old = tag / "7.2-7.4"
+    new = tag / "2025.7.2-2025.7.4"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    (old / "clip.mp4").write_bytes(b"a")
+    moves = migrate_legacy_date_dirs(tag, "2025.7.2-2025.7.4", caption="#demo 7.2-7.4")
+    assert moves
+    assert (new / "clip.mp4").is_file()
+    assert not old.exists()
+
+
 def test_migrate_skips_dir_with_part_files(tmp_path: Path):
     tag = tmp_path / "#demo"
     old = tag / "7.11"
